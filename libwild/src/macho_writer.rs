@@ -41,6 +41,7 @@ use crate::macho::DylinkerCommand;
 use crate::macho::EntryPointCommand;
 use crate::macho::FileHeader;
 use crate::macho::GOT_ENTRY_SIZE;
+use crate::macho::ImportedSymbolBinding;
 use crate::macho::MACHO_COMMAND_ALIGNMENT;
 use crate::macho::MACHO_START_MEM_ADDRESS;
 use crate::macho::MAX_SEGMENT_COUNT;
@@ -2064,19 +2065,29 @@ fn chained_fixups(
 ) -> Result<ChainedFixups> {
     let symbols = &layout.format_specific.imported_symbols;
     let got_layout = layout.section_layouts.get(output_section_id::GOT);
+    let tlvp_layout = layout.section_layouts.get(output_section_id::TLVP);
     let mut fixups_by_segment = (0..layout.segment_layouts.segments.len())
         .map(|_| Vec::new())
         .collect_vec();
 
     for (import_index, symbol) in symbols.iter().enumerate() {
-        let address = symbol.got_address.get();
-        ensure!(
-            address >= got_layout.mem_offset
-                && address
-                    .checked_add(GOT_ENTRY_SIZE)
-                    .is_some_and(|end| end <= got_layout.mem_offset + got_layout.mem_size),
-            "Mach-O GOT bind at {address:#x} is outside __got"
-        );
+        let address = symbol.binding.address().get();
+        match symbol.binding {
+            ImportedSymbolBinding::Got { .. } => ensure!(
+                address >= got_layout.mem_offset
+                    && address
+                        .checked_add(GOT_ENTRY_SIZE)
+                        .is_some_and(|end| end <= got_layout.mem_offset + got_layout.mem_size),
+                "Mach-O GOT bind at {address:#x} is outside __got"
+            ),
+            ImportedSymbolBinding::Tlvp { .. } => ensure!(
+                address >= tlvp_layout.mem_offset
+                    && address
+                        .checked_add(GOT_ENTRY_SIZE)
+                        .is_some_and(|end| end <= tlvp_layout.mem_offset + tlvp_layout.mem_size),
+                "Mach-O TLVP bind at {address:#x} is outside __thread_ptrs"
+            ),
+        }
         let (segment_index, _) = segment_for_address(layout, address, GOT_ENTRY_SIZE)?;
         fixups_by_segment[segment_index].push(ChainedFixup {
             address,
@@ -2173,7 +2184,11 @@ fn write_plt_entries<A: Arch<Platform = MachO>>(
     let plt_layout = layout.section_layouts.get(output_section_id::PLT_GOT);
 
     for imported_symbol in &layout.format_specific.imported_symbols {
-        let Some(stub_address) = imported_symbol.plt_address else {
+        let ImportedSymbolBinding::Got {
+            got_address,
+            plt_address: Some(stub_address),
+        } = imported_symbol.binding
+        else {
             continue;
         };
 
@@ -2186,7 +2201,7 @@ fn write_plt_entries<A: Arch<Platform = MachO>>(
 
         A::write_plt_entry(
             &mut plt[offset..end],
-            imported_symbol.got_address.get(),
+            got_address.get(),
             stub_address.get(),
         )?;
     }
@@ -2510,7 +2525,21 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
     let flags = layout.flags_for_symbol(local_symbol_id);
 
     let mask = get_page_mask(rel_info.mask);
-    let symbol_plus_addend = resolution.raw_value.wrapping_add(addend as u64);
+    let symbol_plus_addend = if matches!(
+        rel.r_type,
+        object::macho::ARM64_RELOC_TLVP_LOAD_PAGE21
+            | object::macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12
+    ) && flags.needs_got_tls_descriptor()
+    {
+        resolution
+            .format_specific
+            .tlvp_address
+            .context("dynamic Mach-O TLVP relocation has no __thread_ptrs slot")?
+            .get()
+            .wrapping_add(addend as u64)
+    } else {
+        resolution.raw_value.wrapping_add(addend as u64)
+    };
     let mut value = match rel_info.kind {
         RelocationKind::Absolute => symbol_plus_addend.bitand(mask.symbol_plus_addend),
         RelocationKind::AbsoluteLowPart => symbol_plus_addend.bitand(mask.symbol_plus_addend),
@@ -2573,7 +2602,9 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
         out.len(),
     );
 
-    if rel.r_type == object::macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12 {
+    if rel.r_type == object::macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12
+        && !flags.needs_got_tls_descriptor()
+    {
         rewrite_tlvp_load_as_add(&mut out[output_offset..])?;
     }
 

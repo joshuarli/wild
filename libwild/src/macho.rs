@@ -110,6 +110,10 @@ pub(crate) fn link_for_arch<'data, F: FileSystem>(
 enum SinglePartSectionId {
     Strtab = crate::output_section_id::NUM_COMMON_SINGLE_PART_SECTIONS,
     Got,
+    /// Runtime-bound pointers to TLV descriptors imported from dynamic libraries. Although a
+    /// TLVP instruction pair has the same ADRP/LDR shape as a GOT load, its target is a
+    /// descriptor selected by dyld for each image, not a normal symbol address.
+    Tlvp,
     PltGot,
     SymtabGlobal,
     LinkEditSegment,
@@ -136,6 +140,7 @@ pub(crate) mod part_id {
 
     pub(crate) const STRTAB: PartId = SinglePartSectionId::Strtab.part_id();
     pub(crate) const GOT: PartId = SinglePartSectionId::Got.part_id();
+    pub(crate) const TLVP: PartId = SinglePartSectionId::Tlvp.part_id();
     pub(crate) const PLT_GOT: PartId = SinglePartSectionId::PltGot.part_id();
     pub(crate) const SYMTAB_GLOBAL: PartId = SinglePartSectionId::SymtabGlobal.part_id();
     pub(crate) const LOAD_COMMANDS: PartId = SinglePartSectionId::LoadCommands.part_id();
@@ -153,6 +158,7 @@ pub(crate) mod output_section_id {
 
     pub(crate) const STRTAB: OutputSectionId = SinglePartSectionId::Strtab.output_section_id();
     pub(crate) const GOT: OutputSectionId = SinglePartSectionId::Got.output_section_id();
+    pub(crate) const TLVP: OutputSectionId = SinglePartSectionId::Tlvp.output_section_id();
     pub(crate) const PLT_GOT: OutputSectionId = SinglePartSectionId::PltGot.output_section_id();
     pub(crate) const SYMTAB_GLOBAL: OutputSectionId =
         SinglePartSectionId::SymtabGlobal.output_section_id();
@@ -757,7 +763,7 @@ impl std::fmt::Display for SegmentName {
 
 #[derive(Debug, Default)]
 pub(crate) struct LayoutExt {
-    /// Imported STUB library symbols, sorted by GOT.
+    /// Imported symbols, sorted by their runtime-bound pointer slot.
     pub(crate) imported_symbols: Vec<ImportedSymbolWithResolution>,
 }
 
@@ -782,8 +788,33 @@ pub(crate) struct PreludeLayoutExt {
 #[derive(derive_more::Debug, Clone, Copy)]
 pub(crate) struct ImportedSymbolWithResolution {
     pub(crate) symbol_id: SymbolId,
-    pub(crate) got_address: NonZeroU64,
-    pub(crate) plt_address: Option<NonZeroU64>,
+    pub(crate) binding: ImportedSymbolBinding,
+}
+
+/// Storage which dyld binds for an imported symbol.
+///
+/// A TLVP slot deliberately is not a `__got` entry. It stores a pointer to the exporting dylib's
+/// TLV descriptor, which its bootstrap function then uses to find the caller's current-thread
+/// storage. Keeping this distinction through layout and writing prevents the local-TLVP rewrite
+/// from turning an imported descriptor load into an address of the wrong storage cell.
+#[derive(derive_more::Debug, Clone, Copy)]
+pub(crate) enum ImportedSymbolBinding {
+    Got {
+        got_address: NonZeroU64,
+        plt_address: Option<NonZeroU64>,
+    },
+    Tlvp {
+        tlvp_address: NonZeroU64,
+    },
+}
+
+impl ImportedSymbolBinding {
+    pub(crate) fn address(self) -> NonZeroU64 {
+        match self {
+            Self::Got { got_address, .. } => got_address,
+            Self::Tlvp { tlvp_address } => tlvp_address,
+        }
+    }
 }
 
 #[derive(derive_more::Debug)]
@@ -2169,22 +2200,33 @@ impl platform::Platform for MachO {
                     .get(symbol_id)
                     .with_context(|| "missing resolution for a stub library symbol".to_string())?;
 
-                let got_address = resolution
-                    .format_specific
-                    .got_address
-                    .ok_or_else(|| error!("missing GOT entry for a stub library symbol"))?;
+                let binding = match (
+                    resolution.format_specific.got_address,
+                    resolution.format_specific.tlvp_address,
+                ) {
+                    (Some(got_address), None) => ImportedSymbolBinding::Got {
+                        got_address,
+                        plt_address: resolution.format_specific.plt_address,
+                    },
+                    (None, Some(tlvp_address)) => ImportedSymbolBinding::Tlvp { tlvp_address },
+                    (None, None) => {
+                        bail!("missing runtime-bound pointer slot for imported Mach-O symbol")
+                    }
+                    (Some(_), Some(_)) => {
+                        bail!("imported Mach-O symbol has both GOT and TLVP slots")
+                    }
+                };
 
                 Ok(ImportedSymbolWithResolution {
                     symbol_id,
-                    got_address,
-                    plt_address: resolution.format_specific.plt_address,
+                    binding,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
 
         layout_ext.imported_symbols = imported_symbols
             .into_iter()
-            .sorted_by_key(|symbol| symbol.got_address)
+            .sorted_by_key(|symbol| symbol.binding.address())
             .collect();
 
         Ok(layout_ext)
@@ -2343,9 +2385,9 @@ impl platform::Platform for MachO {
             })
             .sum::<u64>();
 
-        // Chained fixups may now occur in every output segment: imported GOT slots are binds and
-        // ordinary local data pointers are rebases. Segment addresses are assigned later, so use
-        // a bounded reservation here. Counting every non-empty part independently is an upper
+        // Chained fixups may now occur in every output segment: imported GOT/TLVP slots are binds
+        // and ordinary local data pointers are rebases. Segment addresses are assigned later, so
+        // use a bounded reservation here. Counting every non-empty part independently is an upper
         // bound for the number of 16KiB pages after parts are packed into their segments.
         let max_page_count = mem_sizes
             .parts
@@ -2529,13 +2571,16 @@ impl platform::Platform for MachO {
         _args: &Self::Args,
     ) {
         // Keep size finalisation in lockstep with `create_resolution`: a local resolution can
-        // still consume a PLT or GOT slot. Restricting this to dynamic flags leaves a zero-sized
-        // provisional `__got` that final layout later advances.
+        // still consume a PLT, GOT, or TLVP slot. Restricting this to dynamic flags leaves a
+        // zero-sized provisional synthetic section that final layout later advances.
         if flags.needs_plt() {
             mem_sizes.increment(part_id::PLT_GOT, PLT_ENTRY_SIZE);
         }
         if flags.needs_got() {
             mem_sizes.increment(part_id::GOT, GOT_ENTRY_SIZE);
+        }
+        if flags.needs_got_tls_descriptor() {
+            mem_sizes.increment(part_id::TLVP, GOT_ENTRY_SIZE);
         }
     }
 
@@ -2623,6 +2668,7 @@ impl platform::Platform for MachO {
             dynamic_symbol_index,
             format_specific: ResolutionExt {
                 got_address: None,
+                tlvp_address: None,
                 plt_address: None,
             },
             flags,
@@ -2637,6 +2683,10 @@ impl platform::Platform for MachO {
             let got_address = allocate_got(memory_offsets);
             resolution.raw_value = got_address.get();
             resolution.format_specific.got_address = Some(got_address);
+        } else if flags.needs_got_tls_descriptor() {
+            let tlvp_address = allocate_tlvp(memory_offsets);
+            resolution.raw_value = tlvp_address.get();
+            resolution.format_specific.tlvp_address = Some(tlvp_address);
         }
 
         resolution
@@ -2732,7 +2782,18 @@ impl platform::Platform for MachO {
         builder.add_section(output_section_id::EH_FRAME);
         builder.add_section(output_section_id::GOT);
 
-        for segment in [SegmentName::DATA_CONST, SegmentName::DATA] {
+        for segment in [SegmentName::DATA_CONST] {
+            add_sections_in_segment(&mut builder, output_sections, &custom.exec, segment);
+            add_sections_in_segment(&mut builder, output_sections, &custom.ro, segment);
+            add_sections_in_segment(&mut builder, output_sections, &custom.data, segment);
+            add_sections_in_segment(&mut builder, output_sections, &custom.bss, segment);
+        }
+
+        // A dynamic TLS reference is a pointer to a dylib's `__thread_vars` descriptor, not a
+        // normal `__got` value. Keep it in the ABI's dedicated pointer section, ahead of ordinary
+        // writable data just as ld64.lld does.
+        builder.add_section(output_section_id::TLVP);
+        for segment in [SegmentName::DATA] {
             add_sections_in_segment(&mut builder, output_sections, &custom.exec, segment);
             add_sections_in_segment(&mut builder, output_sections, &custom.ro, segment);
             add_sections_in_segment(&mut builder, output_sections, &custom.data, segment);
@@ -3011,6 +3072,15 @@ const SECTION_DEFINITIONS: [BuiltInSectionDetails; NUM_BUILT_IN_SECTIONS] = {
         section_flags: macho::S_NON_LAZY_SYMBOL_POINTERS.to_flags(),
         ..DEFAULT_DEFS
     };
+    defs[output_section_id::TLVP.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionIdentity::new(
+            SectionName(b"__thread_ptrs"),
+            Some(SegmentName::DATA),
+        )),
+        section_flags: macho::S_THREAD_LOCAL_VARIABLE_POINTERS.to_flags(),
+        min_alignment: alignment::USIZE,
+        ..DEFAULT_DEFS
+    };
     defs[output_section_id::PLT_GOT.as_usize()] = BuiltInSectionDetails {
         kind: SectionKind::Primary(SectionIdentity::new(
             SectionName(b"__stubs"),
@@ -3078,6 +3148,8 @@ pub(crate) struct DynamicLayoutExt {
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct ResolutionExt {
     pub(crate) got_address: Option<NonZeroU64>,
+    /// Runtime-bound pointer to an imported dylib's TLV descriptor in `__thread_ptrs`.
+    pub(crate) tlvp_address: Option<NonZeroU64>,
     pub(crate) plt_address: Option<NonZeroU64>,
 }
 
@@ -3085,6 +3157,12 @@ fn allocate_got(memory_offsets: &mut OutputSectionPartMap<u64>) -> NonZeroU64 {
     let got_address = NonZeroU64::new(*memory_offsets.get(part_id::GOT)).unwrap();
     memory_offsets.increment(part_id::GOT, GOT_ENTRY_SIZE);
     got_address
+}
+
+fn allocate_tlvp(memory_offsets: &mut OutputSectionPartMap<u64>) -> NonZeroU64 {
+    let tlvp_address = NonZeroU64::new(*memory_offsets.get(part_id::TLVP)).unwrap();
+    memory_offsets.increment(part_id::TLVP, GOT_ENTRY_SIZE);
+    tlvp_address
 }
 
 fn allocate_plt(memory_offsets: &mut OutputSectionPartMap<u64>) -> NonZeroU64 {
@@ -3199,24 +3277,6 @@ fn process_relocation<'data, 'scope, A: platform::Arch<Platform = MachO>>(
         let symbol_id = symbol_db.definition(local_symbol_id);
         let target_is_dynamic = is_dynamic_library(&symbol_db.file(symbol_db.file_id_for_symbol(symbol_id)));
 
-        // A local TLS symbol names its in-image `__thread_vars` descriptor, so its TLVP pair is
-        // resolved directly by `MachOAArch64`. A dylib TLS definition instead needs a separate
-        // runtime-bound TLVP slot and a chained fixup at that slot. Do not let the direct local
-        // representation produce a subtly incorrect linked binary for that case.
-        if target_is_dynamic
-            && matches!(
-                rel_info.r_type,
-                object::macho::ARM64_RELOC_TLVP_LOAD_PAGE21
-                    | object::macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12
-            )
-        {
-            bail!(
-                "{} against dynamically defined TLS symbol `{}` requires a runtime-bound Mach-O TLVP slot, which the relocation writer does not implement",
-                A::rel_type_to_string(rel_info),
-                String::from_utf8_lossy(symbol_db.symbol_name(symbol_id)?.bytes()),
-            );
-        }
-
         let mut flags = resources.local_flags_for_symbol(symbol_id);
         flags.merge(resources.local_flags_for_symbol(local_symbol_id));
 
@@ -3233,7 +3293,19 @@ fn process_relocation<'data, 'scope, A: platform::Arch<Platform = MachO>>(
         );
         let mut flags_to_add = layout::resolution_flags(relocation.kind);
         if target_is_dynamic {
-            flags_to_add |= ValueFlags::GOT;
+            if matches!(
+                rel_info.r_type,
+                object::macho::ARM64_RELOC_TLVP_LOAD_PAGE21
+                    | object::macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12
+            ) {
+                // The imported value is the dylib's `__thread_vars` descriptor. Unlike an
+                // ordinary dynamic address it must remain a TLVP load through a dedicated
+                // `__thread_ptrs` slot, whose chained bind dyld fills at load time.
+                flags_to_add.remove(ValueFlags::DIRECT);
+                flags_to_add |= ValueFlags::GOT_TLS_DESCRIPTOR;
+            } else {
+                flags_to_add |= ValueFlags::GOT;
+            }
             // TODO: classify symbols more reliably, likely by checking whether their section is
             // __text.
             if rel_info.r_type == object::macho::ARM64_RELOC_BRANCH26
@@ -3673,6 +3745,7 @@ mod tests {
         assert!(is_tls_section_type(S_THREAD_LOCAL_REGULAR));
         assert!(is_tls_section_type(S_THREAD_LOCAL_ZEROFILL));
         assert!(!is_tls_section_type(macho::S_THREAD_LOCAL_VARIABLES));
+        assert!(!is_tls_section_type(macho::S_THREAD_LOCAL_VARIABLE_POINTERS));
         assert!(!is_tls_section_type(macho::S_REGULAR));
     }
 
@@ -3717,6 +3790,39 @@ mod tests {
         assert_eq!(*memory_offsets.get(part_id::GOT), 0x10 + GOT_ENTRY_SIZE);
         assert_eq!(
             *compute_allocations::<MachO>(&resolution, output_kind, &args).get(part_id::GOT),
+            GOT_ENTRY_SIZE
+        );
+    }
+
+    #[test]
+    fn reserves_a_distinct_tlvp_slot_for_a_dynamic_tls_descriptor() {
+        use crate::args::RelocationModel;
+        use crate::layout::compute_allocations;
+        use crate::output_kind::OutputKind;
+        use crate::platform::Platform;
+
+        let args = MachOArgs::default();
+        let output_kind = OutputKind::DynamicExecutable(RelocationModel::Relocatable);
+        let output_sections =
+            crate::output_section_id::OutputSections::<MachO>::with_base_address(0, output_kind);
+        let mut memory_offsets = output_sections.new_part_map();
+        *memory_offsets.get_mut(part_id::TLVP) = 0x20;
+
+        let resolution = MachO::create_resolution(
+            ValueFlags::GOT_TLS_DESCRIPTOR,
+            0xfeed_face,
+            None,
+            &mut memory_offsets,
+            &args,
+            output_kind,
+        );
+
+        assert_eq!(resolution.raw_value, 0x20);
+        assert_eq!(resolution.format_specific.tlvp_address.unwrap().get(), 0x20);
+        assert!(resolution.format_specific.got_address.is_none());
+        assert_eq!(*memory_offsets.get(part_id::TLVP), 0x20 + GOT_ENTRY_SIZE);
+        assert_eq!(
+            *compute_allocations::<MachO>(&resolution, output_kind, &args).get(part_id::TLVP),
             GOT_ENTRY_SIZE
         );
     }

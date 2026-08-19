@@ -46,7 +46,7 @@ than supported facilities:
 | --- | --- | --- |
 | Mach-O argument semantics | Models ARM64, dylib/executable, install names, rpaths, export lists, framework paths, strip options, and input-local `-force_load`. | partial |
 | Section/symbol classification | Handles data access, debug/non-alloc, `__DATA_CONST`, TLV storage, no-dead-strip, C strings, and Mach-O-specific no-op hooks. | partial |
-| ARM64 relocations / thunks | Validates supported standalone forms, `POINTER_TO_GOT`, local executable TLVP descriptors, paired `ADDEND`, and out-of-range `BRANCH26` via nearby text islands. `SUBTRACTOR`, dynamic-TLVP, and authenticated paths remain explicitly diagnosed or absent. | partial; unqualified |
+| ARM64 relocations / thunks | Validates supported standalone forms, `POINTER_TO_GOT`, local and dylib-imported TLVP descriptors, paired `ADDEND`, and out-of-range `BRANCH26` via nearby text islands. `SUBTRACTOR` and authenticated paths remain explicitly diagnosed or absent. | partial; unqualified |
 | Chained fixups | Plans address-ordered imported binds and local rebases per segment; gaps, leading local slots, 16 KiB pages, and malformed encodings are handled. Wider pointer-format/arm64e qualification remains. | partial; unqualified |
 | Dylib output / rpaths / exports | Emits `MH_DYLIB`, `LC_ID_DYLIB`, requested `LC_RPATH`, and omits executable-only commands; C runtime smoke passes. Dependency ordinals, weak/reexport behavior, and Rust dylib qualification remain. | partial; unqualified |
 | Dead strip / atoms | `MH_SUBSECTIONS_VIA_SYMBOLS` inputs are split into live symbol-delimited spans under `-dead_strip`; whole-section behavior is retained otherwise. | partial; differential smoke green |
@@ -61,7 +61,7 @@ than supported facilities:
 | dylib | `trivial-dynamic` now links its `foo.c` dylib with Wild and consumes it at runtime | pass | C runtime pass | n/a | smoke green |
 | framework | none | pending | pending | n/a | unqualified |
 | dead strip | `macho/dead-strip` | code/data/export parity pass | C runtime pass | pending | atom smoke green |
-| TLS | `macho/tls-local` | structural comparison pending | C runtime pass; Rust static/dylib TLS re-qualification pending | pending | local executable smoke green |
+| TLS | `macho/tls-local`, `macho/tls-dynamic` | Apple ld binds the imported descriptor through `__got`; ld64.lld uses `__thread_ptrs` | C runtime pass, including a two-thread imported-TLS smoke under `-dead_strip`; Rust static/dylib TLS re-qualification pending | pending | bounded C local/dylib smoke green |
 | compact unwind | `macho/exception` C++ throw/catch; `macho/rust-panic-unwind` | structural section/header check; C++ and Rust runtime pass | ARM64 Rust `panic=unwind` / `catch_unwind` under `-dead_strip` | pending | bounded ARM64 support |
 | DWARF / dSYM / LLDB | none | pending | pending | pending | unqualified |
 | chained fixups | existing output inspection only | pending | pending | pending | unqualified |
@@ -75,7 +75,7 @@ passed wherever Wild is listed as failing.
 | Workflow | Current Wild result | Next required work |
 | --- | --- | --- |
 | Rust/C `Security` framework | links and runs | retain as a permanent integration fixture |
-| C local and dylib TLS | links and passes a two-thread independence smoke | broaden TLS/dylib coverage |
+| C local and dylib TLS | `macho/tls-dynamic` passes an imported descriptor two-thread independence smoke under `-dead_strip` and PIE/ASLR | broaden TLS/dylib coverage |
 | Rust `cdylib` consumed from C | links and runs | export, unwind, and debug qualification |
 | Rust `dylib` consumed from Rust | consumer segfaulted before general local rebases | re-qualify after rebase work |
 | Proc macro crate | rustc segfaulted before general local rebases | re-qualify after rebase work |
@@ -155,10 +155,16 @@ relaxation APIs; none removes the known correctness gaps listed above.
   exposed by enabling C-string merging.
 * AArch64 relocation validation now rejects malformed standalone encodings deterministically,
   supports both `ARM64_RELOC_POINTER_TO_GOT` representations, local executable TLVP descriptors,
-  and paired `ADDEND` forms. It reports subtractor, dynamic-TLVP, and arm64e forms explicitly
-  instead of treating them as unknown or silently applying an invalid result. `macho/tls-local`
-  proves a C local TLS variable links and has per-process runtime initialization through the native
-  dyld bootstrap path; `macho/reloc-addend` proves a positive paired page addend at runtime.
+  dylib-imported TLVP descriptor pointers, and paired `ADDEND` forms. A dynamic TLVP is recorded
+  as the generic TLS-descriptor resource, allocated in Mach-O's dedicated
+  `__DATA,__thread_ptrs` (`S_THREAD_LOCAL_VARIABLE_POINTERS`) section rather than as an ordinary
+  GOT entry, and emitted as a normal chained bind at that slot. The writer preserves the imported
+  ADRP/LDR pair; it performs the local-descriptor LDR-to-ADD rewrite only for in-image TLS.
+  `macho/tls-local` proves a C local TLS variable links and has per-process runtime initialization
+  through the native dyld bootstrap path; `macho/tls-dynamic` proves imported TLS shares the
+  producer's value within each thread, remains isolated between two threads, and survives
+  `-dead_strip` under PIE/ASLR. `macho/reloc-addend` proves a positive paired page addend at
+  runtime.
 * Mach-O allocation now reserves every GOT/PLT entry that resolution creation will consume. The
   minimal stable Cargo smoke therefore advances past its empty-`__got` layout invariant.
 * Mach-O dynamic-library inputs are deduplicated by install name, rather than their distinct SDK
@@ -184,5 +190,5 @@ relaxation APIs; none removes the known correctness gaps listed above.
 
 1. Broaden final `__TEXT,__eh_frame` CIE/FDE grammar and retain/relocate ordinary debug DWARF for
    debugger workflows.
-2. Complete dynamic TLS, subtractor relocations, and full dylib/proc-macro qualification.
+2. Complete subtractor relocations and full dylib/proc-macro and Rust TLS qualification.
 3. Expand the Apple-differential corpus and ARM64 Rust crate-type/stress qualification.

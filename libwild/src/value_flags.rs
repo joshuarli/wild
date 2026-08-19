@@ -77,9 +77,9 @@ bitflags! {
         /// TLS block.
         const GOT_TLS_OFFSET = 1 << 10;
 
-        /// A double GOT entry is needed in order to store the function pointer and a pointer that
-        /// points to a pair of words (module number and offset within the module).
-        /// Only set for TLS variables.
+        /// A runtime-resolved TLS descriptor is needed. ELF materializes a pair of GOT words
+        /// (function pointer and module/offset pair); Mach-O instead binds one pointer to a
+        /// dylib's TLV descriptor in its dedicated `__thread_ptrs` section.
         const GOT_TLS_DESCRIPTOR = 1 << 11;
 
         /// The request originated from a dynamic object, so the symbol should be put into the dynamic
