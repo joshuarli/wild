@@ -91,6 +91,7 @@ use object::Endianness;
 use object::SymbolIndex;
 use object::U16;
 use object::U32;
+use object::Wrap;
 use object::from_bytes_mut;
 use object::macho;
 use object::macho::CPU_SUBTYPE_ARM64_ALL;
@@ -3419,12 +3420,44 @@ impl MachOSymbolTableWriter {
         Ok(())
     }
 
+    /// STABS records use the same output symbol table as ordinary symbols, but an empty
+    /// terminator name must have `n_strx == 0` rather than a second empty string in `__LINKEDIT`.
+    fn define_stab(
+        &mut self,
+        buffers: &mut OutputSectionPartMap<&mut [u8]>,
+        name: Option<&[u8]>,
+        stab: object::macho::SymbolStab,
+        section: u8,
+        desc: object::macho::SymbolDesc,
+        value: u64,
+    ) -> Result {
+        let entry = match name {
+            Some(name) => self.write_entry(name, buffers)?,
+            None => self.write_unnamed_entry(buffers)?,
+        };
+        entry.n_sect = section;
+        entry.n_type = object::macho::SymbolFlags::from_inner(stab.into_inner());
+        entry.n_value.set(LE, value);
+        entry.n_desc.set(LE, desc);
+
+        Ok(())
+    }
+
     fn write_entry<'out>(
         &mut self,
         name: &[u8],
         buffers: &'out mut OutputSectionPartMap<&mut [u8]>,
     ) -> Result<&'out mut SymtabEntry> {
         let string_offset = self.write_str(name, buffers);
+        let entry = self.write_unnamed_entry(buffers)?;
+        entry.n_strx.set(LE, string_offset);
+        Ok(entry)
+    }
+
+    fn write_unnamed_entry<'out>(
+        &mut self,
+        buffers: &'out mut OutputSectionPartMap<&mut [u8]>,
+    ) -> Result<&'out mut SymtabEntry> {
         let entry_bytes = buffers
             .get_mut(part_id::SYMTAB_GLOBAL)
             .split_off_mut(..size_of::<SymtabEntry>())
@@ -3432,7 +3465,7 @@ impl MachOSymbolTableWriter {
         let entry: &mut SymtabEntry = from_bytes_mut(entry_bytes)
             .map_err(|_| error!("Invalid SYMTAB_GLOBAL entry allocation"))?
             .0;
-        entry.n_strx.set(LE, string_offset);
+        entry.n_strx.set(LE, 0);
         Ok(entry)
     }
 }
@@ -3443,6 +3476,8 @@ fn write_symbols<'data>(
     layout: &MachOLayout<'data>,
     symbol_writer: &mut MachOSymbolTableWriter,
 ) -> Result {
+    write_dsymutil_debug_map(object, buffers, layout, symbol_writer)?;
+
     for ((sym_index, sym), flags) in object
         .object
         .enumerate_symbols()
@@ -3508,6 +3543,108 @@ fn write_symbols<'data>(
 
         symbol_writer.define_symbol(buffers, info.name, section, symbol_type, desc, value)?;
     }
+
+    Ok(())
+}
+
+/// Emits the minimal STABS debug map that Apple's `dsymutil` accepts for ordinary C objects.
+///
+/// The final executable deliberately contains no copied `__DWARF` sections. `N_OSO` preserves
+/// the loose input-object path, while each paired `N_FUN` records the original function length
+/// and its post-GC, post-compaction output address. `dsymutil` is then responsible for applying
+/// the input DWARF relocations and producing the dSYM.
+fn write_dsymutil_debug_map<'data>(
+    object: &ObjectLayout<'data, MachO>,
+    buffers: &mut OutputSectionPartMap<&mut [u8]>,
+    layout: &MachOLayout<'data>,
+    symbol_writer: &mut MachOSymbolTableWriter,
+) -> Result {
+    if layout.args().should_strip_debug() || object.input.entry.is_some() {
+        return Ok(());
+    }
+    let Some(debug_map) = object.object.dsymutil_debug_map(&object.sections, |section, offset| {
+        object.input_offset_is_live(section, offset)
+    })? else {
+        return Ok(());
+    };
+
+    let object_path = object.input.file.filename.as_os_str().as_encoded_bytes();
+    symbol_writer.define_stab(
+        buffers,
+        Some(&debug_map.source_path),
+        macho::N_SO,
+        0,
+        object::macho::SymbolDesc::default(),
+        0,
+    )?;
+    // `n_desc == 1` is the low ARM64 CPU subtype byte used by Apple's and lld's C debug maps.
+    symbol_writer.define_stab(
+        buffers,
+        Some(object_path),
+        macho::N_OSO,
+        0,
+        object::macho::SymbolDesc::from_inner(1),
+        0,
+    )?;
+
+    let mut terminating_source_section = 0;
+    for function in &debug_map.functions {
+        let output_section_id = object
+            .section_part_id(function.section_index, &layout.symbol_db.section_part_ids)
+            .output_section_id::<MachO>();
+        let primary_id = layout.output_sections.primary_output_section(output_section_id);
+        let section = macho_section_index(layout, primary_id).with_context(|| {
+            format!(
+                "No Mach-O section index for {} while writing dSYM map entry {}",
+                primary_id,
+                String::from_utf8_lossy(function.name)
+            )
+        })?;
+        let output_offset = object
+            .output_offset_for_input(function.section_index, function.input_offset)
+            .with_context(|| {
+                format!(
+                    "Live Mach-O dSYM map atom {} has no output offset",
+                    String::from_utf8_lossy(function.name)
+                )
+            })?;
+        let address = object.section_resolutions[function.section_index.0]
+            .address()
+            .with_context(|| {
+                format!(
+                    "Live Mach-O dSYM map atom {} has no output section address",
+                    String::from_utf8_lossy(function.name)
+                )
+            })?
+            .checked_add(output_offset)
+            .context("Mach-O dSYM map function address overflows")?;
+
+        symbol_writer.define_stab(
+            buffers,
+            Some(function.name),
+            macho::N_FUN,
+            section,
+            object::macho::SymbolDesc::default(),
+            address,
+        )?;
+        symbol_writer.define_stab(
+            buffers,
+            None,
+            macho::N_FUN,
+            0,
+            object::macho::SymbolDesc::default(),
+            function.input_size,
+        )?;
+        terminating_source_section = section;
+    }
+    symbol_writer.define_stab(
+        buffers,
+        None,
+        macho::N_SO,
+        terminating_source_section,
+        object::macho::SymbolDesc::default(),
+        0,
+    )?;
 
     Ok(())
 }

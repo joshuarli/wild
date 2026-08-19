@@ -83,11 +83,14 @@ use object::read::macho::Nlist;
 use object::read::macho::Section;
 use object::read::macho::Segment;
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 use std::num::NonZeroU8;
 use std::num::NonZeroU64;
 use std::ops::Range;
 use std::slice::Iter;
 use std::sync::atomic::Ordering;
+
+use gimli::Reader as _;
 
 #[derive(Debug, Copy, Clone, Default)]
 pub(crate) struct MachO;
@@ -826,6 +829,29 @@ pub(crate) struct File<'data> {
     #[allow(unused)]
     pub(crate) flags: object::macho::FileFlags,
     kind: ObjectKind<'data>,
+}
+
+/// A source-level function entry that `dsymutil` can relocate from an input C object to the
+/// linked image. The length deliberately stays in input coordinates: that is the `N_FUN`
+/// terminator convention used by Apple's debug-map reader.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DsymutilDebugMapFunction<'data> {
+    pub(crate) name: &'data [u8],
+    pub(crate) section_index: object::SectionIndex,
+    pub(crate) input_offset: u64,
+    pub(crate) input_size: u64,
+}
+
+/// The deliberately small Mach-O debug-map slice that we can prove for ordinary C objects.
+///
+/// Final Mach-O executables do not carry their input `__DWARF` sections. Instead, `dsymutil`
+/// reads those still-available objects through `N_OSO` and uses `N_FUN` entries to relocate CUs
+/// into a dSYM. Keep this separate from output-section handling so debug relocations never make
+/// dead code live.
+#[derive(Debug)]
+pub(crate) struct DsymutilDebugMap<'data> {
+    pub(crate) source_path: Vec<u8>,
+    pub(crate) functions: Vec<DsymutilDebugMapFunction<'data>>,
 }
 
 /// Mach-O permits atom-level dead stripping only when the input file opts into
@@ -2619,6 +2645,25 @@ impl platform::Platform for MachO {
                 strings_size += info.name.len() + 1;
             }
         }
+
+        // An executable's final image intentionally omits ordinary `__DWARF`. For the restricted
+        // C path, reserve the STABS debug map that lets `dsymutil` reopen this loose input object
+        // and do the address rewriting itself. Keep this allocation exactly in sync with
+        // `write_dsymutil_debug_map` in the writer.
+        if !symbol_db.args.should_strip_debug() && state.input.entry.is_none() {
+            if let Some(debug_map) = state.object.dsymutil_debug_map(&state.sections, |section, offset| {
+                state.input_offset_is_live(section, offset)
+            })? {
+                num_globals += 3 + 2 * debug_map.functions.len() as u64;
+                strings_size += debug_map.source_path.len() + 1;
+                strings_size += state.input.file.filename.as_os_str().as_encoded_bytes().len() + 1;
+                strings_size += debug_map
+                    .functions
+                    .iter()
+                    .map(|function| function.name.len() + 1)
+                    .sum::<usize>();
+            }
+        }
         let entry_size = size_of::<SymtabEntry>() as u64;
         common.allocate(part_id::SYMTAB_GLOBAL, num_globals * entry_size);
         common.allocate(part_id::STRTAB, strings_size as u64);
@@ -3399,6 +3444,119 @@ fn is_dynamic_library(file: &SequencedInput<MachO>) -> bool {
 }
 
 impl<'data> File<'data> {
+    /// Returns the C compilation-unit path recorded in ordinary DWARF, if this object is in the
+    /// intentionally narrow debug-map subset. DWARF relocations are not applied here: extracting
+    /// `DW_AT_language` and `DW_AT_name` does not need code addresses, and applying them during
+    /// layout could make otherwise dead atoms live.
+    fn c_dwarf_source_path(&self) -> Result<Option<Vec<u8>>> {
+        let dwarf_sections = gimli::DwarfSections::load(&|id: gimli::SectionId| -> Result<Cow<[u8]>> {
+            // Mach-O spells DWARF section names with two leading underscores, while gimli uses
+            // their ELF spelling (for example `.debug_info`).
+            let section_name = format!("__{}", id.name().trim_start_matches('.'));
+            let data = self
+                .section_by_name(&section_name)
+                .map_or(Ok(&[][..]), |(_, section)| self.raw_section_data(section))?;
+            Ok(Cow::Borrowed(data))
+        })?;
+        let borrow_section: &dyn for<'a> Fn(
+            &'a Cow<[u8]>,
+        ) -> gimli::EndianSlice<'a, gimli::LittleEndian> =
+            &|section| gimli::EndianSlice::new(section, gimli::LittleEndian);
+        let dwarf = dwarf_sections.borrow(borrow_section);
+
+        let mut units = dwarf.units();
+        let Some(header) = units.next()? else {
+            return Ok(None);
+        };
+        let unit = dwarf.unit(header)?;
+        let mut entries = unit.entries();
+        let Some(root) = entries.next_dfs()? else {
+            return Ok(None);
+        };
+        if root.tag() != gimli::DW_TAG_compile_unit {
+            return Ok(None);
+        }
+        let Some(gimli::AttributeValue::Language(language)) =
+            root.attr_value(gimli::DW_AT_language)
+        else {
+            return Ok(None);
+        };
+        if !matches!(
+            language,
+            gimli::DW_LANG_C89
+                | gimli::DW_LANG_C
+                | gimli::DW_LANG_C99
+                | gimli::DW_LANG_C11
+                | gimli::DW_LANG_C17
+        ) {
+            return Ok(None);
+        }
+        let Some(name) = root.attr_value(gimli::DW_AT_name) else {
+            return Ok(None);
+        };
+        Ok(Some(dwarf.attr_string(&unit, name)?.to_slice()?.into_owned()))
+    }
+
+    /// Builds the `N_SO`/`N_OSO`/`N_FUN` payload for an ordinary C object. This only names live,
+    /// loaded executable atoms: merged sections have no linear input-to-output mapping and
+    /// unloaded/dead atoms must not get an address in the debug map.
+    pub(crate) fn dsymutil_debug_map(
+        &'data self,
+        sections: &[resolution::SectionSlot],
+        mut input_offset_is_live: impl FnMut(object::SectionIndex, u64) -> bool,
+    ) -> Result<Option<DsymutilDebugMap<'data>>> {
+        if !self.uses_subsections_via_symbols() {
+            return Ok(None);
+        }
+        let Some(source_path) = self.c_dwarf_source_path()? else {
+            return Ok(None);
+        };
+
+        let mut functions = Vec::new();
+        let mut emitted_atoms = BTreeSet::new();
+        for (symbol_index, symbol) in self.enumerate_symbols() {
+            if symbol.n_type.is_stab() || symbol.n_type.typ() != N_SECT {
+                continue;
+            }
+            let Some((section_index, atom_range)) = self.atom_for_symbol(symbol, symbol_index)?
+            else {
+                continue;
+            };
+            let section = self.section(section_index)?;
+            if !section.is_executable()
+                || !matches!(sections.get(section_index.0), Some(resolution::SectionSlot::Loaded(_)))
+                || !input_offset_is_live(section_index, atom_range.start)
+                || atom_range.is_empty()
+            {
+                continue;
+            }
+            let name = self.symbol_name(symbol)?;
+            // `ltmp` marks compiler section labels rather than user functions. It shares the
+            // first function atom on clang-generated C inputs, so omitting it before de-duping
+            // lets the function symbol own that atom's dSYM mapping.
+            if name.is_empty() || name.starts_with(b"ltmp") {
+                continue;
+            }
+            if !emitted_atoms.insert((section_index.0, atom_range.start)) {
+                continue;
+            }
+            functions.push(DsymutilDebugMapFunction {
+                name,
+                section_index,
+                input_offset: atom_range.start,
+                input_size: atom_range.end - atom_range.start,
+            });
+        }
+
+        if functions.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(DsymutilDebugMap {
+            source_path,
+            functions,
+        }))
+    }
+
     fn uses_subsections_via_symbols(&self) -> bool {
         self.flags.0 & macho::MH_SUBSECTIONS_VIA_SYMBOLS.0 != 0
     }

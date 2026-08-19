@@ -50,7 +50,7 @@ than supported facilities:
 | Chained fixups | Plans address-ordered imported binds and local rebases per segment; gaps, leading local slots, 16 KiB pages, and malformed encodings are handled. Wider pointer-format/arm64e qualification remains. | partial; unqualified |
 | Dylib output / rpaths / exports | Emits `MH_DYLIB`, `LC_ID_DYLIB`, requested `LC_RPATH`, and omits executable-only commands; C runtime smoke passes. Dependency ordinals, weak/reexport behavior, and Rust dylib qualification remain. | partial; unqualified |
 | Dead strip / atoms | `MH_SUBSECTIONS_VIA_SYMBOLS` inputs are split into live symbol-delimited spans under `-dead_strip`; whole-section behavior is retained otherwise. | partial; differential smoke green |
-| TLS, compact unwind, DWARF, string merging | A local C TLS descriptor fixture executes successfully. ARM64 compact frame/frameless rows, personality pointers, and LSDAs are synthesized and a C++ throw/catch fixture passes. Bounded ARM64 DWARF-mode rows now serialize their live `__eh_frame` CIE/FDE records and pass a Rust `panic=unwind` / `catch_unwind` smoke under `-dead_strip`; ordinary debug DWARF remains dropped. | partial; bounded unwind smoke green |
+| TLS, compact unwind, DWARF, string merging | A local C TLS descriptor fixture executes successfully. ARM64 compact frame/frameless rows, personality pointers, and LSDAs are synthesized and a C++ throw/catch fixture passes. Bounded ARM64 DWARF-mode rows now serialize their live `__eh_frame` CIE/FDE records and pass a Rust `panic=unwind` / `catch_unwind` smoke under `-dead_strip`. Ordinary C debug data is represented only by a bounded `dsymutil` debug map; final executables intentionally do not copy `__DWARF`. | partial; bounded unwind and C debug-map smoke green |
 
 ## Compatibility matrix
 
@@ -61,9 +61,9 @@ than supported facilities:
 | dylib | `trivial-dynamic` now links its `foo.c` dylib with Wild and consumes it at runtime | pass | C runtime pass | n/a | smoke green |
 | framework | none | pending | pending | n/a | unqualified |
 | dead strip | `macho/dead-strip` | code/data/export parity pass | C runtime pass | pending | atom smoke green |
-| TLS | `macho/tls-local`, `macho/tls-dynamic` | Apple ld binds the imported descriptor through `__got`; ld64.lld uses `__thread_ptrs` | C runtime pass, including a two-thread imported-TLS smoke under `-dead_strip`; Rust static/dylib TLS re-qualification pending | pending | bounded C local/dylib smoke green |
+| TLS | `macho/tls-local`, `macho/tls-dynamic`, `macho/rust-thread-local` | Apple ld binds the imported descriptor through `__got`; ld64.lld uses `__thread_ptrs` | C and Rust two-thread runtime passes under Wild; Rust static/dylib TLS qualification remains external | pending | bounded C/Rust local/dylib smoke green |
 | compact unwind | `macho/exception` C++ throw/catch; `macho/rust-panic-unwind` | structural section/header check; C++ and Rust runtime pass | ARM64 Rust `panic=unwind` / `catch_unwind` under `-dead_strip` | pending | bounded ARM64 support |
-| DWARF / dSYM / LLDB | none | pending | pending | pending | unqualified |
+| DWARF / dSYM / LLDB | `macho/debug-dwarf` C `-g -dead_strip` | Apple ld and ld64.lld establish the `N_SO`/`N_OSO`/paired-`N_FUN` control shape; Wild `dsymutil --dump-debug-map` passes | generated dSYM verifies; LLDB source breakpoint/backtrace and C parameter inspection pass | pending | bounded loose-object ARM64 C support |
 | chained fixups | existing output inspection only | pending | pending | pending | unqualified |
 | branch islands | `macho/branch-island`, `macho/branch-islands` | Apple links forced overflows | C runtime pass | multiple islands pass | ARM64 smoke green |
 
@@ -76,13 +76,13 @@ passed wherever Wild is listed as failing.
 | --- | --- | --- |
 | Rust/C `Security` framework | links and runs | retain as a permanent integration fixture |
 | C local and dylib TLS | `macho/tls-dynamic` passes an imported descriptor two-thread independence smoke under `-dead_strip` and PIE/ASLR | broaden TLS/dylib coverage |
-| Rust `cdylib` consumed from C | links and runs | export, unwind, and debug qualification |
-| Rust `dylib` consumed from Rust | consumer segfaulted before general local rebases | re-qualify after rebase work |
-| Proc macro crate | rustc segfaulted before general local rebases | re-qualify after rebase work |
-| Rust `thread_local!` / `cargo test` | default `cargo test` now passes through Wild; `thread_local!` needs re-qualification | exercise static/dylib TLS matrix |
+| Rust `cdylib` consumed from C | retained Cargo workspace links and runs through Wild; the existing integration harness cannot replay rustc's generated export-list file | fix save-dir retention of `-exported_symbols_list`, then add a permanent C consumer |
+| Rust `dylib` consumed from Rust | retained Cargo workspace links and runs through Wild | add Cargo crate-graph coverage outside the one-source integration harness |
+| Proc macro crate | retained Cargo workspace compiles, loads, and runs through Wild | add Cargo crate-graph coverage outside the one-source integration harness |
+| Rust `thread_local!` / `cargo test` | permanent `macho/rust-thread-local` two-thread fixture and default `cargo test` pass through Wild | exercise static/dylib TLS matrix |
 | C++ throw/catch | links, emits `__TEXT,__unwind_info`, and catches at runtime | broaden compact-unwind differential coverage |
 | Rust `panic=unwind` | `macho/rust-panic-unwind` selects live CIE/FDE records, rewrites DWARF compact-unwind FDE offsets, and catches a panic at runtime under `-dead_strip` | broaden CIE/FDE grammar and crate/stress coverage |
-| DWARF / `dsymutil` | debug sections are dropped; `dsymutil` reports no debug symbols | retain and relocate debug sections |
+| C DWARF / `dsymutil` | `macho/debug-dwarf` emits `N_SO`, `N_OSO`, and live-atom `N_FUN` pairs; `dsymutil` makes a verified dSYM and LLDB stops at the C source line under `-dead_strip` | qualify more C shapes and debug-map inputs |
 | `-dead_strip` and `-force_load` | dead C code/data and unreferenced forced archive member are covered | add stress/edge corpus |
 | 138 MiB fragmented branch | Apple and Wild both link/run through nearby islands | larger stress qualification |
 | 700 imported function binds | links/runs across multiple pages | extend fixups from imported GOT binds to local rebases |
@@ -91,6 +91,12 @@ passed wherever Wild is listed as failing.
 
 * Fast existing Mach-O suite: `cargo test --profile ci --workspace --features macho`.
 * Existing CI build: `cargo build --profile ci --workspace --no-default-features`.
+* Focused permanent Rust TLS fixture: `WILD_TEST_IGNORE_FORMAT=1 cargo test -p wild-linker
+  --features macho --test integration_tests -- 'macho/aarch64/rust-thread-local/default'`.
+* Focused C debug-map fixture: `WILD_TEST_IGNORE_FORMAT=1 cargo test --profile ci -p wild-linker
+  --test integration_tests --features macho -- 'macho/aarch64/debug-dwarf/default'`. Its output
+  can be checked with `dsymutil --dump-debug-map <binary>`, `dsymutil <binary>`, and
+  `dwarfdump --verify <binary>.dSYM/Contents/Resources/DWARF/<binary-name>`.
 * Rust-to-Darwin command capture: [`darwin-linker-recorder.md`](darwin-linker-recorder.md)
   documents the new `darwin-linker-recorder` wrapper and its exact NUL-delimited replay records.
 * A fresh stable `aarch64-apple-darwin` Cargo binary was captured through that recorder. Its final
@@ -122,6 +128,62 @@ RUSTFLAGS="-C linker=clang -C link-arg=--ld-path=$PWD/target/debug/wild" \
 This is a smoke result only. It is not evidence for dynamic TLS, proc macros, Rust panic/unwind,
 or debug information and the other qualification gates listed below. The invocation selects Wild;
 it does not fall back to Apple ld.
+
+### Existing integration-harness coverage and Cargo boundary
+
+`wild/tests/integration_tests.rs` can compile a standalone `.rs` primary source, and its `Shared`
+input can invoke rustc with `--crate-type cdylib`. The permanent `macho/rust-thread-local` fixture
+uses the first path and verifies independent Rust TLS values in the parent and child threads.
+
+The `Shared` cdylib path is not yet a passing fixture: rustc's save-dir replay contains an
+`-exported_symbols_list` file under a generated `rustcwsAsIT` path, but Wild does not copy that
+file into the save directory. The exact current failure is:
+
+```text
+ld: -exported_symbols_list file '.../rustcwsAsIT/list' could not be opened, errno=2
+```
+
+The smallest implementation prerequisite for a permanent Rust cdylib/C consumer fixture is to
+retain that option's file in the save-dir input set; do not add a permanently failing fixture.
+
+Cargo Rust `dylib` consumption and proc-macro loading require multiple packages and distinct
+rustc invocations (producer, consumer, and proc-macro host). They therefore do not fit the
+single-source compiler model in this integration harness. Requalify them in a retained temporary
+Cargo workspace with the following repeatable controls:
+
+```sh
+cargo build -p wild-linker --features macho --bin wild
+WILD="$PWD/target/debug/wild"
+CARGO_TARGET_DIR="$QUAL_DIR/target" \
+RUSTFLAGS="-Clinker=clang -Clink-arg=--ld-path=$WILD" \
+  cargo run --manifest-path "$QUAL_DIR/Cargo.toml" \
+    --target aarch64-apple-darwin -vv
+```
+
+The workspace should contain a path-dependent Rust `dylib` producer/consumer pair and a
+`proc-macro = true` crate plus a consumer. Preserve each `cargo -vv` log, the `WILD_SAVE_DIR`
+`run-with` file, and the exit status; accept a result only when the final rustc/clang invocation
+contains `--ld-path=$WILD` and the resulting ARM64 consumer runs. This is the reproducible Cargo
+qualification plan for those crate graphs without adding a parallel test framework here.
+
+### Bounded C `dsymutil` debug map
+
+`macho/debug-dwarf` is the permanent ARM64 C control: clang compiles one loose `-g` object and
+the link uses `-dead_strip`. Wild intentionally leaves final `__DWARF` sections out of the
+executable, as Apple ld and ld64.lld do. Instead `MachO::allocate_object_symtab_space` reserves,
+and `write_dsymutil_debug_map` emits, `N_SO`, `N_OSO`, one start/terminator `N_FUN` pair for each
+live executable atom, and the terminating empty `N_SO`. Start addresses use the post-GC compacted
+section mapping; terminators retain each atom's original input length. `dsymutil` owns DWARF
+relocation and address rewriting when it builds the dSYM.
+
+The supported input is deliberately small: a loose ARM64 Mach-O object with
+`MH_SUBSECTIONS_VIA_SYMBOLS`, ordinary C (`DW_LANG_C89`, `C`, `C99`, `C11`, or `C17`) debug data,
+and live, non-merged executable atoms. The fixture checks that a dead static function is absent
+from the map, runs `dsymutil --dump-debug-map`, verifies the generated dSYM with `dwarfdump`, and
+uses an LLDB batch source breakpoint/backtrace to inspect `value = 41`. C++, Objective-C,
+archives, split DWARF, and all Rust debug-info modes are not claimed by this implementation.
+There is no final-section copy, generic debug relocation writer, or Rust dSYM claim hidden behind
+this C smoke.
 
 ### Local chained-rebase regression
 
@@ -185,10 +247,11 @@ relaxation APIs; none removes the known correctness gaps listed above.
 * Universal/fat output (thin binaries combined externally are sufficient).
 * Incremental linking.
 * x86_64 Mach-O is outside the agreed scope for this effort.
+* C++/Objective-C/Rust/archived/split-DWARF dSYM debug maps and generic output-DWARF relocation.
 
 ## Next work items
 
-1. Broaden final `__TEXT,__eh_frame` CIE/FDE grammar and retain/relocate ordinary debug DWARF for
-   debugger workflows.
+1. Broaden final `__TEXT,__eh_frame` CIE/FDE grammar and qualify C++/Objective-C/Rust/archive
+   debug-map inputs before designing any generic ordinary-DWARF relocation path.
 2. Complete subtractor relocations and full dylib/proc-macro and Rust TLS qualification.
 3. Expand the Apple-differential corpus and ARM64 Rust crate-type/stress qualification.

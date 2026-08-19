@@ -100,6 +100,13 @@
 //! ExpectSectionBytes:{section_name}=0x{hex_bytes} [start_range..end_range] Checks that the
 //! specified section contains exactly the given bytes.
 //!
+//! ExpectDsymutilSymbol:{symbol-name} Runs `dsymutil --dump-debug-map` and checks that the
+//! resulting Mach-O debug map contains the named input-to-output function mapping.
+//!
+//! NoDsymutilSymbol:{symbol-name} Checks that `dsymutil --dump-debug-map` does not contain the
+//! named function mapping. This is useful for asserting that `-dead_strip` atoms stay out of a
+//! dSYM map.
+//!
 //! ExpectGdbIndexCuCount:{count} Checks that the `.gdb_index` section contains exactly the
 //! specified number of CU entries.
 //!
@@ -1874,6 +1881,8 @@ struct Assertions {
     expected_sections: Vec<ExpectedSection>,
     absent_sections: Vec<String>,
     expected_section_bytes: Vec<ExpectedSectionBytes>,
+    expected_dsymutil_symbols: Vec<String>,
+    absent_dsymutil_symbols: Vec<String>,
     /// Wasm: `(module, field, expected_count)` for function imports.
     expected_func_imports: Vec<(String, String, usize)>,
     /// Wasm: total number of function imports in the import section.
@@ -2506,6 +2515,14 @@ fn process_directive(
                     match_range,
                 });
         }
+        "ExpectDsymutilSymbol" => config
+            .assertions
+            .expected_dsymutil_symbols
+            .push(arg.to_owned()),
+        "NoDsymutilSymbol" => config
+            .assertions
+            .absent_dsymutil_symbols
+            .push(arg.to_owned()),
         "ExpectDynamic" => config
             .assertions
             .expected_dynamic_entries
@@ -4800,7 +4817,51 @@ impl Assertions {
         }
 
         self.check_path(&link_output.binary, &link_output.linker_used)?;
+        self.check_dsymutil_debug_map(link_output)?;
         self.check_output_files(link_output)?;
+        Ok(())
+    }
+
+    fn check_dsymutil_debug_map(&self, link_output: &LinkOutput) -> Result {
+        if self.expected_dsymutil_symbols.is_empty() && self.absent_dsymutil_symbols.is_empty() {
+            return Ok(());
+        }
+
+        let output = Command::new("dsymutil")
+            .arg("--dump-debug-map")
+            .arg(&link_output.binary)
+            .output()
+            .with_context(|| {
+                format!(
+                    "Failed to run dsymutil for `{}`",
+                    link_output.binary.display()
+                )
+            })?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !output.status.success() {
+            bail!(
+                "dsymutil failed for `{}`:\n{stdout}{stderr}",
+                link_output.binary.display()
+            );
+        }
+
+        for symbol in &self.expected_dsymutil_symbols {
+            let expected = format!("sym: {symbol}");
+            ensure!(
+                stdout.contains(&expected),
+                "dsymutil debug map for `{}` does not contain `{expected}`:\n{stdout}{stderr}",
+                link_output.binary.display()
+            );
+        }
+        for symbol in &self.absent_dsymutil_symbols {
+            let unexpected = format!("sym: {symbol}");
+            ensure!(
+                !stdout.contains(&unexpected),
+                "dsymutil debug map for `{}` unexpectedly contains `{unexpected}`:\n{stdout}{stderr}",
+                link_output.binary.display()
+            );
+        }
         Ok(())
     }
 
@@ -4897,6 +4958,8 @@ impl Assertions {
             expected_sections: self.expected_sections.clone(),
             absent_sections: self.absent_sections.clone(),
             expected_section_bytes: self.expected_section_bytes.clone(),
+            expected_dsymutil_symbols: self.expected_dsymutil_symbols.clone(),
+            absent_dsymutil_symbols: self.absent_dsymutil_symbols.clone(),
             output_file_matches: self.output_file_matches.clone(),
             ..Default::default()
         };
