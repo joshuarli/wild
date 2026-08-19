@@ -1021,7 +1021,10 @@ pub(crate) fn get_merged_string_output_address<'data, P: Platform>(
     let SectionSlot::MergeStrings(merge_slot) = &sections[section_index.0] else {
         return Ok(None);
     };
-    let mut input_offset = symbol.value();
+    // ELF symbol values are section-relative, whereas Mach-O n_value is the input object's
+    // address in its section. Ask the platform adapter for the section-relative offset instead
+    // so the merge map is keyed in the same coordinate system for every format.
+    let mut input_offset = object.symbol_offset_in_section(symbol, section_index)?;
 
     // When we reference data in a string-merge section via a named symbol, we determine which
     // string we're referencing without taking the addend into account, then apply the addend
@@ -1109,7 +1112,7 @@ impl MergedStringStartAddresses {
         let mut addresses = output_sections.new_section_map_with(|| [0; MERGE_STRING_BUCKETS]);
         let internal_start_offsets = starting_mem_offsets_by_group.first().unwrap();
         merge_string_sections.for_each(|section_id, sec| {
-            if !section_id.is_regular::<P>() {
+            if sec.len() == 0 || !section_id.is_regular::<P>() {
                 return;
             }
             // We already have the offsets of each bucket relative to the start of the section. So

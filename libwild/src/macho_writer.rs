@@ -42,6 +42,7 @@ use crate::macho::MACHO_START_MEM_ADDRESS;
 use crate::macho::MAX_SEGMENT_COUNT;
 use crate::macho::MachO;
 use crate::macho::PLT_ENTRY_SIZE;
+use crate::macho::RpathCommand;
 use crate::macho::SectionEntry;
 use crate::macho::SegmentCommand;
 use crate::macho::SegmentName;
@@ -51,12 +52,14 @@ use crate::macho::code_signature_identifier;
 use crate::macho::code_signature_padded_identifier_size;
 use crate::macho::get_segment_sections;
 use crate::macho::load_dylib_command_size;
+use crate::macho::rpath_command_size;
 use crate::macho::output_section_id;
 use crate::macho::output_section_id::LOAD_COMMANDS;
 use crate::macho::part_id;
 use crate::output_section_id::OrderEvent;
 use crate::output_section_id::OutputSectionId;
 use crate::output_section_id::SectionName;
+use crate::output_section_map::OutputSectionMap;
 use crate::output_section_part_map::OutputSectionPartMap;
 use crate::output_trace::HexU64;
 use crate::output_trace::TraceOutput;
@@ -93,14 +96,17 @@ use object::macho::LC_BUILD_VERSION;
 use object::macho::LC_CODE_SIGNATURE;
 use object::macho::LC_DYLD_CHAINED_FIXUPS;
 use object::macho::LC_DYLD_EXPORTS_TRIE;
+use object::macho::LC_ID_DYLIB;
 use object::macho::LC_LOAD_DYLIB;
 use object::macho::LC_LOAD_DYLINKER;
 use object::macho::LC_MAIN;
+use object::macho::LC_RPATH;
 use object::macho::LC_SEGMENT_64;
 use object::macho::LC_SYMTAB;
 use object::macho::LC_UUID;
 use object::macho::LoadCommand;
 use object::macho::MH_CIGAM_64;
+use object::macho::MH_DYLIB;
 use object::macho::MH_EXECUTE;
 use object::macho::N_ABS;
 use object::macho::N_SECT;
@@ -162,12 +168,28 @@ pub(crate) fn write<'data, A: Arch<Platform = MachO>>(
     let mut section_buffers = split_output_into_sections(layout, &mut sized_output.out).0;
     write_got_entries(layout, section_buffers.get_mut(output_section_id::GOT))?;
     write_plt_entries::<A>(layout, section_buffers.get_mut(output_section_id::PLT_GOT))?;
+    write_merged_strings(layout, &mut section_buffers);
 
     write_code_signature_metadata(layout, sized_output)?;
     write_uuid(layout, sized_output)?;
     write_code_signature_hashes(layout, sized_output)?;
 
     Ok(())
+}
+
+/// Merged string sections are represented by layout-owned buckets rather than by an input object
+/// section. They must therefore be emitted after object copying and before the final code-signature
+/// hash, just as regular input data is.
+fn write_merged_strings(
+    layout: &MachOLayout<'_>,
+    buffers: &mut OutputSectionMap<&mut [u8]>,
+) {
+    layout.merged_strings.for_each(|section_id, merged| {
+        if merged.len() > 0 {
+            let buffer = buffers.get_mut(section_id);
+            crate::elf_writer::write_merged_strings_to_buffer(merged, buffer);
+        }
+    });
 }
 
 fn write_file<'data, A: Arch<Platform = MachO>>(
@@ -231,11 +253,26 @@ fn write_prelude<'data>(
         write_build_version_command(layout, build_version_command)?;
     }
 
-    let command_size = (size_of::<DylinkerCommand>() + DYLINKER_PATH.len())
-        .next_multiple_of(MACHO_COMMAND_ALIGNMENT);
-    let mut command_buffer = load_command_buffer.split_off_mut(..command_size).unwrap();
-    let dylinker_command = take_mut(&mut command_buffer)?;
-    write_dylinker_command(dylinker_command, command_buffer);
+    if layout.symbol_db.output_kind.is_executable() {
+        let command_size = (size_of::<DylinkerCommand>() + DYLINKER_PATH.len())
+            .next_multiple_of(MACHO_COMMAND_ALIGNMENT);
+        let mut command_buffer = load_command_buffer.split_off_mut(..command_size).unwrap();
+        let dylinker_command = take_mut(&mut command_buffer)?;
+        write_dylinker_command(dylinker_command, command_buffer);
+    } else if layout.symbol_db.output_kind.is_shared_object() {
+        let install_name = layout.args().dylib_install_name();
+        let command_size = load_dylib_command_size(install_name);
+        let mut command_buffer = load_command_buffer.split_off_mut(..command_size).unwrap();
+        let dylib_command = take_mut(&mut command_buffer)?;
+        write_dylib_command(dylib_command, command_buffer, install_name, LC_ID_DYLIB);
+    }
+
+    for rpath in &layout.args().rpaths {
+        let command_size = rpath_command_size(rpath.as_bytes());
+        let mut command_buffer = load_command_buffer.split_off_mut(..command_size).unwrap();
+        let rpath_command = take_mut(&mut command_buffer)?;
+        write_rpath_command(rpath_command, command_buffer, rpath.as_bytes());
+    }
 
     for (&file_id, &command_size) in prelude
         .format_specific
@@ -247,7 +284,7 @@ fn write_prelude<'data>(
         let dylib_command = take_mut(&mut command_buffer)?;
         let path = crate::macho::install_name(file_id, &layout.symbol_db);
 
-        write_dylib_command(dylib_command, command_buffer, path);
+        write_dylib_command(dylib_command, command_buffer, path, LC_LOAD_DYLIB);
     }
 
     write_dyld_chained_fixups_command(layout, take_mut(&mut load_command_buffer)?);
@@ -432,17 +469,25 @@ fn populate_file_header(
     header.magic.set(BigEndian, MH_CIGAM_64);
     header.cputype.set(LE, CPU_TYPE_ARM64);
     header.cpusubtype.set(LE, CPU_SUBTYPE_ARM64_ALL.into());
-    header.filetype.set(LE, MH_EXECUTE);
+    header.filetype.set(
+        LE,
+        if layout.symbol_db.output_kind.is_shared_object() {
+            MH_DYLIB
+        } else {
+            MH_EXECUTE
+        },
+    );
     header
         .ncmds
         .set(LE, prelude.format_specific.load_command_count as u32);
     header
         .sizeofcmds
         .set(LE, load_commands_info.file_size as u32);
-    header.flags.set(
-        LE,
-        macho::MH_PIE | macho::MH_DYLDLINK | macho::MH_NOUNDEFS | macho::MH_TWOLEVEL,
-    );
+    let mut flags = macho::MH_DYLDLINK | macho::MH_NOUNDEFS | macho::MH_TWOLEVEL;
+    if layout.symbol_db.output_kind.is_executable() {
+        flags |= macho::MH_PIE;
+    }
+    header.flags.set(LE, flags);
     header.reserved.set(LE, 0);
 }
 
@@ -816,8 +861,13 @@ fn write_dylinker_command(command: &mut DylinkerCommand, path_buffer: &mut [u8])
     path_buffer[DYLINKER_PATH.len()..].zero();
 }
 
-fn write_dylib_command(command: &mut DylibCommand, path_buffer: &mut [u8], path: &[u8]) {
-    command.cmd.set(LE, LC_LOAD_DYLIB);
+fn write_dylib_command(
+    command: &mut DylibCommand,
+    path_buffer: &mut [u8],
+    path: &[u8],
+    command_type: macho::LoadCommandType,
+) {
+    command.cmd.set(LE, command_type);
     command
         .cmdsize
         .set(LE, load_dylib_command_size(path) as u32);
@@ -839,6 +889,20 @@ fn write_dylib_command(command: &mut DylibCommand, path_buffer: &mut [u8], path:
         .set(LE, macho::Version(1 << 16));
 
     path_buffer[0..path.len()].copy_from_slice(path);
+    path_buffer[path.len()..].zero();
+}
+
+fn write_rpath_command(command: &mut RpathCommand, path_buffer: &mut [u8], path: &[u8]) {
+    command.cmd.set(LE, LC_RPATH);
+    command
+        .cmdsize
+        .set(LE, rpath_command_size(path) as u32);
+    command
+        .path
+        .offset
+        .set(LE, size_of::<RpathCommand>() as u32);
+
+    path_buffer[..path.len()].copy_from_slice(path);
     path_buffer[path.len()..].zero();
 }
 
@@ -1123,8 +1187,12 @@ fn write_code_signature_metadata(
         team_offset: 0,
         exec_seg_base: text_segment.sizes.file_offset as u64,
         exec_seg_limit: text_segment.sizes.file_size as u64,
-        // TODO: change once shared libraries are supported
-        exec_seg_flags: CS_EXECSEG_MAIN_BINARY,
+        exec_seg_flags: layout
+            .symbol_db
+            .output_kind
+            .is_executable()
+            .then_some(CS_EXECSEG_MAIN_BINARY)
+            .unwrap_or(macho::CsExecSegFlags(0)),
     };
 
     let mut rest: &mut [u8] = code_signature;
@@ -1259,7 +1327,10 @@ fn write_symbols<'data>(
         let (section, symbol_type, desc) =
             if let Some(section_index) = object.object.symbol_section(sym, sym_index)? {
                 let section_id = match &object.sections[section_index.0] {
-                    SectionSlot::Loaded(_) => object
+                    // String merging computes the symbol resolution through its explicit
+                    // input-offset-to-output-offset map. The resulting symbol still belongs to
+                    // the same output Mach-O section as an ordinary loaded section.
+                    SectionSlot::Loaded(_) | SectionSlot::MergeStrings(_) => object
                         .section_part_id(section_index, &layout.symbol_db.section_part_ids)
                         .output_section_id::<MachO>(),
                     _ => bail!(
@@ -1321,4 +1392,46 @@ fn macho_section_index(layout: &MachOLayout<'_>, section_id: OutputSectionId) ->
     }
 
     bail!("cannot find the output section")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[repr(align(8))]
+    struct AlignedBytes<const N: usize>([u8; N]);
+
+    #[test]
+    fn dylib_install_name_uses_an_id_load_command() {
+        let path = b"@rpath/libexample.dylib";
+        let mut command_bytes = AlignedBytes([0; size_of::<DylibCommand>()]);
+        let command = from_bytes_mut::<DylibCommand>(&mut command_bytes.0).unwrap().0;
+        let mut path_buffer =
+            vec![0xff; load_dylib_command_size(path) - size_of::<DylibCommand>()];
+
+        write_dylib_command(command, &mut path_buffer, path, LC_ID_DYLIB);
+
+        assert_eq!(command.cmd.get(LE), LC_ID_DYLIB);
+        assert_eq!(command.cmdsize.get(LE) as usize, load_dylib_command_size(path));
+        assert_eq!(command.dylib.name.offset.get(LE) as usize, size_of::<DylibCommand>());
+        assert_eq!(&path_buffer[..path.len()], path);
+        assert!(path_buffer[path.len()..].iter().all(|&byte| byte == 0));
+    }
+
+    #[test]
+    fn rpath_load_command_includes_a_nul_terminated_path() {
+        let path = b"@loader_path/Frameworks";
+        let mut command_bytes = AlignedBytes([0; size_of::<RpathCommand>()]);
+        let command = from_bytes_mut::<RpathCommand>(&mut command_bytes.0).unwrap().0;
+        let mut path_buffer =
+            vec![0xff; rpath_command_size(path) - size_of::<RpathCommand>()];
+
+        write_rpath_command(command, &mut path_buffer, path);
+
+        assert_eq!(command.cmd.get(LE), LC_RPATH);
+        assert_eq!(command.cmdsize.get(LE) as usize, rpath_command_size(path));
+        assert_eq!(command.path.offset.get(LE) as usize, size_of::<RpathCommand>());
+        assert_eq!(&path_buffer[..path.len()], path);
+        assert!(path_buffer[path.len()..].iter().all(|&byte| byte == 0));
+    }
 }

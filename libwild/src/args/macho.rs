@@ -24,9 +24,31 @@ pub struct MachOArgs {
     pub(crate) platform_version: Option<PlatformVersion>,
     pub(crate) sysroot: Option<Box<Path>>,
     pub(crate) lib_search_path: Vec<Box<Path>>,
+    pub(crate) framework_search_path: Vec<Box<Path>>,
     pub(crate) plugin_path: Option<String>,
     pub(crate) dead_strip_dylibs: bool,
+    pub(crate) gc_sections: bool,
+    pub(crate) output_kind: MachOOutputKind,
+    pub(crate) strip: Strip,
+    pub(crate) install_name: Option<String>,
+    pub(crate) export_list_path: Option<PathBuf>,
+    pub(crate) rpaths: Vec<String>,
     pub(crate) entry: String,
+}
+
+/// The Mach-O output kinds supported by the writer. These must remain distinct from the generic
+/// `OutputKind`, which additionally accounts for whether the input graph requires dynamic linking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MachOOutputKind {
+    Executable,
+    Dylib,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Strip {
+    Nothing,
+    Debug,
+    All,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,7 +86,6 @@ const SILENTLY_IGNORED_FLAGS: &[&str] = &[
     "no_deduplicate",
     // Mach-O appears to always demangle symbols.
     "demangle",
-    "dynamic",
 ];
 
 const IGNORED_FLAGS: &[&str] = &[];
@@ -76,6 +97,14 @@ impl MachOArgs {
             ..Default::default()
         })
     }
+
+    /// `ld64` uses the output path as the install name when a dylib does not specify one.
+    pub(crate) fn dylib_install_name(&self) -> &[u8] {
+        self.install_name
+            .as_deref()
+            .map(str::as_bytes)
+            .unwrap_or_else(|| self.common.output.as_os_str().as_encoded_bytes())
+    }
 }
 
 impl Default for MachOArgs {
@@ -85,8 +114,15 @@ impl Default for MachOArgs {
             platform_version: None,
             sysroot: None,
             lib_search_path: Vec::new(),
+            framework_search_path: Vec::new(),
             plugin_path: None,
             dead_strip_dylibs: false,
+            gc_sections: false,
+            output_kind: MachOOutputKind::Executable,
+            strip: Strip::Nothing,
+            install_name: None,
+            export_list_path: None,
+            rpaths: Vec::new(),
             entry: "_main".to_owned(),
         }
     }
@@ -102,11 +138,11 @@ impl platform::Args for MachOArgs {
     }
 
     fn should_strip_debug(&self) -> bool {
-        todo!()
+        matches!(self.strip, Strip::Debug | Strip::All)
     }
 
     fn should_strip_all(&self) -> bool {
-        false
+        self.strip == Strip::All
     }
 
     fn entry_point<'a>(
@@ -132,13 +168,28 @@ impl platform::Args for MachOArgs {
         self.sysroot.as_deref()
     }
 
+    fn framework_search_path(&self) -> &[Box<Path>] {
+        &self.framework_search_path
+    }
+
+    fn shared_library_extension(&self) -> &'static str {
+        "dylib"
+    }
+
+    fn export_list_path(&self) -> Option<&Path> {
+        self.export_list_path.as_deref()
+    }
+
+    fn export_list_style(&self) -> crate::export_list::ExportListStyle {
+        crate::export_list::ExportListStyle::MachO
+    }
+
     fn should_gc_sections(&self) -> bool {
-        // TODO: Mach-O needs proper support for GC and -dead_strip.
-        false
+        self.gc_sections
     }
 
     fn should_export_all_dynamic_symbols(&self) -> bool {
-        true
+        self.export_list_path.is_none()
     }
 
     fn should_export_dynamic(&self, _lib_name: &[u8]) -> bool {
@@ -155,8 +206,7 @@ impl platform::Args for MachOArgs {
     }
 
     fn should_output_executable(&self) -> bool {
-        // TODO
-        true
+        self.output_kind == MachOOutputKind::Executable
     }
 
     fn is_ignored_flag(&self, flag: &str) -> bool {
@@ -176,6 +226,10 @@ pub(crate) fn parse<S: AsRef<str>, I: Iterator<Item = S>>(
         let arg = arg.as_ref();
 
         arg_parser.handle_argument(args, &mut modifier_stack, arg, &mut input)?;
+    }
+
+    if args.install_name.is_some() && args.output_kind != MachOOutputKind::Dylib {
+        bail!("-install_name may only be used with -dylib");
     }
 
     args.common.report_unrecognized()?;
@@ -232,8 +286,10 @@ fn setup_argument_parser() -> ArgumentParser<MachOArgs> {
         .execute(|args, _modifier_stack, value| {
             args.common_mut().save_dir.handle_file(value);
             let sysroot = std::fs::canonicalize(value).unwrap_or_else(|_| PathBuf::from(value));
-            // TODO: handle properly
             args.lib_search_path = vec![sysroot.join("usr/lib").into_boxed_path()];
+            args.framework_search_path = vec![sysroot
+                .join("System/Library/Frameworks")
+                .into_boxed_path()];
             args.sysroot = Some(Box::from(sysroot.as_path()));
             Ok(())
         });
@@ -260,6 +316,16 @@ fn setup_argument_parser() -> ArgumentParser<MachOArgs> {
         .execute(|args, _modifier_stack, value| {
             args.common_mut().save_dir.handle_file(value);
             args.lib_search_path.push(Box::from(Path::new(value)));
+            Ok(())
+        });
+    parser
+        .declare_with_param()
+        .prefix("F")
+        .help("Add directory to framework search path")
+        .execute(|args, _modifier_stack, value| {
+            ensure!(!value.is_empty(), "-F requires a directory");
+            args.common_mut().save_dir.handle_file(value);
+            args.framework_search_path.push(Box::from(Path::new(value)));
             Ok(())
         });
     parser
@@ -309,11 +375,108 @@ fn setup_argument_parser() -> ArgumentParser<MachOArgs> {
 
     parser
         .declare()
+        .long("dead_strip")
+        .help("Remove unreferenced sections")
+        .execute(|args, _modifier_stack| {
+            args.gc_sections = true;
+            Ok(())
+        });
+
+    parser
+        .declare()
         .long("dead_strip_dylibs")
         .execute(|args, _modifier_stack| {
             args.dead_strip_dylibs = true;
             Ok(())
         });
+
+    parser
+        .declare_with_param()
+        .long("framework")
+        .help("Link with a framework")
+        .execute(|args, modifier_stack, value| {
+            ensure!(!value.is_empty(), "-framework requires a framework name");
+            args.common_mut().inputs.push(Input {
+                spec: InputSpec::Framework(Box::from(value)),
+                search_first: None,
+                modifiers: *modifier_stack.last().unwrap(),
+            });
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("dylib")
+        .long("dynamiclib")
+        .help("Create a dynamically linked shared library")
+        .execute(|args, _modifier_stack| {
+            args.output_kind = MachOOutputKind::Dylib;
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("dynamic")
+        .long("execute")
+        .help("Create a dynamically linked executable")
+        .execute(|args, _modifier_stack| {
+            args.output_kind = MachOOutputKind::Executable;
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .long("install_name")
+        .help("Set the install name for a dynamically linked shared library")
+        .execute(|args, _modifier_stack, value| {
+            ensure!(!value.is_empty(), "-install_name requires a name");
+            args.install_name = Some(value.to_owned());
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .long("exported_symbols_list")
+        .help("Read the exported symbol list from a file")
+        .execute(|args, _modifier_stack, value| {
+            ensure!(!value.is_empty(), "-exported_symbols_list requires a filename");
+            args.export_list_path = Some(PathBuf::from(value));
+            Ok(())
+        });
+
+    parser
+        .declare_with_param()
+        .long("rpath")
+        .help("Add a runtime library search path")
+        .execute(|args, _modifier_stack, value| {
+            ensure!(!value.is_empty(), "-rpath requires a path");
+            args.rpaths.push(value.to_owned());
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .short("S")
+        .help("Strip debug symbols")
+        .execute(|args, _modifier_stack| {
+            args.strip = Strip::Debug;
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .short("s")
+        .help("Strip all symbols")
+        .execute(|args, _modifier_stack| {
+            args.strip = Strip::All;
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .short("x")
+        .help("Strip local symbols")
+        .execute(|args, _modifier_stack| args.warn_unsupported("-x"));
 
     // The option declaration cannot be moved to declare_common_args as other platforms
     // use `prefix("o")`.
@@ -345,7 +508,9 @@ fn add_silently_ignored_flags(parser: &mut ArgumentParser<MachOArgs>) {
 #[cfg(test)]
 mod tests {
     use super::MachOArgs;
+    use super::MachOOutputKind;
     use super::PlatformVersion;
+    use crate::args::Input;
     use crate::args::InputSpec;
     use crate::args::macho::SemanticVersion;
     use crate::platform::Args as _;
@@ -391,11 +556,11 @@ mod tests {
         assert_eq!(args.sysroot, Some(Box::from(Path::new("/foo/bar"))));
         assert!(args.common.inputs.iter().any(|i| match &i.spec {
             InputSpec::File(f) => f.as_ref() == Path::new("main.o"),
-            InputSpec::Lib(_) | InputSpec::Search(_) => false,
+            InputSpec::Lib(_) | InputSpec::Search(_) | InputSpec::Framework(_) => false,
         }));
         assert!(args.common.inputs.iter().any(|i| match &i.spec {
             InputSpec::Lib(f) => f.as_ref() == "c++",
-            InputSpec::File(_) | InputSpec::Search(_) => false,
+            InputSpec::File(_) | InputSpec::Search(_) | InputSpec::Framework(_) => false,
         }));
         assert!(
             args.lib_search_path
@@ -424,5 +589,110 @@ mod tests {
         args.parse(INPUT1.iter()).unwrap();
         input1_assertions(&args);
         assert!(warnings.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn models_dylib_options_without_treating_them_as_executable_options() {
+        let mut args = MachOArgs::new().unwrap();
+        args.parse(
+            [
+                "-arch",
+                "arm64",
+                "-dead_strip",
+                "-dylib",
+                "-install_name",
+                "@rpath/libexample.dylib",
+                "-exported_symbols_list",
+                "exports.txt",
+                "-rpath",
+                "@loader_path/Frameworks",
+                "-rpath",
+                "@executable_path/Frameworks",
+                "-S",
+            ]
+            .iter(),
+        )
+        .unwrap();
+
+        assert_eq!(args.output_kind, MachOOutputKind::Dylib);
+        assert!(!args.should_output_executable());
+        assert!(args.should_gc_sections());
+        assert!(args.should_strip_debug());
+        assert!(!args.should_strip_all());
+        assert_eq!(args.install_name.as_deref(), Some("@rpath/libexample.dylib"));
+        assert_eq!(args.export_list_path.as_deref(), Some(Path::new("exports.txt")));
+        assert_eq!(
+            args.rpaths,
+            [
+                "@loader_path/Frameworks",
+                "@executable_path/Frameworks",
+            ]
+        );
+        assert!(!args.should_export_all_dynamic_symbols());
+    }
+
+    #[test]
+    fn resolves_frameworks_only_through_framework_search_paths() {
+        let mut args = MachOArgs::new().unwrap();
+        args.parse(
+            ["-F/custom/Frameworks", "-F", "/SDK/Frameworks", "-framework", "Security"]
+                .iter(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            args.framework_search_path,
+            [
+                Box::from(Path::new("/custom/Frameworks")),
+                Box::from(Path::new("/SDK/Frameworks")),
+            ]
+        );
+        assert!(matches!(
+            args.common.inputs.as_slice(),
+            [Input {
+                spec: InputSpec::Framework(name),
+                ..
+            }] if name.as_ref() == "Security"
+        ));
+    }
+
+    #[test]
+    fn rejects_an_unsupported_architecture() {
+        let mut args = MachOArgs::new().unwrap();
+        let err = args.parse(["-arch", "x86_64"].iter()).unwrap_err();
+
+        assert!(err.to_string().contains("-arch x86_64 is not yet supported"));
+    }
+
+    #[test]
+    fn install_name_requires_a_dylib_output() {
+        let mut args = MachOArgs::new().unwrap();
+        let err = args
+            .parse(["-install_name", "libexample.dylib"].iter())
+            .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("-install_name may only be used with -dylib"));
+    }
+
+    #[test]
+    fn dynamic_and_execute_select_executable_output() {
+        for option in ["-dynamic", "-execute"] {
+            let mut args = MachOArgs::new().unwrap();
+            args.parse(["-dylib", option].iter()).unwrap();
+
+            assert_eq!(args.output_kind, MachOOutputKind::Executable);
+            assert!(args.should_output_executable());
+        }
+    }
+
+    #[test]
+    fn strip_all_is_visible_through_platform_args() {
+        let mut args = MachOArgs::new().unwrap();
+        args.parse(["-s"].iter()).unwrap();
+
+        assert!(args.should_strip_debug());
+        assert!(args.should_strip_all());
     }
 }

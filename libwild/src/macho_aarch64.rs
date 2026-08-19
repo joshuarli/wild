@@ -18,6 +18,34 @@ use std::borrow::Cow;
 
 pub(crate) struct MachOAArch64;
 
+/// Validates the fixed fields of a relocation form that this linker can apply without inspecting
+/// another relocation. Mach-O uses `r_length` for the storage width, not the instruction width.
+/// Accepting a different value would make the generic writer patch the wrong number of bytes or
+/// interpret a non-PC-relative value as PC-relative.
+fn validate_standalone_relocation(
+    rel: object::macho::RelocationInfo,
+    name: &str,
+    r_pcrel: bool,
+    r_length: u8,
+) -> crate::error::Result {
+    ensure!(
+        rel.r_extern,
+        "{name} requires an external-symbol relocation; section relocations are not represented by the Mach-O writer"
+    );
+    ensure!(
+        rel.r_pcrel == r_pcrel,
+        "{name} requires r_pcrel={}, got {}",
+        u8::from(r_pcrel),
+        u8::from(rel.r_pcrel)
+    );
+    ensure!(
+        rel.r_length == r_length,
+        "{name} requires r_length={r_length}, got {}",
+        rel.r_length
+    );
+    Ok(())
+}
+
 // ADRP+ADD+BR symbol stub template.
 const STUB_TEMPLATE: &[u8] = &[
     0x10, 0x00, 0x00, 0x90, // ADRP x16, page(got)
@@ -99,22 +127,21 @@ impl crate::platform::Arch for MachOAArch64 {
     fn relocation_from_raw(
         rel: object::macho::RelocationInfo,
     ) -> crate::error::Result<RelocationKindInfo> {
-        let rel_size_in_bytes = 1 << rel.r_length;
-        let rel_size = RelocationSize::ByteSize(rel_size_in_bytes);
-        let rel_kind = if rel.r_pcrel {
-            RelocationKind::Relative
-        } else {
-            RelocationKind::Absolute
-        };
-
         let (kind, size, mask, range, alignment) = match rel.r_type {
             object::macho::ARM64_RELOC_UNSIGNED => {
-                (rel_kind, rel_size, None, AllowedRange::no_check(), 1)
+                validate_standalone_relocation(rel, "ARM64_RELOC_UNSIGNED", false, 3)?;
+                (
+                    RelocationKind::Absolute,
+                    RelocationSize::ByteSize(8),
+                    None,
+                    AllowedRange::no_check(),
+                    1,
+                )
             }
             object::macho::ARM64_RELOC_BRANCH26 => {
-                debug_assert_eq!(rel_size, RelocationSize::ByteSize(4));
+                validate_standalone_relocation(rel, "ARM64_RELOC_BRANCH26", true, 2)?;
                 (
-                    rel_kind,
+                    RelocationKind::Relative,
                     RelocationSize::bit_mask_aarch64(2, 28, AArch64Instruction::JumpCall),
                     None,
                     AllowedRange::from_bit_size(28, Sign::Signed),
@@ -122,9 +149,9 @@ impl crate::platform::Arch for MachOAArch64 {
                 )
             }
             object::macho::ARM64_RELOC_PAGE21 => {
-                debug_assert_eq!(rel_size, RelocationSize::ByteSize(4));
+                validate_standalone_relocation(rel, "ARM64_RELOC_PAGE21", true, 2)?;
                 (
-                    rel_kind,
+                    RelocationKind::Relative,
                     RelocationSize::bit_mask_aarch64(12, 33, AArch64Instruction::Adr),
                     Some(PageMask::SymbolPlusAddendAndPosition(PAGE_MASK_4KB)),
                     AllowedRange::from_bit_size(33, Sign::Signed),
@@ -132,7 +159,7 @@ impl crate::platform::Arch for MachOAArch64 {
                 )
             }
             object::macho::ARM64_RELOC_PAGEOFF12 => {
-                debug_assert_eq!(rel_size, RelocationSize::ByteSize(4));
+                validate_standalone_relocation(rel, "ARM64_RELOC_PAGEOFF12", false, 2)?;
                 (
                     RelocationKind::AbsoluteLowPart,
                     RelocationSize::bit_mask_aarch64(0, 12, AArch64Instruction::MachOLow12),
@@ -142,8 +169,7 @@ impl crate::platform::Arch for MachOAArch64 {
                 )
             }
             object::macho::ARM64_RELOC_GOT_LOAD_PAGE21 => {
-                debug_assert_eq!(rel_kind, RelocationKind::Relative);
-                debug_assert_eq!(rel_size, RelocationSize::ByteSize(4));
+                validate_standalone_relocation(rel, "ARM64_RELOC_GOT_LOAD_PAGE21", true, 2)?;
                 (
                     RelocationKind::GotRelative,
                     RelocationSize::bit_mask_aarch64(12, 33, AArch64Instruction::Adr),
@@ -153,7 +179,12 @@ impl crate::platform::Arch for MachOAArch64 {
                 )
             }
             object::macho::ARM64_RELOC_GOT_LOAD_PAGEOFF12 => {
-                debug_assert_eq!(rel_size, RelocationSize::ByteSize(4));
+                validate_standalone_relocation(
+                    rel,
+                    "ARM64_RELOC_GOT_LOAD_PAGEOFF12",
+                    false,
+                    2,
+                )?;
                 (
                     RelocationKind::Got,
                     RelocationSize::bit_mask_aarch64(0, 12, AArch64Instruction::MachOLow12),
@@ -162,6 +193,46 @@ impl crate::platform::Arch for MachOAArch64 {
                     1,
                 )
             }
+            object::macho::ARM64_RELOC_POINTER_TO_GOT if rel.r_pcrel => {
+                validate_standalone_relocation(rel, "ARM64_RELOC_POINTER_TO_GOT", true, 2)?;
+                (
+                    RelocationKind::GotRelative,
+                    RelocationSize::ByteSize(4),
+                    None,
+                    AllowedRange::from_byte_size(4, Sign::Signed),
+                    1,
+                )
+            }
+            object::macho::ARM64_RELOC_POINTER_TO_GOT => {
+                validate_standalone_relocation(rel, "ARM64_RELOC_POINTER_TO_GOT", false, 3)?;
+                (
+                    RelocationKind::Got,
+                    RelocationSize::ByteSize(8),
+                    None,
+                    AllowedRange::no_check(),
+                    1,
+                )
+            }
+            // Apple specifies these as adjacent relocation pairs. The current Mach-O loader and
+            // writer visit relocations independently, so applying either member would discard
+            // information from the other member and produce an incorrect result.
+            object::macho::ARM64_RELOC_ADDEND => bail!(
+                "ARM64_RELOC_ADDEND is a paired relocation, but the Mach-O relocation pipeline does not preserve relocation pairs"
+            ),
+            object::macho::ARM64_RELOC_SUBTRACTOR => bail!(
+                "ARM64_RELOC_SUBTRACTOR is a paired relocation, but the Mach-O relocation pipeline does not preserve relocation pairs"
+            ),
+            // TLVP requires allocating and initialising thread-local-variable-pointer slots.
+            // Authenticated pointers additionally need the arm64e signing metadata to be kept in
+            // the output pointer. Neither representation exists in the generic Mach-O pipeline.
+            object::macho::ARM64_RELOC_TLVP_LOAD_PAGE21
+            | object::macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12 => bail!(
+                "{} requires Mach-O TLVP support, which the relocation writer does not implement",
+                Self::rel_type_to_string(rel)
+            ),
+            object::macho::ARM64_RELOC_AUTHENTICATED_POINTER => bail!(
+                "ARM64_RELOC_AUTHENTICATED_POINTER requires arm64e pointer-authentication support, which the relocation writer does not implement"
+            ),
             _ => bail!("Unknown relocation: {}", rel.r_type),
         };
         Ok(RelocationKindInfo {
@@ -223,5 +294,74 @@ impl crate::platform::Arch for MachOAArch64 {
         _previous_relocation: Option<PreviousRelocationInfo<object::macho::RelocationInfo>>,
     ) -> Option<Self::Relaxation> {
         todo!()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::platform::Arch;
+
+    fn relocation(
+        r_type: object::macho::RelocationType,
+        r_pcrel: bool,
+        r_length: u8,
+    ) -> object::macho::RelocationInfo {
+        object::macho::RelocationInfo {
+            r_address: 0,
+            r_symbolnum: 0,
+            r_pcrel,
+            r_length,
+            r_extern: true,
+            r_type,
+        }
+    }
+
+    #[test]
+    fn pointer_to_got_uses_the_got_address_and_its_abi_width() {
+        let pc_relative = MachOAArch64::relocation_from_raw(relocation(
+            object::macho::ARM64_RELOC_POINTER_TO_GOT,
+            true,
+            2,
+        ))
+        .unwrap();
+        assert_eq!(pc_relative.kind, RelocationKind::GotRelative);
+        assert_eq!(pc_relative.size, RelocationSize::ByteSize(4));
+        assert!(pc_relative.range.contains(i64::from(i32::MIN)));
+        assert!(pc_relative.range.contains(i64::from(i32::MAX)));
+        assert!(!pc_relative.range.contains(i64::from(i32::MAX) + 1));
+
+        let absolute = MachOAArch64::relocation_from_raw(relocation(
+            object::macho::ARM64_RELOC_POINTER_TO_GOT,
+            false,
+            3,
+        ))
+        .unwrap();
+        assert_eq!(absolute.kind, RelocationKind::Got);
+        assert_eq!(absolute.size, RelocationSize::ByteSize(8));
+    }
+
+    #[test]
+    fn rejects_malformed_branch26_instead_of_writing_the_wrong_instruction() {
+        let error = MachOAArch64::relocation_from_raw(relocation(
+            object::macho::ARM64_RELOC_BRANCH26,
+            false,
+            2,
+        ))
+        .unwrap_err();
+
+        assert!(error.to_string().contains("ARM64_RELOC_BRANCH26"));
+    }
+
+    #[test]
+    fn rejects_paired_addends_until_the_macho_pipeline_preserves_the_pair() {
+        let error = MachOAArch64::relocation_from_raw(relocation(
+            object::macho::ARM64_RELOC_ADDEND,
+            false,
+            2,
+        ))
+        .unwrap_err();
+
+        assert!(error.to_string().contains("paired relocation"));
     }
 }

@@ -1515,8 +1515,23 @@ pub(crate) trait Args: std::fmt::Debug + Send + Sync + 'static {
         None
     }
 
+    /// Directories searched for `-framework` inputs. Kept separate from `-L` directories because
+    /// Darwin only applies framework lookup to this search path.
+    fn framework_search_path(&self) -> &[Box<Path>] {
+        &[]
+    }
+
+    /// Extension used for the dynamic form of a `-lfoo` input.
+    fn shared_library_extension(&self) -> &'static str {
+        "so"
+    }
+
     fn export_list_path(&self) -> Option<&Path> {
         None
+    }
+
+    fn export_list_style(&self) -> crate::export_list::ExportListStyle {
+        crate::export_list::ExportListStyle::VersionScript
     }
 
     fn should_gc_sections(&self) -> bool {

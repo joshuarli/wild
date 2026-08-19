@@ -58,11 +58,15 @@ use object::macho::N_EXT;
 use object::macho::N_PEXT;
 use object::macho::N_SECT;
 use object::macho::N_WEAK_DEF;
+use object::macho::S_ATTR_DEBUG;
 use object::macho::S_ATTR_EXT_RELOC;
 use object::macho::S_ATTR_LOC_RELOC;
+use object::macho::S_ATTR_NO_DEAD_STRIP;
 use object::macho::S_ATTR_PURE_INSTRUCTIONS;
 use object::macho::S_ATTR_SOME_INSTRUCTIONS;
+use object::macho::S_CSTRING_LITERALS;
 use object::macho::S_GB_ZEROFILL;
+use object::macho::S_THREAD_LOCAL_REGULAR;
 use object::macho::S_THREAD_LOCAL_ZEROFILL;
 use object::macho::S_ZEROFILL;
 use object::macho::SECTION_ATTRIBUTES;
@@ -77,6 +81,7 @@ use std::borrow::Cow;
 use std::num::NonZeroU8;
 use std::num::NonZeroU64;
 use std::slice::Iter;
+use std::sync::atomic::Ordering;
 
 #[derive(Debug, Copy, Clone, Default)]
 pub(crate) struct MachO;
@@ -182,6 +187,7 @@ pub(crate) type SectionEntry = object::macho::Section64<Endianness>;
 pub(crate) type EntryPointCommand = object::macho::EntryPointCommand<Endianness>;
 pub(crate) type DylinkerCommand = object::macho::DylinkerCommand<Endianness>;
 pub(crate) type DylibCommand = object::macho::DylibCommand<Endianness>;
+pub(crate) type RpathCommand = object::macho::RpathCommand<Endianness>;
 pub(crate) type CodeSignatureCommand = object::macho::LinkeditDataCommand<Endianness>;
 pub(crate) type DyldChainedFixupsCommand = object::macho::LinkeditDataCommand<Endianness>;
 pub(crate) type ChainedFixupsHeader = object::macho::DyldChainedFixupsHeader<Endianness>;
@@ -221,6 +227,10 @@ pub(crate) fn load_dylib_command_size(path: &[u8]) -> usize {
     (size_of::<DylibCommand>() + path.len() + 1).next_multiple_of(MACHO_COMMAND_ALIGNMENT)
 }
 
+pub(crate) fn rpath_command_size(path: &[u8]) -> usize {
+    (size_of::<RpathCommand>() + path.len() + 1).next_multiple_of(MACHO_COMMAND_ALIGNMENT)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct SegmentName([u8; 16]);
 
@@ -231,6 +241,7 @@ impl SegmentName {
     pub(crate) const DATA_CONST: Self = Self::from_bytes(b"__DATA_CONST");
     pub(crate) const LINKEDIT: Self = Self::from_bytes(b"__LINKEDIT");
     pub(crate) const LLVM: Self = Self::from_bytes(b"__LLVM");
+    pub(crate) const DWARF: Self = Self::from_bytes(b"__DWARF");
 
     pub(crate) const fn into_bytes(self) -> [u8; 16] {
         self.0
@@ -244,7 +255,10 @@ impl SegmentName {
     }
 
     fn is_writable(self) -> bool {
-        !matches!(self, Self::PAGEZERO | Self::TEXT | Self::LINKEDIT)
+        !matches!(
+            self,
+            Self::PAGEZERO | Self::TEXT | Self::DATA_CONST | Self::LINKEDIT | Self::DWARF | Self::LLVM
+        )
     }
 }
 
@@ -408,8 +422,9 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
             .ok_or(error!("section index out of range"))
     }
 
-    fn section_by_name(&self, _name: &str) -> Option<(object::SectionIndex, &SectionHeader)> {
-        todo!()
+    fn section_by_name(&self, name: &str) -> Option<(object::SectionIndex, &SectionHeader)> {
+        self.enumerate_sections()
+            .find(|(_, section)| section.name() == name.as_bytes())
     }
 
     fn symbol_section(
@@ -466,17 +481,23 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
         Ok(section.name())
     }
 
-    fn raw_section_data(&self, _section: &SectionHeader) -> Result<&'data [u8]> {
-        todo!()
+    fn raw_section_data(&self, section: &SectionHeader) -> Result<&'data [u8]> {
+        section
+            .data(LE, self.data, section.offset(LE).into())
+            .map_err(|_| error!("cannot get section data"))
     }
 
     fn section_data(
         &self,
-        _section: &SectionHeader,
+        section: &SectionHeader,
         _member: &bumpalo_herd::Member<'data>,
-        _loaded_metrics: &crate::resolution::LoadedMetrics,
+        loaded_metrics: &crate::resolution::LoadedMetrics,
     ) -> Result<&'data [u8]> {
-        todo!()
+        let data = self.raw_section_data(section)?;
+        loaded_metrics
+            .loaded_bytes
+            .fetch_add(data.len(), Ordering::Relaxed);
+        Ok(data)
     }
 
     fn copy_section_data(&self, section: &SectionHeader, out: &mut [u8]) -> Result {
@@ -488,8 +509,8 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
         Ok(())
     }
 
-    fn section_data_cow(&self, _section: &SectionHeader) -> Result<std::borrow::Cow<'data, [u8]>> {
-        todo!()
+    fn section_data_cow(&self, section: &SectionHeader) -> Result<std::borrow::Cow<'data, [u8]>> {
+        Ok(std::borrow::Cow::Borrowed(self.raw_section_data(section)?))
     }
 
     fn section_alignment(&self, section: &SectionHeader) -> Result<u64> {
@@ -571,11 +592,27 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
     }
 }
 
+/// Returns whether a section is linker metadata or debug data rather than input to a
+/// loadable output segment. Mach-O does not have an `SHF_ALLOC` equivalent; this is
+/// defined by the section's attributes and conventional segment role instead.
+fn is_non_alloc_section(flags: SectionFlags, segment_name: &[u8]) -> bool {
+    flags.intersects(S_ATTR_DEBUG)
+        || matches!(
+            SegmentName::from_bytes(segment_name),
+            SegmentName::PAGEZERO
+                | SegmentName::LINKEDIT
+                | SegmentName::LLVM
+                | SegmentName::DWARF
+        )
+}
+
+fn is_tls_section_type(section_type: macho::SectionType) -> bool {
+    matches!(section_type, S_THREAD_LOCAL_REGULAR | S_THREAD_LOCAL_ZEROFILL)
+}
+
 impl platform::SectionHeader for SectionHeader {
     fn is_alloc(&self) -> bool {
-        // TODO: Surely not everything is alloc. But this is for now consistent with
-        // SectionFlags::is_alloc.
-        true
+        !is_non_alloc_section(self.flags.get(LE), self.segment_name())
     }
 
     fn is_writable(&self) -> bool {
@@ -589,30 +626,31 @@ impl platform::SectionHeader for SectionHeader {
     }
 
     fn is_tls(&self) -> bool {
-        todo!()
+        is_tls_section_type(self.flags.get(LE).typ())
     }
 
     fn is_merge_section(&self) -> bool {
-        // TODO
-        false
+        self.flags.get(LE).typ() == S_CSTRING_LITERALS
     }
 
     fn is_strings(&self) -> bool {
-        todo!()
+        self.flags.get(LE).typ() == S_CSTRING_LITERALS
     }
 
     fn should_retain(&self) -> bool {
-        // TODO
-        false
+        self.flags.get(LE).contains(S_ATTR_NO_DEAD_STRIP)
     }
 
     fn should_exclude(&self) -> bool {
         // TODO: We need support for sections backed by the Mach-O indirect symbol table for dynamic
         // linking.
-        self.flags.get(LE).intersects(macho::S_ATTR_DEBUG)
+        self.flags.get(LE).intersects(S_ATTR_DEBUG)
             || matches!(
                 SegmentName::from_bytes(self.segment_name()),
-                SegmentName::PAGEZERO | SegmentName::LINKEDIT | SegmentName::LLVM
+                SegmentName::PAGEZERO
+                    | SegmentName::LINKEDIT
+                    | SegmentName::LLVM
+                    | SegmentName::DWARF
             )
             || matches!(
                 self.flags.get(LE).typ(),
@@ -625,7 +663,9 @@ impl platform::SectionHeader for SectionHeader {
     }
 
     fn is_group(&self) -> bool {
-        todo!()
+        // Mach-O has no section-group analogue. Coalescing is a symbol/linkage
+        // property, not an ELF-style COMDAT section group.
+        false
     }
 
     fn is_note(&self) -> bool {
@@ -633,7 +673,9 @@ impl platform::SectionHeader for SectionHeader {
     }
 
     fn is_prog_bits(&self) -> bool {
-        todo!()
+        // Mach-O records no generic PROGBITS type. Its zero-fill section types are
+        // the only section types that have no bytes in the input file.
+        !self.is_no_bits()
     }
 
     fn is_no_bits(&self) -> bool {
@@ -646,19 +688,21 @@ impl platform::SectionHeader for SectionHeader {
 
 impl platform::SectionType for macho::SectionType {
     fn is_rela(&self) -> bool {
-        todo!()
+        // Relocations live outside Mach-O sections, so there is no RELA section
+        // type to report through this ELF-shaped generic hook.
+        false
     }
 
     fn is_rel(&self) -> bool {
-        todo!()
+        false
     }
 
     fn is_symtab(&self) -> bool {
-        todo!()
+        false
     }
 
     fn is_strtab(&self) -> bool {
-        todo!()
+        false
     }
 }
 
@@ -1585,11 +1629,17 @@ impl platform::Platform for MachO {
 
         if resources.symbol_db.output_kind.is_executable() {
             allocate_load_cmd(size_of::<EntryPointCommand>());
+            allocate_load_cmd(
+                (size_of::<DylinkerCommand>() + DYLINKER_PATH.len())
+                    .next_multiple_of(MACHO_COMMAND_ALIGNMENT),
+            );
+        } else if resources.symbol_db.output_kind.is_shared_object() {
+            allocate_load_cmd(load_dylib_command_size(args.dylib_install_name()));
         }
-        allocate_load_cmd(
-            (size_of::<DylinkerCommand>() + DYLINKER_PATH.len())
-                .next_multiple_of(MACHO_COMMAND_ALIGNMENT),
-        );
+
+        for rpath in &args.rpaths {
+            allocate_load_cmd(rpath_command_size(rpath.as_bytes()));
+        }
 
         prelude.format_specific.imported_library_file_ids =
             resources.format_specific.imported_libraries.clone();
@@ -2237,5 +2287,45 @@ impl SinglePartSectionId {
 
     const fn output_section_id(self) -> OutputSectionId {
         OutputSectionId::from_u32(self as u32)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classifies_non_loadable_macho_sections_from_format_metadata() {
+        assert!(!is_non_alloc_section(
+            macho::S_REGULAR.to_flags(),
+            SegmentName::TEXT.into_bytes().as_slice()
+        ));
+        assert!(is_non_alloc_section(
+            macho::S_REGULAR.to_flags().with(S_ATTR_DEBUG),
+            SegmentName::TEXT.into_bytes().as_slice()
+        ));
+        assert!(is_non_alloc_section(
+            macho::S_REGULAR.to_flags(),
+            SegmentName::DWARF.into_bytes().as_slice()
+        ));
+        assert!(is_non_alloc_section(
+            macho::S_REGULAR.to_flags(),
+            SegmentName::LINKEDIT.into_bytes().as_slice()
+        ));
+    }
+
+    #[test]
+    fn classifies_tlv_storage_without_treating_descriptors_as_tls_data() {
+        assert!(is_tls_section_type(S_THREAD_LOCAL_REGULAR));
+        assert!(is_tls_section_type(S_THREAD_LOCAL_ZEROFILL));
+        assert!(!is_tls_section_type(macho::S_THREAD_LOCAL_VARIABLES));
+        assert!(!is_tls_section_type(macho::S_REGULAR));
+    }
+
+    #[test]
+    fn preserves_read_only_data_const_segment_semantics() {
+        assert!(!SegmentName::DATA_CONST.is_writable());
+        assert!(!SegmentName::DWARF.is_writable());
+        assert!(SegmentName::DATA.is_writable());
     }
 }

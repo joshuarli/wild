@@ -12,6 +12,10 @@ autotests = false
 name = "wild"
 path = "src/main.rs"
 
+[[bin]]
+name = "darwin-linker-recorder"
+path = "src/bin/darwin-linker-recorder.rs"
+
 [[test]]
 name = "integration_tests"
 path = "tests/integration_tests.rs"

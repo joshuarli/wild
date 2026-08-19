@@ -4106,6 +4106,12 @@ pub(crate) fn export_symbols_mode<P: Platform>(
     symbol_db: &SymbolDb<P>,
     input: &InputRef,
 ) -> Option<ExportSymbolsMode> {
+    // An explicit export list narrows the default shared-library export policy too. This is used
+    // by Darwin's `-exported_symbols_list`, as well as GNU-style dynamic symbol lists.
+    if symbol_db.output_kind.needs_dynsym() && symbol_db.export_list.is_some() {
+        return Some(ExportSymbolsMode::Selected);
+    }
+
     if symbol_db.output_kind == OutputKind::SharedObject
         && (!input.has_archive_semantics()
             || symbol_db.args.should_export_dynamic(input.lib_name()))
@@ -4115,10 +4121,6 @@ pub(crate) fn export_symbols_mode<P: Platform>(
 
     if symbol_db.output_kind.needs_dynsym() && symbol_db.args.should_export_all_dynamic_symbols() {
         return Some(ExportSymbolsMode::All);
-    }
-
-    if symbol_db.output_kind.needs_dynsym() && symbol_db.export_list.is_some() {
-        return Some(ExportSymbolsMode::Selected);
     }
 
     None
@@ -4561,7 +4563,23 @@ impl<'data, P: Platform> ObjectLayoutState<'data, P> {
             .object
             .symbol_section(local_symbol, local_symbol_index)?
         {
-            if let Some(section_address) = section_resolutions[section_index.0].address() {
+            // A merge-string slot has no linear input-to-output mapping. Its output address must
+            // always come from the merger's canonical-string map, even if the generic section
+            // layout also has an address for the source section.
+            if matches!(self.sections[section_index.0], SectionSlot::MergeStrings(_)) {
+                get_merged_string_output_address::<P>(
+                    local_symbol_index,
+                    0,
+                    self.object,
+                    &self.sections,
+                    &resources.symbol_db.section_part_ids,
+                    self.section_id_range,
+                    resources.merged_strings,
+                    resources.merged_string_start_addresses,
+                    true,
+                )?
+                .context("Cannot get merged string offset for a symbol")?
+            } else if let Some(section_address) = section_resolutions[section_index.0].address() {
                 let input_offset = self
                     .object
                     .symbol_offset_in_section(local_symbol, section_index)?;

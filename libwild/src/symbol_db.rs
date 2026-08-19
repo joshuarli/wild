@@ -344,7 +344,7 @@ impl<'data, P: Platform> SymbolDb<'data, P> {
 
         let export_list = auxiliary
             .export_list_data
-            .map(ExportList::parse)
+            .map(|data| ExportList::parse_for_style(data, args.export_list_style()))
             .transpose()?;
 
         let num_buckets = num_symbol_hash_buckets(args);

@@ -905,7 +905,10 @@ impl Input {
             InputSpec::Lib(lib_name) => {
                 let mut filenames = Vec::new();
                 if self.modifiers.allow_shared {
-                    filenames.push(PathBuf::from(format!("lib{lib_name}.so")));
+                    filenames.push(PathBuf::from(format!(
+                        "lib{lib_name}.{}",
+                        args.shared_library_extension()
+                    )));
                 }
                 filenames.push(PathBuf::from(format!("lib{lib_name}.a")));
                 if let Some((path, filename_index)) = search_for_files(
@@ -946,6 +949,24 @@ impl Input {
                     });
                 }
                 bail!("Couldn't find library `{filename}` on library search path");
+            }
+            InputSpec::Framework(framework_name) => {
+                let filenames = [
+                    PathBuf::from(format!("{framework_name}.framework/{framework_name}")),
+                    PathBuf::from(format!("{framework_name}.framework/{framework_name}.tbd")),
+                ];
+                if let Some((path, filename_index)) = search_for_files(
+                    file_system,
+                    args.framework_search_path(),
+                    self.search_first.as_ref(),
+                    &filenames,
+                ) {
+                    return Ok(InputPath {
+                        absolute: std::path::absolute(&path)?,
+                        original: filenames[filename_index].clone(),
+                    });
+                }
+                bail!("Couldn't find framework `{framework_name}` on framework search path");
             }
         }
     }

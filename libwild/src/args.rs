@@ -610,6 +610,8 @@ pub(crate) enum InputSpec {
     Lib(Box<str>),
     /// Name of the library, including prefix and suffix.
     Search(Box<str>),
+    /// Name of a Darwin framework, without the `.framework` directory suffix.
+    Framework(Box<str>),
 }
 
 #[derive(Debug, Eq, PartialEq)]
