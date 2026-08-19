@@ -38,7 +38,10 @@ struct UncompressedNode {
 /// Build a Mach-O exports trie for `symbols`. `symbols` is sorted in place.
 pub(crate) fn build(symbols: &mut [Symbol<'_>]) -> Vec<u8> {
     if symbols.is_empty() {
-        return Vec::new();
+        // `LC_DYLD_EXPORTS_TRIE` still requires a syntactically valid root node when an
+        // executable has no exported definitions. An empty byte range is not a trie: dyld and
+        // object readers expect the root's zero terminal-size and zero child-count fields.
+        return vec![0, 0];
     }
 
     symbols.sort_unstable_by(|a, b| a.name.cmp(b.name));
@@ -304,9 +307,11 @@ mod tests {
     }
 
     #[test]
-    fn empty_input_produces_empty_trie() {
+    fn empty_input_produces_a_valid_empty_root_node() {
         let mut symbols = [];
-        assert_eq!(build(&mut symbols), []);
+        let trie = build(&mut symbols);
+        assert_eq!(trie, [0, 0]);
+        assert!(parse_exports(&trie).is_empty());
     }
 
     #[test]

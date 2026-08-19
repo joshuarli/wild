@@ -31,6 +31,8 @@ use crate::macho::CHAINED_STARTS_IN_SEGMENT_FIXED_SIZE;
 use crate::macho::ChainedFixupsHeader;
 use crate::macho::ChainedStartsInSegment;
 use crate::macho::CodeSignatureCommand;
+use crate::macho::COMPACT_UNWIND_ENTRY_SIZE;
+use crate::macho::COMPACT_UNWIND_REGULAR_PAGE_MAX_ENTRIES;
 use crate::macho::DYLINKER_PATH;
 use crate::macho::DyldChainedFixupsCommand;
 use crate::macho::DylibCommand;
@@ -51,6 +53,7 @@ use crate::macho::SymtabCommand;
 use crate::macho::UuidCommand;
 use crate::macho::code_signature_identifier;
 use crate::macho::code_signature_padded_identifier_size;
+use crate::macho::eh_frame_augmentations;
 use crate::macho::get_segment_sections;
 use crate::macho::load_dylib_command_size;
 use crate::macho::rpath_command_size;
@@ -70,6 +73,7 @@ use crate::platform::ObjectFile;
 use crate::platform::Symbol;
 use crate::resolution::SectionSlot;
 use crate::symbol_db::SymbolId;
+use crate::thunks::ThunkBlockId;
 use crate::timing_phase;
 use crate::value_flags::ValueFlags;
 use crate::verbose_timing_phase;
@@ -118,6 +122,7 @@ use object::macho::N_SECT;
 use object::macho::PLATFORM_MACOS;
 use object::macho::RelocationInfo;
 use object::macho::SegmentFlags;
+use object::read::macho::Section as _;
 use object::slice_from_bytes_mut;
 use object::write::macho::CodeDirectory;
 use object::write::macho::CodeSignatureEncoder;
@@ -126,6 +131,8 @@ use rayon::iter::ParallelIterator;
 use rayon::slice::ParallelSlice;
 use sha2::Digest;
 use sha2::Sha256;
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::ops::BitAnd;
 use tracing::debug_span;
 use zerocopy::FromZeros;
@@ -171,9 +178,25 @@ pub(crate) fn write<'data, A: Arch<Platform = MachO>>(
         })?;
 
     let mut section_buffers = split_output_into_sections(layout, &mut sized_output.out).0;
-    write_got_entries(layout, section_buffers.get_mut(output_section_id::GOT))?;
     write_plt_entries::<A>(layout, section_buffers.get_mut(output_section_id::PLT_GOT))?;
     write_merged_strings(layout, &mut section_buffers);
+    write_compact_unwind_info(layout, section_buffers.get_mut(output_section_id::UNWIND_INFO))?;
+    drop(section_buffers);
+
+    // Plan before encoding: local relocations still contain their link-time target addresses.
+    // The same plan drives both the starts table and the in-place chained pointer words.
+    let chained_fixups = chained_fixups(layout, &sized_output.out)?;
+    let mut section_buffers = split_output_into_sections(layout, &mut sized_output.out).0;
+    write_chained_fixup_table(
+        layout,
+        &chained_fixups,
+        section_buffers.get_mut(output_section_id::CHAINED_FIXUP_TABLE),
+    )?;
+    drop(section_buffers);
+
+    // All object relocations have now written their link-time pointer values. Rewrite the
+    // locations dyld owns as chained bind/rebase words before UUID and code-signature hashing.
+    write_chained_fixup_pointers(layout, &chained_fixups, &mut sized_output.out)?;
 
     write_code_signature_metadata(layout, sized_output)?;
     write_uuid(layout, sized_output)?;
@@ -195,6 +218,633 @@ fn write_merged_strings(
             crate::elf_writer::write_merged_strings_to_buffer(merged, buffer);
         }
     });
+}
+
+/// A compact-unwind record after its object-file relocations have been resolved to final image
+/// addresses. The final Mach-O table stores all of these addresses as 32-bit offsets from the
+/// image base, so retaining the full addresses here makes range validation straightforward.
+#[derive(Debug)]
+struct CompactUnwindEntry {
+    function_address: u64,
+    function_length: u32,
+    encoding: u32,
+    personality_address: Option<u64>,
+    lsda_address: Option<u64>,
+}
+
+/// Synthesize `__TEXT,__unwind_info` from object-file `__LD,__compact_unwind` records.
+///
+/// Mach-O deliberately uses a different final representation from its object files: final
+/// records are sorted by post-GC function address and grouped into an indexed two-level page
+/// table. We always emit the regular page form (kind 2). It is larger than the compressed form
+/// but has no artificial encoding-count or function-offset limit and is the format's specified
+/// lossless fallback.
+fn write_compact_unwind_info(layout: &MachOLayout<'_>, output: &mut [u8]) -> Result {
+    if output.is_empty() {
+        return Ok(());
+    }
+
+    timing_phase!("Write compact unwind info");
+    let mut entries = Vec::new();
+    for group in &layout.group_layouts {
+        for file in &group.files {
+            let FileLayout::Object(object) = file else {
+                continue;
+            };
+            for (section_index, slot) in object.sections.iter().enumerate() {
+                let SectionSlot::FrameData(compact_unwind_section_index) = slot else {
+                    continue;
+                };
+                debug_assert_eq!(section_index, compact_unwind_section_index.0);
+                entries.extend(read_compact_unwind_entries(
+                    layout,
+                    object,
+                    *compact_unwind_section_index,
+                )?);
+            }
+        }
+    }
+
+    entries.sort_by_key(|entry| entry.function_address);
+    // ARM64's DWARF mode delegates actual frame recovery to a final `__TEXT,__eh_frame` table.
+    // Wild does not yet serialize that relocation-rich table, so emitting an apparently complete
+    // `__unwind_info` would turn a deterministic link-time limitation into a process-time abort.
+    // Frame and frameless compact encodings remain self-contained and are supported below.
+    const ARM64_UNWIND_MODE_MASK: u32 = 0x0f00_0000;
+    const ARM64_UNWIND_MODE_DWARF: u32 = 0x0300_0000;
+    ensure!(
+        entries.iter().all(|entry| entry.encoding & ARM64_UNWIND_MODE_MASK != ARM64_UNWIND_MODE_DWARF),
+        "ARM64 compact unwind DWARF mode requires final __TEXT,__eh_frame serialization, which Wild does not yet implement"
+    );
+    for adjacent in entries.windows(2) {
+        let previous_end = adjacent[0]
+            .function_address
+            .checked_add(u64::from(adjacent[0].function_length))
+            .context("compact-unwind function range overflow")?;
+        ensure!(
+            previous_end <= adjacent[1].function_address,
+            "overlapping compact-unwind function ranges at 0x{:x} and 0x{:x}",
+            adjacent[0].function_address,
+            adjacent[1].function_address
+        );
+    }
+
+    let mut personalities = Vec::new();
+    for entry in &entries {
+        let Some(personality) = entry.personality_address else {
+            continue;
+        };
+        if !personalities.contains(&personality) {
+            ensure!(
+                personalities.len() < 3,
+                "Mach-O compact unwind supports at most three distinct personality functions"
+            );
+            personalities.push(personality);
+        }
+    }
+
+    let serialized = serialize_compact_unwind_info(&entries, &personalities)?;
+    ensure!(
+        serialized.len() <= output.len(),
+        "allocated {} bytes for __unwind_info but need {}",
+        output.len(),
+        serialized.len()
+    );
+    output.fill(0);
+    output[..serialized.len()].copy_from_slice(&serialized);
+    Ok(())
+}
+
+fn read_compact_unwind_entries(
+    layout: &MachOLayout<'_>,
+    object: &ObjectLayout<'_, MachO>,
+    compact_unwind_section_index: object::SectionIndex,
+) -> Result<Vec<CompactUnwindEntry>> {
+    let section = object.object.section(compact_unwind_section_index)?;
+    let data = object.object.raw_section_data(section)?;
+    ensure!(
+        data.len() % COMPACT_UNWIND_ENTRY_SIZE == 0,
+        "{} has malformed __compact_unwind data: {} bytes is not a multiple of {}",
+        object.input,
+        data.len(),
+        COMPACT_UNWIND_ENTRY_SIZE
+    );
+
+    let mut relocations = std::collections::BTreeMap::new();
+    for relocation in object
+        .relocations(compact_unwind_section_index)?
+        .relocations
+    {
+        let info = relocation.info(LE);
+        ensure!(
+            info.r_type == macho::ARM64_RELOC_UNSIGNED && !info.r_pcrel && info.r_length == 3,
+            "unsupported __compact_unwind relocation in {}: expected ARM64_RELOC_UNSIGNED, r_pcrel=0, r_length=3",
+            object.input
+        );
+        let offset = usize::try_from(info.r_address)
+            .context("__compact_unwind relocation offset overflowed usize")?;
+        ensure!(
+            offset + size_of::<u64>() <= data.len()
+                && matches!(offset % COMPACT_UNWIND_ENTRY_SIZE, 0 | 16 | 24),
+            "unsupported __compact_unwind relocation offset 0x{offset:x} in {}",
+            object.input
+        );
+        ensure!(
+            relocations.insert(offset, info).is_none(),
+            "duplicate __compact_unwind relocation at offset 0x{offset:x} in {}",
+            object.input
+        );
+    }
+
+    let mut entries = Vec::new();
+    for record_offset in (0..data.len()).step_by(COMPACT_UNWIND_ENTRY_SIZE) {
+        let function_addend = compact_unwind_u64(data, record_offset)?;
+        let function_length = compact_unwind_u32(data, record_offset + 8)?;
+        ensure!(
+            function_length != 0,
+            "{} has zero-length __compact_unwind function at offset 0x{record_offset:x}",
+            object.input
+        );
+        let encoding = compact_unwind_u32(data, record_offset + 12)?;
+        let personality_addend = compact_unwind_u64(data, record_offset + 16)?;
+        let lsda_addend = compact_unwind_u64(data, record_offset + 24)?;
+
+        let Some(function_address) = compact_unwind_function_address(
+            layout,
+            object,
+            *relocations.get(&record_offset).context(
+                "__compact_unwind function has no relocation",
+            )?,
+            function_addend,
+            function_length,
+        )?
+        else {
+            // The function's Mach-O atom was dead-stripped. Its metadata and any associated
+            // LSDA must disappear with it rather than retaining an invalid input address.
+            continue;
+        };
+
+        let personality_address = compact_unwind_optional_target_address(
+            layout,
+            object,
+            relocations.get(&(record_offset + 16)).copied(),
+            personality_addend,
+            "personality",
+        )?;
+        let lsda_address = compact_unwind_optional_target_address(
+            layout,
+            object,
+            relocations.get(&(record_offset + 24)).copied(),
+            lsda_addend,
+            "LSDA",
+        )?;
+
+        entries.push(CompactUnwindEntry {
+            function_address,
+            function_length,
+            encoding,
+            personality_address,
+            lsda_address,
+        });
+    }
+    merge_eh_frame_augmentations(layout, object, &mut entries)?;
+    Ok(entries)
+}
+
+/// Complete sparse Rust compact-unwind rows from their paired DWARF FDEs. LLVM's C++ Mach-O
+/// producer puts personality and LSDA relocations directly in `__compact_unwind`; rustc instead
+/// uses the standard `zPLR` CIE/FDE augmentation and leaves those two words zero. The parser is
+/// deliberately shared with GC so the metadata retained here and the dependencies retained
+/// there have exactly the same bounded ARM64 representation.
+fn merge_eh_frame_augmentations(
+    layout: &MachOLayout<'_>,
+    object: &ObjectLayout<'_, MachO>,
+    entries: &mut [CompactUnwindEntry],
+) -> Result {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let mut targets = std::collections::BTreeMap::new();
+    for (section_index, section) in object.object.enumerate_sections() {
+        if section.name() != b"__eh_frame" {
+            continue;
+        }
+        let data = object.object.raw_section_data(section)?;
+        let augmentations = eh_frame_augmentations(data)?;
+        if augmentations.is_empty() {
+            continue;
+        }
+        let mut relocations = std::collections::BTreeMap::new();
+        for relocation in object.relocations(section_index)?.relocations {
+            let info = relocation.info(LE);
+            if matches!(
+                info.r_type,
+                macho::ARM64_RELOC_POINTER_TO_GOT | macho::ARM64_RELOC_UNSIGNED
+            ) {
+                let offset = usize::try_from(info.r_address)
+                    .context("Mach-O __eh_frame relocation offset overflowed usize")?;
+                ensure!(
+                    relocations.insert(offset, info).is_none(),
+                    "duplicate Mach-O __eh_frame relocation at offset 0x{offset:x} in {}",
+                    object.input
+                );
+            }
+        }
+
+        for augmentation in augmentations {
+            let Some(function) = eh_frame_target_address(
+                layout,
+                object,
+                *relocations
+                    .get(&augmentation.function_relocation_offset)
+                    .with_context(|| {
+                        format!(
+                            "missing function relocation at Mach-O __eh_frame offset 0x{:x} in {}",
+                            augmentation.function_relocation_offset, object.input
+                        )
+                    })?,
+                macho::ARM64_RELOC_UNSIGNED,
+                "function",
+                false,
+            )?
+            else {
+                // An FDE is input metadata too. Rust keeps FDEs for dead libstd atoms, whose
+                // symbol has no final resolution; the matching compact row was already omitted.
+                continue;
+            };
+            let personality = eh_frame_target_address(
+                layout,
+                object,
+                *relocations
+                    .get(&augmentation.personality_relocation_offset)
+                    .with_context(|| {
+                        format!(
+                            "missing personality relocation at Mach-O __eh_frame offset 0x{:x} in {}",
+                            augmentation.personality_relocation_offset, object.input
+                        )
+                    })?,
+                macho::ARM64_RELOC_POINTER_TO_GOT,
+                "personality",
+                true,
+            )?
+            .expect("required __eh_frame personality target");
+            let lsda = eh_frame_target_address(
+                layout,
+                object,
+                *relocations
+                    .get(&augmentation.lsda_relocation_offset)
+                    .with_context(|| {
+                        format!(
+                            "missing LSDA relocation at Mach-O __eh_frame offset 0x{:x} in {}",
+                            augmentation.lsda_relocation_offset, object.input
+                        )
+                    })?,
+                macho::ARM64_RELOC_UNSIGNED,
+                "LSDA",
+                true,
+            )?
+            .expect("required __eh_frame LSDA target");
+            let previous = targets.insert(function, (personality, lsda));
+            ensure!(
+                previous.is_none_or(|previous| previous == (personality, lsda)),
+                "conflicting Mach-O __eh_frame zPLR metadata for function at 0x{function:x}"
+            );
+        }
+    }
+
+    for entry in entries {
+        let Some(&(personality, lsda)) = targets.get(&entry.function_address) else {
+            continue;
+        };
+        if entry.personality_address.is_none() {
+            entry.personality_address = Some(personality);
+        }
+        if entry.lsda_address.is_none() {
+            entry.lsda_address = Some(lsda);
+        }
+    }
+    Ok(())
+}
+
+fn eh_frame_target_address(
+    layout: &MachOLayout<'_>,
+    object: &ObjectLayout<'_, MachO>,
+    relocation: RelocationInfo,
+    expected_type: macho::RelocationType,
+    field_name: &str,
+    required: bool,
+) -> Result<Option<u64>> {
+    ensure!(
+        relocation.r_type == expected_type && relocation.r_extern,
+        "unsupported Mach-O __eh_frame {field_name} relocation in {}",
+        object.input
+    );
+    if expected_type == macho::ARM64_RELOC_POINTER_TO_GOT {
+        ensure!(
+            relocation.r_pcrel && relocation.r_length == 2,
+            "unsupported Mach-O __eh_frame personality relocation in {}: expected ARM64_RELOC_POINTER_TO_GOT, r_pcrel=1, r_length=2",
+            object.input
+        );
+    } else {
+        ensure!(
+            !relocation.r_pcrel && relocation.r_length == 3,
+            "unsupported Mach-O __eh_frame {field_name} relocation in {}: expected r_pcrel=0",
+            object.input
+        );
+    }
+    let local_symbol_index = SymbolIndex(relocation.r_symbolnum as usize);
+    let symbol_id = object.symbol_id_range.input_to_id(local_symbol_index);
+    let resolution = layout.merged_symbol_resolution(symbol_id);
+    if required {
+        return resolution
+            .with_context(|| {
+            format!(
+                "unresolved Mach-O __eh_frame {field_name} symbol {} in {}",
+                layout.symbol_debug(symbol_id),
+                object.input
+            )
+        })
+            .map(|resolution| Some(resolution.raw_value));
+    }
+    Ok(resolution.map(|resolution| resolution.raw_value))
+}
+
+/// Compact-unwind records are metadata, so their relocation target can be a valid end label even
+/// when the function body was discarded. A final end label does have an output address, but it
+/// must not create an unwind row. Require the complete function range to survive before resolving
+/// its start address; personalities and LSDAs remain ordinary address targets below.
+fn compact_unwind_function_address(
+    layout: &MachOLayout<'_>,
+    object: &ObjectLayout<'_, MachO>,
+    relocation: RelocationInfo,
+    addend: u64,
+    function_length: u32,
+) -> Result<Option<u64>> {
+    if !relocation.r_extern {
+        let section_ordinal = usize::try_from(relocation.r_symbolnum)
+            .context("__compact_unwind function section ordinal overflowed usize")?;
+        let section_index = object::SectionIndex(
+            section_ordinal
+                .checked_sub(1)
+                .context("__compact_unwind function relocation has section ordinal zero")?,
+        );
+        let input_section = object.object.section(section_index)?;
+        let input_offset = addend
+            .checked_sub(input_section.addr.get(LE))
+            .context("__compact_unwind function target precedes its input section")?;
+        let input_end = input_offset
+            .checked_add(u64::from(function_length))
+            .context("__compact_unwind function range overflows")?;
+        if !object.input_range_is_live(section_index, input_offset..input_end) {
+            return Ok(None);
+        }
+    }
+
+    compact_unwind_target_address(layout, object, relocation, addend)
+}
+
+fn compact_unwind_u32(data: &[u8], offset: usize) -> Result<u32> {
+    let bytes = data
+        .get(offset..offset + size_of::<u32>())
+        .context("truncated __compact_unwind u32 field")?;
+    Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+fn compact_unwind_u64(data: &[u8], offset: usize) -> Result<u64> {
+    let bytes = data
+        .get(offset..offset + size_of::<u64>())
+        .context("truncated __compact_unwind u64 field")?;
+    Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+fn compact_unwind_optional_target_address(
+    layout: &MachOLayout<'_>,
+    object: &ObjectLayout<'_, MachO>,
+    relocation: Option<RelocationInfo>,
+    addend: u64,
+    field_name: &str,
+) -> Result<Option<u64>> {
+    match relocation {
+        Some(relocation) => compact_unwind_target_address(layout, object, relocation, addend),
+        None if addend == 0 => Ok(None),
+        None => bail!(
+            "{} has a nonzero __compact_unwind {field_name} without a relocation",
+            object.input
+        ),
+    }
+}
+
+fn compact_unwind_target_address(
+    layout: &MachOLayout<'_>,
+    object: &ObjectLayout<'_, MachO>,
+    relocation: RelocationInfo,
+    addend: u64,
+) -> Result<Option<u64>> {
+    ensure!(
+        relocation.r_type == macho::ARM64_RELOC_UNSIGNED
+            && !relocation.r_pcrel
+            && relocation.r_length == 3,
+        "unsupported __compact_unwind target relocation in {}",
+        object.input
+    );
+
+    if relocation.r_extern {
+        let local_symbol_index = SymbolIndex(relocation.r_symbolnum as usize);
+        let symbol_id = object.symbol_id_range.input_to_id(local_symbol_index);
+        let resolution = layout.merged_symbol_resolution(symbol_id).with_context(|| {
+            format!(
+                "unresolved __compact_unwind symbol {} in {}",
+                layout.symbol_debug(symbol_id),
+                object.input
+            )
+        })?;
+        return resolution
+            .raw_value
+            .checked_add(addend)
+            .map(Some)
+            .context("__compact_unwind external target address overflow");
+    }
+
+    let section_ordinal = usize::try_from(relocation.r_symbolnum)
+        .context("__compact_unwind section ordinal overflowed usize")?;
+    let section_index = object::SectionIndex(
+        section_ordinal
+            .checked_sub(1)
+            .context("__compact_unwind local relocation has section ordinal zero")?,
+    );
+    let Some(section_address) = object
+        .section_resolutions
+        .get(section_index.0)
+        .and_then(|resolution| resolution.address())
+    else {
+        return Ok(None);
+    };
+    // A local Mach-O relocation's in-place word is a section-relative *address*, not always an
+    // offset: object files commonly lay `__gcc_except_tab` after `__text`, so the LSDA word is
+    // the section's object address plus its in-section offset. Convert it before applying the
+    // post-GC input-to-output mapping. `__text` often begins at zero, which is why treating the
+    // raw word as an offset superficially works until an exception table is involved.
+    let input_section = object.object.section(section_index)?;
+    let input_offset = addend
+        .checked_sub(input_section.addr.get(LE))
+        .context("__compact_unwind local target precedes its input section")?;
+    let Some(output_offset) = object.output_offset_for_input(section_index, input_offset) else {
+        return Ok(None);
+    };
+    section_address
+        .checked_add(output_offset)
+        .map(Some)
+        .context("__compact_unwind local target address overflow")
+}
+
+fn serialize_compact_unwind_info(
+    entries: &[CompactUnwindEntry],
+    personalities: &[u64],
+) -> Result<Vec<u8>> {
+    const VERSION: u32 = 1;
+    const HEADER_SIZE: u32 = 28;
+    const REGULAR_SECOND_LEVEL_PAGE: u32 = 2;
+    const REGULAR_PAGE_HEADER_SIZE: u16 = 8;
+    const PERSONALITY_MASK: u32 = 0x3000_0000;
+    const PERSONALITY_SHIFT: u32 = 28;
+
+    let pages: Vec<&[CompactUnwindEntry]> = entries
+        .chunks(COMPACT_UNWIND_REGULAR_PAGE_MAX_ENTRIES)
+        .collect();
+    let index_count = pages
+        .len()
+        .checked_add(1)
+        .context("too many compact-unwind pages")?;
+    let personality_offset = HEADER_SIZE;
+    let index_offset = personality_offset
+        .checked_add(
+            u32::try_from(personalities.len() * size_of::<u32>())
+                .context("compact-unwind personality table exceeds u32")?,
+        )
+        .context("compact-unwind index offset overflow")?;
+
+    let mut data = Vec::new();
+    for value in [
+        VERSION,
+        HEADER_SIZE,
+        0,
+        personality_offset,
+        u32::try_from(personalities.len()).context("too many compact-unwind personalities")?,
+        index_offset,
+        u32::try_from(index_count).context("too many compact-unwind indices")?,
+    ] {
+        push_u32(&mut data, value);
+    }
+    for &personality in personalities {
+        push_u32(&mut data, compact_unwind_image_offset(personality, "personality")?);
+    }
+
+    debug_assert_eq!(data.len(), index_offset as usize);
+    let index_start = data.len();
+    data.resize(index_start + index_count * 12, 0);
+
+    // Each index points at the first LSDA descriptor for its page. The sentinel's LSDA offset is
+    // the end of the shared descriptor table, which gives libunwind a bounded range for the last
+    // page as specified by the Mach-O compact-unwind ABI.
+    let mut lsda_offsets = Vec::with_capacity(pages.len());
+    for page in &pages {
+        lsda_offsets.push(
+            u32::try_from(data.len()).context("compact-unwind LSDA offset exceeds u32")?,
+        );
+        for entry in *page {
+            if let Some(lsda) = entry.lsda_address {
+                push_u32(
+                    &mut data,
+                    compact_unwind_image_offset(entry.function_address, "function")?,
+                );
+                push_u32(&mut data, compact_unwind_image_offset(lsda, "LSDA")?);
+            }
+        }
+    }
+    let lsda_end = u32::try_from(data.len()).context("compact-unwind LSDA table exceeds u32")?;
+
+    let mut page_offsets = Vec::with_capacity(pages.len());
+    for page in &pages {
+        align_u32(&mut data, 4);
+        page_offsets.push(
+            u32::try_from(data.len()).context("compact-unwind page offset exceeds u32")?,
+        );
+        push_u32(&mut data, REGULAR_SECOND_LEVEL_PAGE);
+        push_u16(&mut data, REGULAR_PAGE_HEADER_SIZE);
+        push_u16(
+            &mut data,
+            u16::try_from(page.len()).context("too many entries in compact-unwind page")?,
+        );
+        for entry in *page {
+            let mut encoding = entry.encoding & !PERSONALITY_MASK;
+            if let Some(personality) = entry.personality_address {
+                let index = personalities
+                    .iter()
+                    .position(|candidate| *candidate == personality)
+                    .context("compact-unwind personality was not recorded")?;
+                encoding |= u32::try_from(index + 1)
+                    .context("compact-unwind personality index overflow")?
+                    << PERSONALITY_SHIFT;
+            }
+            push_u32(
+                &mut data,
+                compact_unwind_image_offset(entry.function_address, "function")?,
+            );
+            push_u32(&mut data, encoding);
+        }
+    }
+
+    for (page_index, page) in pages.iter().enumerate() {
+        let index_offset = index_start + page_index * 12;
+        write_u32_at(
+            &mut data,
+            index_offset,
+            compact_unwind_image_offset(page[0].function_address, "function")?,
+        );
+        write_u32_at(&mut data, index_offset + 4, page_offsets[page_index]);
+        write_u32_at(&mut data, index_offset + 8, lsda_offsets[page_index]);
+    }
+
+    let sentinel_offset = index_start + pages.len() * 12;
+    let sentinel_function = entries.last().map_or(0, |entry| {
+        entry
+            .function_address
+            .checked_add(u64::from(entry.function_length))
+            .expect("compact-unwind function range was already checked")
+    });
+    write_u32_at(
+        &mut data,
+        sentinel_offset,
+        compact_unwind_image_offset(sentinel_function, "function")?,
+    );
+    write_u32_at(&mut data, sentinel_offset + 4, 0);
+    write_u32_at(&mut data, sentinel_offset + 8, lsda_end);
+
+    Ok(data)
+}
+
+fn compact_unwind_image_offset(address: u64, what: &str) -> Result<u32> {
+    let offset = address
+        .checked_sub(MACHO_START_MEM_ADDRESS)
+        .with_context(|| format!("compact-unwind {what} address 0x{address:x} is below image"))?;
+    u32::try_from(offset)
+        .with_context(|| format!("compact-unwind {what} address 0x{address:x} is over 4GiB from image base"))
+}
+
+fn push_u16(data: &mut Vec<u8>, value: u16) {
+    data.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_u32(data: &mut Vec<u8>, value: u32) {
+    data.extend_from_slice(&value.to_le_bytes());
+}
+
+fn write_u32_at(data: &mut [u8], offset: usize, value: u32) {
+    data[offset..offset + size_of::<u32>()].copy_from_slice(&value.to_le_bytes());
+}
+
+fn align_u32(data: &mut Vec<u8>, alignment: usize) {
+    data.resize(data.len().next_multiple_of(alignment), 0);
 }
 
 fn write_file<'data, A: Arch<Platform = MachO>>(
@@ -316,11 +966,10 @@ fn write_prelude<'data>(
 fn write_epilogue(
     _epilogue: &EpilogueLayout<MachO>,
     buffers: &mut OutputSectionPartMap<&mut [u8]>,
-    layout: &MachOLayout<'_>,
+    _layout: &MachOLayout<'_>,
     exports_trie: &[u8],
 ) -> Result {
     verbose_timing_phase!("Write epilogue");
-    write_chained_fixup_table(layout, buffers.get_mut(part_id::CHAINED_FIXUP_TABLE))?;
     let out = buffers.get_mut(part_id::EXPORTS_TRIE);
     ensure!(
         exports_trie.len() <= out.len(),
@@ -328,6 +977,17 @@ fn write_epilogue(
     );
     out[..exports_trie.len()].copy_from_slice(exports_trie);
     out[exports_trie.len()..].fill(0);
+
+    // `__unwind_info` is allocated to this synthetic file so normal per-group allocation
+    // verification accounts for it. Its bytes cannot be finalized until every object has been
+    // copied and all final symbol addresses are available, so reserve/zero this span here and
+    // populate it from the whole-output section view later in `write`.
+    let unwind_info = buffers.get_mut(part_id::UNWIND_INFO);
+    let unwind_info_len = unwind_info.len();
+    unwind_info
+        .split_off_mut(..unwind_info_len)
+        .context("Insufficient __unwind_info allocation")?
+        .fill(0);
 
     Ok(())
 }
@@ -404,53 +1064,58 @@ fn exported_symbol_is_weak(layout: &MachOLayout<'_>, symbol_id: SymbolId) -> Res
     Ok(object.object.symbol(symbol_index)?.is_weak())
 }
 
-/// `DYLD_CHAINED_PTR_64` has one chain start per 16KiB page. The `next` field connects
-/// every imported GOT bind in the same page, in four-byte units.
+/// `DYLD_CHAINED_PTR_64_OFFSET` chains are defined independently per load segment and 16KiB
+/// page. A chain can mix local rebases with imported binds; they differ only in the high bit of
+/// the encoded pointer. Keeping the plan in VM-address order makes the on-disk starts table and
+/// pointer `next` fields deterministic.
 #[derive(Debug, PartialEq, Eq)]
-struct GotChainedFixups {
-    /// One entry for every `__DATA_CONST` page through the last GOT fixup.
+struct ChainedFixups {
+    segments: Vec<SegmentChainedFixups>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SegmentChainedFixups {
+    /// Index into `Layout::segment_layouts.segments`, excluding the synthetic __PAGEZERO entry.
+    segment_index: usize,
+    segment_start: u64,
     page_starts: Vec<u16>,
-    /// Every GOT slot that dyld must process, in ascending address order.
-    fixups: Vec<GotFixup>,
-    /// The `next` field for each entry in `fixups`.
+    fixups: Vec<ChainedFixup>,
     next_by_fixup: Vec<u16>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct GotFixup {
+struct ChainedFixup {
     address: u64,
-    /// The index of the `dyld_chained_import` record for a dynamically imported symbol.
-    import_index: usize,
+    kind: ChainedFixupKind,
 }
 
-fn plan_got_chained_fixups(
-    got_start: u64,
-    got_size: u64,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChainedFixupKind {
+    /// The index of the `dyld_chained_import` record for a dynamically imported symbol.
+    Bind { import_index: usize },
+    /// The link-time VM address of a local target. The wire format stores this relative to the
+    /// image base for `DYLD_CHAINED_PTR_64_OFFSET`.
+    Rebase { target: u64 },
+}
+
+fn plan_segment_chained_fixups(
+    segment_index: usize,
     segment_start: u64,
     segment_size: u64,
-    mut fixups: Vec<GotFixup>,
-) -> Result<GotChainedFixups> {
+    mut fixups: Vec<ChainedFixup>,
+) -> Result<SegmentChainedFixups> {
     const POINTER_STRIDE: u64 = 4;
     const MAX_NEXT: u64 = (1 << 12) - 1;
 
     let page_size = MACHO_PAGE_ALIGNMENT.value();
-    ensure!(
-        got_start >= segment_start,
-        "__got starts before its __DATA_CONST segment"
-    );
-    let got_end = got_start
-        .checked_add(got_size)
-        .ok_or_else(|| error!("__got range overflows the Mach-O address space"))?;
     let segment_end = segment_start
         .checked_add(segment_size)
-        .ok_or_else(|| error!("__DATA_CONST range overflows the Mach-O address space"))?;
-    ensure!(
-        got_end <= segment_end,
-        "__got is outside its __DATA_CONST segment"
-    );
+        .ok_or_else(|| error!("Mach-O segment range overflows the address space"))?;
 
     if fixups.is_empty() {
-        return Ok(GotChainedFixups {
+        return Ok(SegmentChainedFixups {
+            segment_index,
+            segment_start,
             page_starts: Vec::new(),
             fixups,
             next_by_fixup: Vec::new(),
@@ -466,21 +1131,24 @@ fn plan_got_chained_fixups(
             let previous_address = fixups[index - 1].address;
             ensure!(
                 address > previous_address,
-                "Mach-O GOT fixups must have distinct addresses: {previous_address:#x} then {address:#x}"
+                "Mach-O chained fixups must have distinct addresses: {previous_address:#x} then {address:#x}"
             );
         }
         ensure!(
-            address >= got_start && address.checked_add(GOT_ENTRY_SIZE).is_some_and(|end| end <= got_end),
-            "Mach-O GOT fixup at {address:#x} is outside __got"
+            address >= segment_start
+                && address
+                    .checked_add(GOT_ENTRY_SIZE)
+                    .is_some_and(|end| end <= segment_end),
+            "Mach-O chained fixup at {address:#x} is outside its segment"
         );
         ensure!(
             address % GOT_ENTRY_SIZE == 0,
-            "Mach-O GOT fixup at {address:#x} is not pointer aligned"
+            "Mach-O chained fixup at {address:#x} is not pointer aligned"
         );
 
         let segment_offset = address - segment_start;
         let page_index = usize::try_from(segment_offset / page_size)
-            .map_err(|_| error!("dynamic GOT bind page index does not fit usize"))?;
+            .map_err(|_| error!("Mach-O chained-fixup page index does not fit usize"))?;
         let page_offset = segment_offset % page_size;
         locations.push((page_index, page_offset, address));
     }
@@ -488,7 +1156,7 @@ fn plan_got_chained_fixups(
     let page_count = locations.last().unwrap().0 + 1;
     ensure!(
         page_count <= usize::from(u16::MAX),
-        "__DATA_CONST has too many pages for Mach-O chained fixups"
+        "Mach-O segment has too many pages for chained fixups"
     );
     let mut page_starts = vec![DYLD_CHAINED_PTR_START_NONE; page_count];
     let mut next_by_fixup = vec![0; fixups.len()];
@@ -496,7 +1164,7 @@ fn plan_got_chained_fixups(
     for (index, &(page_index, page_offset, address)) in locations.iter().enumerate() {
         ensure!(
             page_offset <= u64::from(u16::MAX),
-            "Mach-O GOT fixup page offset does not fit chained fixups"
+            "Mach-O chained-fixup page offset does not fit"
         );
 
         if index == 0 || locations[index - 1].0 != page_index {
@@ -507,66 +1175,300 @@ fn plan_got_chained_fixups(
         let previous_address = locations[index - 1].2;
         let delta = address.checked_sub(previous_address).ok_or_else(|| {
             error!(
-                "Mach-O GOT fixups must be sorted by address: {previous_address:#x} then {address:#x}"
+                "Mach-O chained fixups must be sorted by address: {previous_address:#x} then {address:#x}"
             )
         })?;
         ensure!(
             delta % POINTER_STRIDE == 0,
-            "Mach-O GOT fixup distance {delta:#x} is not a chained-fixup stride"
+            "Mach-O chained-fixup distance {delta:#x} is not a chain stride"
         );
         let next = delta / POINTER_STRIDE;
         ensure!(
             next <= MAX_NEXT,
-            "Mach-O GOT fixup distance {delta:#x} exceeds the chained-fixup next field"
+            "Mach-O chained-fixup distance {delta:#x} exceeds the next field"
         );
         next_by_fixup[index - 1] = next as u16;
     }
 
-    Ok(GotChainedFixups {
+    Ok(SegmentChainedFixups {
+        segment_index,
+        segment_start,
         page_starts,
         fixups,
         next_by_fixup,
     })
 }
 
-fn got_chained_fixups(layout: &MachOLayout<'_>) -> Result<GotChainedFixups> {
-    let symbols = &layout.format_specific.imported_symbols;
-    let got_layout = layout.section_layouts.get(output_section_id::GOT);
+fn image_base(layout: &MachOLayout<'_>) -> Result<u64> {
+    layout
+        .segment_layouts
+        .segments
+        .iter()
+        .find(|segment| layout.program_segments.segment_def(segment.id).name == SegmentName::TEXT)
+        .map(|segment| segment.sizes.mem_offset)
+        .context("Mach-O chained fixups require a __TEXT segment")
+}
 
-    if symbols.is_empty() {
-        return Ok(GotChainedFixups {
-            page_starts: Vec::new(),
-            fixups: Vec::new(),
-            next_by_fixup: Vec::new(),
-        });
-    }
-
-    let (_, data_const_segment) = layout
+fn segment_for_address<'layout, 'data>(
+    layout: &'layout MachOLayout<'data>,
+    address: u64,
+    size: u64,
+) -> Result<(usize, &'layout crate::layout::SegmentLayout)> {
+    let end = address
+        .checked_add(size)
+        .ok_or_else(|| error!("Mach-O chained-fixup address range overflows"))?;
+    layout
         .segment_layouts
         .segments
         .iter()
         .enumerate()
         .find(|(_, segment)| {
-            layout.program_segments.segment_def(segment.id).name == SegmentName::DATA_CONST
+            address >= segment.sizes.mem_offset
+                && end <= segment.sizes.mem_offset.saturating_add(segment.sizes.mem_size)
         })
-        .ok_or_else(|| error!("Mach-O GOT fixups require a __DATA_CONST segment"))?;
+        .context("Mach-O chained fixup is outside all output segments")
+}
 
-    let fixups = symbols
-        .iter()
-        .enumerate()
-        .map(|(import_index, symbol)| GotFixup {
-            address: symbol.got_address.get(),
-            import_index,
-        })
+fn file_offset_for_address(
+    layout: &MachOLayout<'_>,
+    address: u64,
+    size: usize,
+) -> Result<usize> {
+    let (_, segment) = segment_for_address(layout, address, size as u64)?;
+    let offset = address
+        .checked_sub(segment.sizes.mem_offset)
+        .and_then(|offset| segment.sizes.file_offset.checked_add(offset as usize))
+        .context("Mach-O chained fixup file offset overflows")?;
+    ensure!(
+        offset.checked_add(size).is_some_and(|end| end <= segment.sizes.file_end()),
+        "Mach-O chained fixup points into zero-fill data"
+    );
+    Ok(offset)
+}
+
+fn local_rebase_fixups(
+    layout: &MachOLayout<'_>,
+    output: &[u8],
+) -> Result<Vec<ChainedFixup>> {
+    let mut fixups = Vec::new();
+
+    for group in &layout.group_layouts {
+        for file in &group.files {
+            let FileLayout::Object(object) = file else {
+                continue;
+            };
+
+            for (section_index, slot) in object.sections.iter().enumerate() {
+                if !matches!(slot, SectionSlot::Loaded(_)) {
+                    continue;
+                }
+                let section_index = object::SectionIndex(section_index);
+                let section_address = object.section_resolutions[section_index.0]
+                    .address()
+                    .context("loaded Mach-O section has no output address")?;
+
+                for relocation in crate::macho::paired_relocations(
+                    object.relocations(section_index)?.relocations,
+                ) {
+                    let relocation = relocation?;
+                    let info = relocation.info;
+                    // A 64-bit unsigned relocation writes a data pointer. Other absolute forms
+                    // are instruction immediates or smaller scalar constants and must stay raw.
+                    if info.r_type != object::macho::ARM64_RELOC_UNSIGNED
+                        || info.r_length != 3
+                        || info.r_pcrel
+                    {
+                        continue;
+                    }
+                    if !relocation_storage_is_live(object, section_index, info)? {
+                        continue;
+                    }
+                    let Some(output_offset) =
+                        object.output_offset_for_input(section_index, u64::from(info.r_address))
+                    else {
+                        continue;
+                    };
+
+                    let symbol_index = SymbolIndex(info.r_symbolnum as usize);
+                    if info.r_extern
+                        && tlv_descriptor_tls_data_start(
+                            info,
+                            section_index,
+                            symbol_index,
+                            object,
+                            layout,
+                        )?
+                        .is_some()
+                    {
+                        // The data word in a local `__thread_vars` descriptor is a TLS-template
+                        // offset, not an image pointer. Dyld must not slide it.
+                        continue;
+                    }
+
+                    let address = section_address
+                        .checked_add(output_offset)
+                        .context("Mach-O rebase address overflows")?;
+                    let file_offset = file_offset_for_address(layout, address, GOT_ENTRY_SIZE as usize)?;
+                    let target = u64::from_le_bytes(
+                        output[file_offset..file_offset + GOT_ENTRY_SIZE as usize]
+                            .try_into()
+                            .unwrap(),
+                    );
+
+                    // The relocation writer can also use ARM64_RELOC_UNSIGNED for an absolute
+                    // scalar. Only a value that names this image is a dyld rebase.
+                    if segment_for_address(layout, target, 0).is_ok() {
+                        fixups.push(ChainedFixup {
+                            address,
+                            kind: ChainedFixupKind::Rebase { target },
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(fixups)
+}
+
+/// A local `GOT_LOAD` relocation allocates a slot exactly like an imported symbol, but dyld must
+/// slide the locally defined target rather than resolve an import. The old writer only populated
+/// `format_specific.imported_symbols`, leaving these slots as zero. Rust's test formatter reaches
+/// local trait-format functions through this path.
+fn local_got_rebase_fixups(layout: &MachOLayout<'_>) -> Result<Vec<ChainedFixup>> {
+    let mut fixups = Vec::new();
+    let mut seen_got_addresses = BTreeSet::new();
+
+    for group in &layout.group_layouts {
+        for file in &group.files {
+            let FileLayout::Object(object) = file else {
+                continue;
+            };
+
+            for (section_index, slot) in object.sections.iter().enumerate() {
+                if !matches!(slot, SectionSlot::Loaded(_)) {
+                    continue;
+                }
+                let section_index = object::SectionIndex(section_index);
+
+                for relocation in crate::macho::paired_relocations(
+                    object.relocations(section_index)?.relocations,
+                ) {
+                    let relocation = relocation?;
+                    let info = relocation.info;
+                    if !info.r_extern
+                        || !matches!(
+                            info.r_type,
+                            object::macho::ARM64_RELOC_GOT_LOAD_PAGE21
+                                | object::macho::ARM64_RELOC_GOT_LOAD_PAGEOFF12
+                                | object::macho::ARM64_RELOC_POINTER_TO_GOT
+                        )
+                    {
+                        continue;
+                    }
+                    if !relocation_storage_is_live(object, section_index, info)? {
+                        continue;
+                    }
+
+                    let (_, _, local_symbol_id) = get_resolution(info, object, layout)?;
+                    let symbol_id = layout.symbol_db.definition(local_symbol_id);
+                    let FileLayout::Object(definition) = layout
+                        .file_layout(layout.symbol_db.file_id_for_symbol(symbol_id))
+                    else {
+                        // Dynamic symbols use `ImportedSymbolWithResolution` and become binds.
+                        continue;
+                    };
+
+                    let symbol_index = definition.symbol_id_range.id_to_input(symbol_id);
+                    let symbol = definition.object.symbol(symbol_index)?;
+                    let section_index = definition
+                        .object
+                        .symbol_section(symbol, symbol_index)?
+                        .context("local Mach-O GOT target is not section-defined")?;
+                    let section_address = definition.section_resolutions[section_index.0]
+                        .address()
+                        .context("local Mach-O GOT target section has no output address")?;
+                    let target = section_address
+                        .checked_add(
+                            definition
+                                .output_offset_for_input(
+                                    section_index,
+                                    definition
+                                        .object
+                                        .symbol_offset_in_section(symbol, section_index)?,
+                                )
+                                .context("local Mach-O GOT target is in a dead atom")?,
+                        )
+                        .context("local Mach-O GOT target address overflows")?;
+                    let got_address = layout
+                        .symbol_resolutions
+                        .get(symbol_id)
+                        .and_then(|resolution| resolution.format_specific.got_address)
+                        .context("local Mach-O GOT relocation has no allocated GOT slot")?
+                        .get();
+
+                    if seen_got_addresses.insert(got_address) {
+                        fixups.push(ChainedFixup {
+                            address: got_address,
+                            kind: ChainedFixupKind::Rebase { target },
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(fixups)
+}
+
+fn chained_fixups(layout: &MachOLayout<'_>, output: &[u8]) -> Result<ChainedFixups> {
+    let symbols = &layout.format_specific.imported_symbols;
+    let got_layout = layout.section_layouts.get(output_section_id::GOT);
+    let mut fixups_by_segment = (0..layout.segment_layouts.segments.len())
+        .map(|_| Vec::new())
         .collect_vec();
 
-    plan_got_chained_fixups(
-        got_layout.mem_offset,
-        got_layout.mem_size,
-        data_const_segment.sizes.mem_offset,
-        data_const_segment.sizes.mem_size,
-        fixups,
-    )
+    for (import_index, symbol) in symbols.iter().enumerate() {
+        let address = symbol.got_address.get();
+        ensure!(
+            address >= got_layout.mem_offset
+                && address
+                    .checked_add(GOT_ENTRY_SIZE)
+                    .is_some_and(|end| end <= got_layout.mem_offset + got_layout.mem_size),
+            "Mach-O GOT bind at {address:#x} is outside __got"
+        );
+        let (segment_index, _) = segment_for_address(layout, address, GOT_ENTRY_SIZE)?;
+        fixups_by_segment[segment_index].push(ChainedFixup {
+            address,
+            kind: ChainedFixupKind::Bind { import_index },
+        });
+    }
+
+    for fixup in local_rebase_fixups(layout, output)? {
+        let (segment_index, _) = segment_for_address(layout, fixup.address, GOT_ENTRY_SIZE)?;
+        fixups_by_segment[segment_index].push(fixup);
+    }
+
+    for fixup in local_got_rebase_fixups(layout)? {
+        let (segment_index, _) = segment_for_address(layout, fixup.address, GOT_ENTRY_SIZE)?;
+        fixups_by_segment[segment_index].push(fixup);
+    }
+
+    let mut segments = Vec::new();
+    for (segment_index, fixups) in fixups_by_segment.into_iter().enumerate() {
+        if fixups.is_empty() {
+            continue;
+        }
+        let segment = &layout.segment_layouts.segments[segment_index];
+        segments.push(plan_segment_chained_fixups(
+            segment_index,
+            segment.sizes.mem_offset,
+            segment.sizes.mem_size,
+            fixups,
+        )?);
+    }
+
+    Ok(ChainedFixups { segments })
 }
 
 fn chained_bind_word(ordinal: usize, next: u16) -> Result<u64> {
@@ -582,38 +1484,43 @@ fn chained_bind_word(ordinal: usize, next: u16) -> Result<u64> {
     Ok((1u64 << 63) | (u64::from(next) << 51) | ordinal as u64)
 }
 
-fn write_got_entries(layout: &MachOLayout<'_>, got: &mut [u8]) -> Result {
-    let got_layout = layout.section_layouts.get(output_section_id::GOT);
-    let chained_fixups = got_chained_fixups(layout)?;
-    for (fixup, &next) in chained_fixups
-        .fixups
-        .iter()
-        .zip(&chained_fixups.next_by_fixup)
-    {
-        let offset: usize = fixup
-            .address
-            .checked_sub(got_layout.mem_offset)
-            .ok_or_else(|| error!("GOT entry address is before __got"))?
-            .try_into()
-            .map_err(|_| error!("GOT entry offset does not fit the output file"))?;
-        let end = offset
-            .checked_add(GOT_ENTRY_SIZE as usize)
-            .ok_or_else(|| error!("GOT entry range overflows the output file"))?;
-        ensure!(
-            end <= got.len(),
-            "GOT entry is outside the allocated __got section"
-        );
+fn chained_rebase_word(target: u64, image_base: u64, next: u16) -> Result<u64> {
+    const TARGET_BITS: u32 = 36;
 
-        /* DYLD_CHAINED_PTR_64 format:
-        uint64_t dyld_chained_ptr_64_bind:
-          ordinal: 24
-          addend: 8 // 0 thru 255
-          reserved: 19 // all zeros
-          next: 12 // 4-byte stride
-          bind: 1 // == 1
-        */
-        let encoded = chained_bind_word(fixup.import_index, next)?;
-        got[offset..end].copy_from_slice(&encoded.to_le_bytes());
+    ensure!(
+        next <= 0x0fff,
+        "Mach-O chained-fixup next value does not fit 12 bits"
+    );
+    let target = target
+        .checked_sub(image_base)
+        .context("Mach-O chained rebase target is before the image base")?;
+    ensure!(
+        target < (1u64 << TARGET_BITS),
+        "Mach-O chained rebase target does not fit 36 bits"
+    );
+
+    // DYLD_CHAINED_PTR_64_OFFSET stores a local target relative to the image base. `high8` is
+    // zero because an in-image ARM64 pointer never needs bits above this 36-bit image offset.
+    Ok((u64::from(next) << 51) | target)
+}
+
+fn write_chained_fixup_pointers(
+    layout: &MachOLayout<'_>,
+    chained_fixups: &ChainedFixups,
+    output: &mut [u8],
+) -> Result {
+    let image_base = image_base(layout)?;
+
+    for segment in &chained_fixups.segments {
+        for (fixup, &next) in segment.fixups.iter().zip(&segment.next_by_fixup) {
+            let encoded = match fixup.kind {
+                ChainedFixupKind::Bind { import_index } => chained_bind_word(import_index, next)?,
+                ChainedFixupKind::Rebase { target } => chained_rebase_word(target, image_base, next)?,
+            };
+            let file_offset = file_offset_for_address(layout, fixup.address, GOT_ENTRY_SIZE as usize)?;
+            output[file_offset..file_offset + GOT_ENTRY_SIZE as usize]
+                .copy_from_slice(&encoded.to_le_bytes());
+        }
     }
 
     Ok(())
@@ -832,6 +1739,49 @@ fn write_object<'data, A: Arch<Platform = MachO>>(
 
     write_symbols(object, buffers, layout, symbol_writer)?;
 
+    if object.owns_thunk_block
+        && let Some(addresses) = layout
+            .thunk_block_addresses
+            .get(object.thunk_block_id.as_usize())
+    {
+        write_thunks::<A>(addresses, buffers, layout)?;
+    }
+
+    Ok(())
+}
+
+/// Emit one deterministic ARM64 range-extension island per target in an object-owned thunk
+/// block. Layout has already reserved this exact space in the primary `__TEXT,__text` part, so
+/// splitting the part buffer here puts an island directly after its owner object's code rather
+/// than in the unrelated `__stubs` section.
+fn write_thunks<'data, A: Arch<Platform = MachO>>(
+    thunk_addresses: &BTreeMap<SymbolId, u64>,
+    buffers: &mut OutputSectionPartMap<&mut [u8]>,
+    layout: &MachOLayout<'data>,
+) -> Result {
+    if thunk_addresses.is_empty() {
+        return Ok(());
+    }
+
+    let config = A::thunk_config().expect("Mach-O thunk addresses require a thunk configuration");
+    let thunk_size = usize::try_from(config.thunk_size).context("Mach-O thunk size overflows usize")?;
+
+    for (symbol_id, &thunk_address) in thunk_addresses {
+        let resolution = layout.merged_symbol_resolution(*symbol_id).with_context(|| {
+            format!(
+                "No resolution for Mach-O branch island target {}",
+                layout.symbol_db.symbol_name_for_display(*symbol_id)
+            )
+        })?;
+        let target_address = resolution.raw_value;
+        let thunk = buffers
+            .get_mut(config.primary_function_part_id)
+            .split_off_mut(..thunk_size)
+            .ok_or_else(|| crate::file_writer::insufficient_allocation("Mach-O __text branch island"))?;
+
+        A::write_thunk(thunk_address, target_address, thunk);
+    }
+
     Ok(())
 }
 
@@ -852,10 +1802,21 @@ fn write_object_section<'data, A: Arch<Platform = MachO>>(
         object_layout.relocations(section_index)?.relocations,
     ) {
         let relocation = relocation?;
+        let input_offset = u64::from(relocation.info.r_address);
+        if !relocation_storage_is_live(object_layout, section_index, relocation.info)? {
+            continue;
+        }
+        let Some(output_offset) = object_layout.output_offset_for_input(section_index, input_offset)
+        else {
+            // Mach-O stores all relocations for a section together. A relocation whose source is
+            // in a discarded atom must neither be applied nor create a chained rebase later.
+            continue;
+        };
         apply_relocation::<A>(
             object_layout,
             section_index,
             section_address,
+            output_offset,
             relocation.info,
             relocation.addend,
             layout,
@@ -866,18 +1827,36 @@ fn write_object_section<'data, A: Arch<Platform = MachO>>(
     Ok(())
 }
 
+/// A final-atom end label can resolve to an output address, but it cannot be a relocation source:
+/// applying an `r_length`-wide field there would write into the next object's allocation. Check
+/// the complete field before compacting its input offset.
+fn relocation_storage_is_live(
+    object: &ObjectLayout<'_, MachO>,
+    section_index: object::SectionIndex,
+    relocation: RelocationInfo,
+) -> Result<bool> {
+    let input_offset = u64::from(relocation.r_address);
+    let width = 1u64
+        .checked_shl(u32::from(relocation.r_length))
+        .context("Mach-O relocation width is invalid")?;
+    let input_end = input_offset
+        .checked_add(width)
+        .context("Mach-O relocation source range overflows")?;
+    Ok(object.input_range_is_live(section_index, input_offset..input_end))
+}
+
 #[inline(always)]
 fn apply_relocation<'data, A: Arch<Platform = MachO>>(
     object_layout: &ObjectLayout<'data, MachO>,
     source_section_index: object::SectionIndex,
     section_address: u64,
+    output_offset: u64,
     rel: RelocationInfo,
     addend: i64,
     layout: &MachOLayout<'data>,
     out: &mut [u8],
 ) -> Result {
-    let offset_in_section = u64::from(rel.r_address);
-    let place = section_address + offset_in_section;
+    let place = section_address + output_offset;
 
     let _span = tracing::trace_span!(
         "relocation",
@@ -915,6 +1894,18 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
         value = tls_storage_offset(resolution.raw_value, tls_data_start)?;
     }
 
+    if let Some(thunked_value) = maybe_get_thunk_for_relocation::<A>(
+        object_layout,
+        source_section_index,
+        layout,
+        rel_info,
+        local_symbol_id,
+        place,
+        value,
+    )? {
+        value = thunked_value;
+    }
+
     tracing::trace!(
             %flags,
             ?rel_info.kind,
@@ -925,12 +1916,29 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
             symbol_name = %layout.symbol_db.symbol_name_for_display(local_symbol_id),
             "relocation applied");
 
+    let output_offset = usize::try_from(output_offset)
+        .context("Mach-O relocation output offset does not fit usize")?;
+    let relocation_width = 1usize
+        .checked_shl(u32::from(rel.r_length))
+        .context("Mach-O relocation width is invalid")?;
+    ensure!(
+        output_offset
+            .checked_add(relocation_width)
+            .is_some_and(|end| end <= out.len()),
+        "live Mach-O subsection ends inside relocation storage in {}: input offset 0x{:x} maps to output offset 0x{:x}, but {} bytes are required and this object's compacted section has {} bytes",
+        object_layout.object.section_display_name(source_section_index),
+        rel.r_address,
+        output_offset,
+        relocation_width,
+        out.len(),
+    );
+
     if rel.r_type == object::macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12 {
-        rewrite_tlvp_load_as_add(&mut out[offset_in_section as usize..])?;
+        rewrite_tlvp_load_as_add(&mut out[output_offset..])?;
     }
 
     rel_info
-        .write_to_buffer(value, &mut out[offset_in_section as usize..])
+        .write_to_buffer(value, &mut out[output_offset..])
         .with_context(|| {
             format!(
                 "Failed to apply relocation {} to {}",
@@ -940,6 +1948,73 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
         })?;
 
     Ok(())
+}
+
+/// Replaces an out-of-range branch relocation with the assigned nearby island. Allocation is
+/// decided after dead stripping, while the writer has the final addresses needed to decide
+/// whether a direct `B`/`BL` remains in range.
+fn maybe_get_thunk_for_relocation<'data, A: Arch<Platform = MachO>>(
+    object_layout: &ObjectLayout<'data, MachO>,
+    source_section_index: object::SectionIndex,
+    layout: &MachOLayout<'data>,
+    rel_info: linker_utils::elf::RelocationKindInfo,
+    local_symbol_id: SymbolId,
+    place: u64,
+    value: u64,
+) -> Result<Option<u64>> {
+    let Some(config) = A::thunk_config() else {
+        return Ok(None);
+    };
+    if !rel_info.thunkable || rel_info.range.contains(value as i64) {
+        return Ok(None);
+    }
+
+    let canonical_id = layout.symbol_db.definition(local_symbol_id);
+    let source_part = object_layout
+        .section_part_id(source_section_index, &layout.symbol_db.section_part_ids);
+    let thunk_block = if source_part == config.primary_function_part_id {
+        object_layout.thunk_block_id
+    } else {
+        ThunkBlockId::FIRST
+    };
+
+    let Some(thunk_address) = layout
+        .thunk_block_addresses
+        .get(thunk_block.as_usize())
+        .and_then(|addresses| addresses.get(&canonical_id))
+        .copied()
+    else {
+        bail!(
+            "Mach-O branch relocation out of range by {over} for symbol {symbol}, but no branch island was allocated (part: {part})",
+            over = rel_info.range.overrun(value as i64),
+            symbol = layout.symbol_db.symbol_name_for_display(local_symbol_id),
+            part = layout.output_sections.part_debug(source_part),
+        );
+    };
+    ensure!(
+        thunk_address != 0,
+        "Mach-O branch island address was not assigned for {}",
+        layout.symbol_db.symbol_name_for_display(local_symbol_id)
+    );
+
+    let mask = get_page_mask(rel_info.mask);
+    let island_value = thunk_address
+        .wrapping_add(rel_info.bias)
+        .bitand(mask.symbol_plus_addend)
+        .wrapping_sub(place.bitand(mask.place));
+    ensure!(
+        rel_info.range.contains(island_value as i64),
+        "allocated Mach-O branch island for {} is still out of range",
+        layout.symbol_db.symbol_name_for_display(local_symbol_id)
+    );
+
+    tracing::trace!(
+        old_value = value,
+        new_value = island_value,
+        thunk_address,
+        "using Mach-O ARM64 branch island"
+    );
+    Ok(Some(island_value))
 }
 
 /// Mach-O assemblers emit an unsigned-immediate `ldr` for a TLVP page-offset relocation. The
@@ -1051,10 +2126,47 @@ fn write_section_raw<'out, 'data>(
         }
         let out = section_buffer.split_off_mut(..allocation_size).unwrap();
         let object_section = object.object.section(section_index)?;
+        let (out, padding) = out.split_at_mut(sec.size as usize);
 
-        let section_size = object.object.section_size(object_section)?;
-        let (out, padding) = out.split_at_mut(section_size as usize);
-        object.object.copy_section_data(object_section, out)?;
+        if let Some(ranges) = object.live_input_ranges(section_index) {
+            let input = object.object.raw_section_data(object_section)?;
+            let mut output_offset = 0usize;
+            for range in ranges {
+                let input_start = usize::try_from(range.start)
+                    .context("Mach-O subsection start does not fit usize")?;
+                let input_end = usize::try_from(range.end)
+                    .context("Mach-O subsection end does not fit usize")?;
+                let span_size = input_end
+                    .checked_sub(input_start)
+                    .context("Mach-O subsection has an invalid range")?;
+                let output_end = output_offset
+                    .checked_add(span_size)
+                    .context("Mach-O subsection output size overflows")?;
+                ensure!(
+                    output_end <= out.len(),
+                    "Mach-O subsection copy exceeds its allocated output section"
+                );
+
+                // Zero-fill sections have no backing file data. For a partially backed section,
+                // copy the available prefix and explicitly initialise the rest rather than
+                // relying on an output-file implementation's initial contents.
+                let copied_end = input_end.min(input.len());
+                if input_start < copied_end {
+                    out[output_offset..output_offset + copied_end - input_start]
+                        .copy_from_slice(&input[input_start..copied_end]);
+                }
+                if copied_end < input_end {
+                    out[output_offset + copied_end - input_start..output_end].fill(0);
+                }
+                output_offset = output_end;
+            }
+            ensure!(
+                output_offset == out.len(),
+                "Mach-O live-subsection sizes do not match section allocation"
+            );
+        } else {
+            object.object.copy_section_data(object_section, out)?;
+        }
         padding.fill(0);
         Ok(out)
     } else {
@@ -1285,7 +2397,11 @@ fn write_code_signature_command(layout: &MachOLayout, command: &mut CodeSignatur
     command.datasize.set(LE, code_signature.file_size as u32);
 }
 
-fn write_chained_fixup_table(layout: &MachOLayout, chained_fixup_table: &mut [u8]) -> Result {
+fn write_chained_fixup_table(
+    layout: &MachOLayout,
+    chained_fixups: &ChainedFixups,
+    chained_fixup_table: &mut [u8],
+) -> Result {
     // The starts-in-image offset is 8-byte aligned while the packed header is 28 bytes. The
     // four-byte wire padding must not retain data from an update-in-place output: it contributes
     // to both the deterministic UUID hash and the code signature.
@@ -1293,7 +2409,6 @@ fn write_chained_fixup_table(layout: &MachOLayout, chained_fixup_table: &mut [u8
 
     let symbols = &layout.format_specific.imported_symbols;
     let active_segments = &layout.segment_layouts.segments;
-    let chained_fixups = got_chained_fixups(layout)?;
 
     // The __PAGEZERO segment needs to be added manually.
     let segment_count = active_segments.len() + 1;
@@ -1302,18 +2417,27 @@ fn write_chained_fixup_table(layout: &MachOLayout, chained_fixup_table: &mut [u8
         "unexpected number of active segments"
     );
     let starts_in_image_len = size_of::<u32>() * (segment_count + 1);
-    let starts_in_segment_len = CHAINED_STARTS_IN_SEGMENT_FIXED_SIZE
-        + chained_fixups.page_starts.len() * size_of::<u16>();
+    let starts_in_segments_len = chained_fixups
+        .segments
+        .iter()
+        .map(|segment| {
+            CHAINED_STARTS_IN_SEGMENT_FIXED_SIZE
+                + segment.page_starts.len() * size_of::<u16>()
+        })
+        .sum::<usize>();
     let imports_len = size_of::<u32>() * symbols.len();
 
     let starts_offset = CHAINED_STARTS_IN_IMAGE_OFFSET;
-    let imports_offset = starts_offset + starts_in_image_len + starts_in_segment_len;
+    // `dyld_chained_import` is a packed u32 record. Segment-start records are only u16 aligned,
+    // so a multi-segment table can otherwise leave imports at an invalid unaligned offset.
+    let starts_and_segments_len = starts_in_image_len + starts_in_segments_len;
+    let imports_offset = (starts_offset + starts_and_segments_len).next_multiple_of(size_of::<u32>());
     let symbols_offset = imports_offset + imports_len;
 
     let (header, rest) = from_bytes_mut::<ChainedFixupsHeader>(chained_fixup_table)
         .map_err(|_| error!("Invalid chained fixups header allocation"))?;
     let (_, rest) = rest.split_at_mut(starts_offset - size_of::<ChainedFixupsHeader>());
-    let (starts_in_image, rest) = slice_from_bytes_mut::<U32<Endianness>>(rest, segment_count + 1)
+    let (starts_in_image, mut rest) = slice_from_bytes_mut::<U32<Endianness>>(rest, segment_count + 1)
         .map_err(|_| error!("Invalid chained fixups starts allocation"))?;
 
     // 1) fill up ChainedFixupsHeader
@@ -1325,69 +2449,68 @@ fn write_chained_fixup_table(layout: &MachOLayout, chained_fixup_table: &mut [u8
     header.imports_format.set(LE, DYLD_CHAINED_IMPORT);
     header.symbols_format.set(LE, 0);
 
-    // 2) fill up dyld_chained_starts_in_image, which is `seg_count` (u32) followed by
-    //    `seg_info_offset` ([u32; seg_count]); only __DATA_CONST,__got segment is covered
+    // 2) Fill `dyld_chained_starts_in_image`: `seg_count` followed by one relative offset for
+    // each load command segment. __PAGEZERO occupies index 0, so active segment N uses N + 1.
     starts_in_image[0].set(LE, segment_count as u32);
     starts_in_image[1..].fill(U32::new(LE, 0));
 
-    // If __got has no bind, no starts table is needed.
-    if chained_fixups.page_starts.is_empty() {
-        rest.zero();
-        return Ok(());
-    }
-
-    let (data_const_segment_index, data_const_segment) = active_segments
-        .iter()
-        .enumerate()
-        .find(|(_, segment)| {
-            layout.program_segments.segment_def(segment.id).name == SegmentName::DATA_CONST
-        })
-        .ok_or_else(|| error!("non-empty __got requires __DATA_CONST segment"))?;
-    let text_segment = active_segments
-        .iter()
-        .find(|segment| {
-            layout.program_segments.segment_def(segment.id).name == SegmentName::TEXT
-        })
-        .ok_or_else(|| error!("Mach-O chained fixups require a __TEXT segment"))?;
-
-    // Accounts for both seg_count and __PAGEZERO.
-    starts_in_image[data_const_segment_index + 2].set(LE, starts_in_image_len as u32);
-
-    let (starts_in_segment_bytes, rest) = rest.split_at_mut(starts_in_segment_len);
-    let (starts_in_segment, _) = from_bytes_mut::<ChainedStartsInSegment>(starts_in_segment_bytes)
-        .map_err(|_| error!("Invalid chained fixups starts in segment allocation"))?;
+    let starts_and_padding_bytes = rest
+        .split_off_mut(..imports_offset - starts_offset - starts_in_image_len)
+        .context("Invalid chained fixups segment-start allocation")?;
+    let (starts_in_segment_bytes, padding) = starts_and_padding_bytes.split_at_mut(starts_in_segments_len);
+    padding.fill(0);
     let (imports, string_pool) = slice_from_bytes_mut::<U32<Endianness>>(rest, symbols.len())
         .map_err(|_| error!("Invalid chained fixups imports allocation"))?;
 
-    // 3) fill up DyldChainedStartsInSegment for the __got section
-    starts_in_segment.size.set(LE, starts_in_segment_len as u32);
-    starts_in_segment
-        .page_size
-        .set(LE, MACHO_PAGE_ALIGNMENT.value() as u16);
-    starts_in_segment
-        .pointer_format
-        .set(LE, DYLD_CHAINED_PTR_64_OFFSET);
-    starts_in_segment
-        .segment_offset
-        .set(
+    // 3) Emit one `dyld_chained_starts_in_segment` record for every segment that contains at
+    // least one bind or rebase. The records are variable-sized because each includes all page
+    // starts through its final chain page.
+    let image_base = image_base(layout)?;
+    let mut segment_bytes = starts_in_segment_bytes;
+    let mut segment_offset_in_starts = starts_in_image_len;
+    for segment in &chained_fixups.segments {
+        let starts_in_segment_len = CHAINED_STARTS_IN_SEGMENT_FIXED_SIZE
+            + segment.page_starts.len() * size_of::<u16>();
+        let bytes = segment_bytes
+            .split_off_mut(..starts_in_segment_len)
+            .context("Invalid chained fixups segment-start record allocation")?;
+        let (starts_in_segment, _) = from_bytes_mut::<ChainedStartsInSegment>(bytes)
+            .map_err(|_| error!("Invalid chained fixups starts in segment allocation"))?;
+
+        // Accounts for both seg_count and the synthetic __PAGEZERO segment.
+        starts_in_image[segment.segment_index + 2].set(
             LE,
-            data_const_segment
-                .sizes
-                .mem_offset
-                .checked_sub(text_segment.sizes.mem_offset)
-                .ok_or_else(|| error!("__DATA_CONST is before __TEXT"))?,
+            u32::try_from(segment_offset_in_starts)
+                .context("Mach-O chained-fixup segment-start offset exceeds 32 bits")?,
         );
-    starts_in_segment.max_valid_pointer.set(LE, 0);
-    starts_in_segment
-        .page_count
-        .set(LE, u16::try_from(chained_fixups.page_starts.len())?);
-    let (page_starts, _) = slice_from_bytes_mut::<U16<Endianness>>(
-        &mut starts_in_segment_bytes[CHAINED_STARTS_IN_SEGMENT_FIXED_SIZE..],
-        chained_fixups.page_starts.len(),
-    )
-    .map_err(|_| error!("Invalid chained fixups page starts allocation"))?;
-    for (output, start) in page_starts.iter_mut().zip(&chained_fixups.page_starts) {
-        output.set(LE, *start);
+        segment_offset_in_starts += starts_in_segment_len;
+
+        starts_in_segment.size.set(LE, starts_in_segment_len as u32);
+        starts_in_segment
+            .page_size
+            .set(LE, MACHO_PAGE_ALIGNMENT.value() as u16);
+        starts_in_segment
+            .pointer_format
+            .set(LE, DYLD_CHAINED_PTR_64_OFFSET);
+        starts_in_segment.segment_offset.set(
+            LE,
+            segment
+                .segment_start
+                .checked_sub(image_base)
+                .context("Mach-O chained-fixup segment is before __TEXT")?,
+        );
+        starts_in_segment.max_valid_pointer.set(LE, 0);
+        starts_in_segment
+            .page_count
+            .set(LE, u16::try_from(segment.page_starts.len())?);
+        let (page_starts, _) = slice_from_bytes_mut::<U16<Endianness>>(
+            &mut bytes[CHAINED_STARTS_IN_SEGMENT_FIXED_SIZE..],
+            segment.page_starts.len(),
+        )
+        .map_err(|_| error!("Invalid chained fixups page starts allocation"))?;
+        for (output, start) in page_starts.iter_mut().zip(&segment.page_starts) {
+            output.set(LE, *start);
+        }
     }
 
     // 4) fill up imports in the same order used by the GOT bind pointers.
@@ -1642,6 +2765,14 @@ fn write_symbols<'data>(
         .zip(layout.per_symbol_flags.raw_range(object.symbol_id_range))
     {
         let symbol_id = object.symbol_id_range.input_to_id(sym_index);
+        if let Some(section_index) = object.object.symbol_section(sym, sym_index)? {
+            let input_offset = object
+                .object
+                .symbol_offset_in_section(sym, section_index)?;
+            if !object.input_offset_is_live(section_index, input_offset) {
+                continue;
+            }
+        }
         let Some(info) = SymbolCopyInfo::new(
             object.object,
             sym_index,
@@ -1797,27 +2928,91 @@ mod tests {
     }
 
     #[test]
-    fn chained_fixups_start_a_new_chain_on_each_got_page() {
+    fn chained_fixups_start_a_new_chain_on_each_segment_page() {
         let page = MACHO_PAGE_ALIGNMENT.value();
-        let plan = plan_got_chained_fixups(
-            0x1_0000,
-            page + 0x10,
+        let plan = plan_segment_chained_fixups(
+            3,
             0x1_0000,
             page * 2,
             vec![
-                GotFixup {
+                ChainedFixup {
                     address: 0x1_0000 + page - GOT_ENTRY_SIZE,
-                    import_index: 0,
+                    kind: ChainedFixupKind::Bind { import_index: 0 },
                 },
-                GotFixup {
+                ChainedFixup {
                     address: 0x1_0000 + page + GOT_ENTRY_SIZE,
-                    import_index: 1,
+                    kind: ChainedFixupKind::Rebase {
+                        target: 0x1_0000 + 0x40,
+                    },
                 },
             ],
         )
         .unwrap();
 
+        assert_eq!(plan.segment_index, 3);
         assert_eq!(plan.page_starts, vec![(page - GOT_ENTRY_SIZE) as u16, GOT_ENTRY_SIZE as u16]);
         assert_eq!(plan.next_by_fixup, vec![0, 0]);
+    }
+
+    #[test]
+    fn chained_rebase_is_image_relative_and_keeps_the_next_delta() {
+        let encoded = chained_rebase_word(0x1_0000_03c0, 0x1_0000_0000, 2).unwrap();
+
+        assert_eq!(encoded & ((1 << 36) - 1), 0x3c0);
+        assert_eq!((encoded >> 51) & 0x0fff, 2);
+        assert_eq!(encoded >> 63, 0);
+    }
+
+    #[test]
+    fn compact_unwind_regular_page_preserves_personality_and_lsda() {
+        let entries = [
+            CompactUnwindEntry {
+                function_address: MACHO_START_MEM_ADDRESS + 0x100,
+                function_length: 0x20,
+                encoding: 0x4400_0000,
+                personality_address: Some(MACHO_START_MEM_ADDRESS + 0x4000),
+                lsda_address: Some(MACHO_START_MEM_ADDRESS + 0x300),
+            },
+            CompactUnwindEntry {
+                function_address: MACHO_START_MEM_ADDRESS + 0x200,
+                function_length: 0x10,
+                encoding: 0x0400_0000,
+                personality_address: None,
+                lsda_address: None,
+            },
+        ];
+
+        let data = serialize_compact_unwind_info(
+            &entries,
+            &[MACHO_START_MEM_ADDRESS + 0x4000],
+        )
+        .unwrap();
+        let word = |offset| u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+
+        assert_eq!(word(0), 1);
+        assert_eq!(word(12), 28);
+        assert_eq!(word(16), 1);
+        assert_eq!(word(20), 32);
+        assert_eq!(word(24), 2);
+        assert_eq!(word(28), 0x4000);
+
+        // The first top-level index points to one regular page and its sole LSDA descriptor.
+        assert_eq!(word(32), 0x100);
+        assert_eq!(word(36), 64);
+        assert_eq!(word(40), 56);
+        assert_eq!(word(44), 0x210);
+        assert_eq!(word(48), 0);
+        assert_eq!(word(52), 64);
+        assert_eq!(word(56), 0x100);
+        assert_eq!(word(60), 0x300);
+
+        assert_eq!(word(64), 2);
+        assert_eq!(u16::from_le_bytes(data[68..70].try_into().unwrap()), 8);
+        assert_eq!(u16::from_le_bytes(data[70..72].try_into().unwrap()), 2);
+        assert_eq!(word(72), 0x100);
+        // The final representation assigns personality-table index one in bits 28..29.
+        assert_eq!(word(76), 0x5400_0000);
+        assert_eq!(word(80), 0x200);
+        assert_eq!(word(84), 0x0400_0000);
     }
 }

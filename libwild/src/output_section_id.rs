@@ -786,7 +786,11 @@ impl<'data, P: Platform> OutputSections<'data, P> {
     ) -> OutputSectionId {
         let mut resolved_id = None;
         if !self.output_kind.is_partial_object()
-            && let Some(builtin_id) = (0..regular_section_base::<P>().as_usize())
+            // Regular built-ins have a complete section identity too. Platforms that use those
+            // identities directly (Mach-O's `__TEXT,__text`, for example) must resolve them
+            // before custom-section allocation; restricting this to single-part sections makes
+            // a same-named section in another segment impossible to distinguish safely.
+            && let Some(builtin_id) = (0..num_built_in_sections::<P>())
                 .map(OutputSectionId::from_usize)
                 .find(|&bid| self.identity(bid) == Some(identity))
         {

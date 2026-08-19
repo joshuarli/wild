@@ -130,6 +130,21 @@ Contents of __compact_unwind section:
 The final format is a 2-level page table structure as described here:
 https://faultlore.com/blah/compact-unwinding/#layout-of-the-page-table
 
+Wild reads object-file `__LD,__compact_unwind` records as linker metadata and emits the final
+`__TEXT,__unwind_info` section in `macho_writer::write_compact_unwind_info`. The writer resolves
+function, personality, and LSDA relocations after GC/layout, so an LSDA in `__gcc_except_tab`
+tracks its compacted output address rather than the input object's section address. It currently
+uses only the ABI's lossless regular second-level pages (kind `2`), splitting at 511 entries per
+page. This deliberately trades a small amount of output size for straightforward correctness;
+compressed pages are an optimization, not a compatibility requirement. The final encoding supports
+the format's three distinct personality slots and reports a diagnostic if an input needs more.
+
+This is intentionally a bounded ARM64 implementation. `UNWIND_ARM64_MODE_DWARF` (`0x03000000`)
+requires a correctly selected and relocated final `__TEXT,__eh_frame` table; Wild does not yet
+serialize that table and therefore rejects a live compact-unwind row using DWARF mode. This is a
+link-time diagnostic rather than an output that aborts while unwinding. Frame and frameless rows,
+including C++ `throw`/`catch` with compact personality and LSDA metadata, are covered.
+
 ```
 ❯ llvm-objdump --unwind-info ~/Programming/testcases/a.out
 

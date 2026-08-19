@@ -100,6 +100,7 @@ use std::mem::size_of;
 use std::mem::swap;
 use std::mem::take;
 use std::num::NonZeroU32;
+use std::ops::Range;
 use std::sync::Mutex;
 use std::sync::atomic;
 use std::sync::atomic::AtomicBool;
@@ -944,6 +945,15 @@ pub(crate) struct ObjectLayout<'data, P: Platform> {
     pub(crate) symbol_id_range: SymbolIdRange,
     pub(crate) section_id_range: SectionIdRange,
 
+    /// Live input spans for sections that are dead-stripped below section granularity. `None`
+    /// retains the traditional one-to-one input-section mapping. A present, empty vector is not
+    /// emitted: it only exists transiently while graph loading discovers a subsection.
+    ///
+    /// This belongs to the generic layout record because address assignment and symbol resolution
+    /// need the same input-to-output mapping as a format-specific writer. Mach-O currently uses
+    /// it for `MH_SUBSECTIONS_VIA_SYMBOLS`; other formats retain the `None` fast path.
+    pub(crate) live_subsections: Vec<Option<Vec<Range<u64>>>>,
+
     /// SFrame section ranges for this object, relative to the start of the .sframe output section.
     pub(crate) sframe_ranges: Vec<std::ops::Range<usize>>,
 
@@ -1350,6 +1360,10 @@ pub(crate) struct ObjectLayoutState<'data, P: Platform> {
 
     /// Info about each of our sections. Indexed the same as the sections in the input object.
     pub(crate) sections: Vec<SectionSlot>,
+
+    /// See [`ObjectLayout::live_subsections`]. Entries are created only for sections whose input
+    /// format explicitly opts into atom-level dead stripping.
+    live_subsections: Vec<Option<Vec<Range<u64>>>>,
 
     /// Mapping from sections to their corresponding relocation section.
     pub(crate) relocations: P::RelocationSections,
@@ -4059,6 +4073,7 @@ fn new_object_layout_state<P: Platform>(
         input: input_state.common.input,
         object: input_state.common.object,
         sections: input_state.sections,
+        live_subsections: vec![None; input_state.common.object.num_sections()],
         relocations: input_state.relocations,
         format_specific: P::new_object_layout_state_ext(input_state.format_specific),
         section_relax_deltas: RelaxDeltaMap::new(),
@@ -4267,6 +4282,127 @@ impl<'data, P: Platform> ObjectLayoutState<'data, P> {
         }
 
         Ok(())
+    }
+
+    /// Mark one explicitly described input subsection live and account for its compacted output
+    /// span. Formats that do not opt into this keep using [`Self::handle_section_load_request`]
+    /// and never populate `live_subsections`.
+    ///
+    /// The ranges are kept in input order even when graph traversal discovers atoms in another
+    /// order. That order is the contract used later by symbol resolution, relocation writing, and
+    /// raw-data copying.
+    pub(crate) fn load_subsection<'scope, A: Arch<Platform = P>>(
+        &mut self,
+        common: &mut CommonGroupState<'data, P>,
+        section_index: SectionIndex,
+        range: Range<u64>,
+        resources: &'scope GraphResources<'data, 'scope, P>,
+        queue: &mut LocalWorkQueue<P>,
+        scope: &Scope<'scope>,
+    ) -> Result<bool> {
+        ensure!(
+            range.start <= range.end,
+            "input subsection range has an invalid end before its start"
+        );
+
+        let new_size = {
+            let ranges = self
+                .live_subsections
+                .get_mut(section_index.0)
+                .context("subsection refers to a section outside the object")?
+                .get_or_insert_with(Vec::new);
+
+            if ranges.iter().any(|existing| *existing == range) {
+                return Ok(false);
+            }
+
+            let insertion_index = ranges.partition_point(|existing| existing.start < range.start);
+            if insertion_index > 0 && ranges[insertion_index - 1].end > range.start {
+                bail!("overlapping live input subsections are not representable");
+            }
+            if ranges
+                .get(insertion_index)
+                .is_some_and(|next| range.end > next.start)
+            {
+                bail!("overlapping live input subsections are not representable");
+            }
+            ranges.insert(insertion_index, range.clone());
+
+            ranges.iter().try_fold(0u64, |size, span| {
+                size.checked_add(span.end - span.start)
+                    .context("live input subsections exceed u64")
+            })?
+        };
+
+        let part_id = self.section_part_id(section_index, &resources.symbol_db.section_part_ids);
+        let header = self.object.section(section_index)?;
+        let new_section = Section { size: new_size };
+        let (old_capacity, first_subsection, unloaded) = match self.sections[section_index.0] {
+            SectionSlot::Unloaded(unloaded) | SectionSlot::MustLoad(unloaded) => (0, true, unloaded),
+            SectionSlot::Loaded(section) => (
+                section.capacity(part_id, resources.output_sections),
+                false,
+                UnloadedSection {
+                    last_frame_index: None,
+                    start_stop_eligible: false,
+                    needs_sorting: false,
+                },
+            ),
+            _ => bail!(
+                "cannot dead-strip a subsection of `{}` because it is not a regular loadable section",
+                self.object.section_display_name(section_index),
+            ),
+        };
+        let new_capacity = new_section.capacity(part_id, resources.output_sections);
+        ensure!(
+            new_capacity >= old_capacity,
+            "loading a subsection reduced its output allocation"
+        );
+
+        self.sections[section_index.0] = SectionSlot::Loaded(new_section);
+        common.allocate(part_id, new_capacity - old_capacity);
+        common.store_section_attributes(part_id, header);
+
+        if let Some(config) = A::thunk_config()
+            && resources.thunk_layout_builder.is_some()
+            && part_id == config.primary_function_part_id
+        {
+            self.post_gc_primary_bytes += range.end - range.start;
+        }
+
+        if first_subsection && new_size > 0 {
+            P::non_empty_section_loaded::<A>(self, common, queue, unloaded, resources, scope)?;
+        } else if first_subsection
+            && P::is_zero_sized_section_content(part_id.output_section_id::<P>())
+        {
+            resources.keep_section(part_id.output_section_id::<P>());
+        }
+
+        Ok(true)
+    }
+
+    /// Returns the compacted output offset for an input-section offset. A missing entry preserves
+    /// the traditional whole-section mapping; a present entry rejects offsets in dead atoms.
+    pub(crate) fn output_offset_for_input(
+        &self,
+        section_index: SectionIndex,
+        input_offset: u64,
+    ) -> Option<u64> {
+        output_offset_for_input(
+            self.live_subsections.get(section_index.0).and_then(Option::as_deref),
+            input_offset,
+        )
+    }
+
+    pub(crate) fn input_offset_is_live(
+        &self,
+        section_index: SectionIndex,
+        input_offset: u64,
+    ) -> bool {
+        input_offset_is_live(
+            self.live_subsections.get(section_index.0).and_then(Option::as_deref),
+            input_offset,
+        )
     }
 
     fn load_section<'scope, A: Arch<Platform = P>>(
@@ -4510,6 +4646,7 @@ impl<'data, P: Platform> ObjectLayoutState<'data, P> {
             file_id: self.file_id,
             object: self.object,
             sections: self.sections,
+            live_subsections: self.live_subsections,
             relocations: self.relocations,
             section_resolutions,
             symbol_id_range,
@@ -4583,10 +4720,24 @@ impl<'data, P: Platform> ObjectLayoutState<'data, P> {
                 let input_offset = self
                     .object
                     .symbol_offset_in_section(local_symbol, section_index)?;
-                let output_offset = opt_input_to_output(
+                let conventional_output_offset = opt_input_to_output(
                     self.section_relax_deltas.get(section_index.0),
                     input_offset,
                 );
+                // Size-reduction relaxations are not currently combined with subsection
+                // compaction. Keep the conventional mapping for every platform, then layer the
+                // compacted Mach-O atom offset underneath it.
+                let output_offset = if self.live_subsections[section_index.0].is_some() {
+                    self.output_offset_for_input(section_index, input_offset)
+                        .with_context(|| {
+                            format!(
+                                "symbol is in a dead input subsection: {}",
+                                resources.symbol_debug(symbol_id)
+                            )
+                        })?
+                } else {
+                    conventional_output_offset
+                };
                 output_offset + section_address
             } else if let Some(x) = get_merged_string_output_address::<P>(
                 local_symbol_index,
@@ -5068,8 +5219,18 @@ fn compute_section_and_symbol_addresses<'data, P: Platform>(
                                     if sec_addr == 0 {
                                         continue;
                                     }
+                                    let Ok(input_offset) =
+                                        obj.object.symbol_offset_in_section(sym, section)
+                                    else {
+                                        continue;
+                                    };
+                                    let Some(output_offset) =
+                                        obj.output_offset_for_input(section, input_offset)
+                                    else {
+                                        continue;
+                                    };
                                     symbol_addresses[sym_id.as_usize()]
-                                        .store(sec_addr + sym.value(), Relaxed);
+                                        .store(sec_addr + output_offset, Relaxed);
                                 }
                                 Ok(None) if sym.is_absolute() => {
                                     symbol_addresses[sym_id.as_usize()].store(sym.value(), Relaxed);
@@ -5991,6 +6152,98 @@ impl<'data, P: Platform> ObjectLayout<'data, P> {
     ) -> PartId {
         part_ids[self.section_id_range.input_to_id(section_index).as_usize()]
     }
+
+    /// Maps an input offset to the compacted output offset for this section. `None` means the
+    /// offset belongs to a dead input atom and must not acquire a symbol address or relocation.
+    pub(crate) fn output_offset_for_input(
+        &self,
+        section_index: SectionIndex,
+        input_offset: u64,
+    ) -> Option<u64> {
+        output_offset_for_input(
+            self.live_subsections.get(section_index.0).and_then(Option::as_deref),
+            input_offset,
+        )
+    }
+
+    pub(crate) fn input_offset_is_live(
+        &self,
+        section_index: SectionIndex,
+        input_offset: u64,
+    ) -> bool {
+        input_offset_is_live(
+            self.live_subsections.get(section_index.0).and_then(Option::as_deref),
+            input_offset,
+        )
+    }
+
+    /// Returns whether every byte in an input range survives subsection compaction. Relocation
+    /// writers use this stricter check so a label at the end of a retained atom cannot be
+    /// mistaken for relocation storage.
+    pub(crate) fn input_range_is_live(
+        &self,
+        section_index: SectionIndex,
+        input_range: Range<u64>,
+    ) -> bool {
+        input_range_is_live(
+            self.live_subsections.get(section_index.0).and_then(Option::as_deref),
+            input_range,
+        )
+    }
+
+    pub(crate) fn live_input_ranges(
+        &self,
+        section_index: SectionIndex,
+    ) -> Option<&[Range<u64>]> {
+        self.live_subsections
+            .get(section_index.0)
+            .and_then(Option::as_deref)
+    }
+}
+
+fn output_offset_for_input(ranges: Option<&[Range<u64>]>, input_offset: u64) -> Option<u64> {
+    let Some(ranges) = ranges else {
+        return Some(input_offset);
+    };
+
+    let mut output_offset = 0;
+    for (index, range) in ranges.iter().enumerate() {
+        if range.start == range.end && input_offset == range.start {
+            return Some(output_offset);
+        }
+        if input_offset >= range.start && input_offset < range.end {
+            return Some(output_offset + input_offset - range.start);
+        }
+        output_offset += range.end - range.start;
+
+        // A label at the end of the final retained atom is a valid zero-size alias for the end
+        // of the compacted section. Do not let the same rule bridge a dead gap between atoms.
+        if index + 1 == ranges.len() && input_offset == range.end {
+            return Some(output_offset);
+        }
+    }
+    None
+}
+
+fn input_offset_is_live(ranges: Option<&[Range<u64>]>, input_offset: u64) -> bool {
+    let Some(ranges) = ranges else {
+        return true;
+    };
+    ranges.iter().any(|range| {
+        (range.start == range.end && input_offset == range.start)
+            || (input_offset >= range.start && input_offset < range.end)
+    })
+}
+
+fn input_range_is_live(ranges: Option<&[Range<u64>]>, input_range: Range<u64>) -> bool {
+    let Some(ranges) = ranges else {
+        return true;
+    };
+    ranges.iter().any(|range| {
+        input_range.start >= range.start
+            && input_range.end >= input_range.start
+            && input_range.end <= range.end
+    })
 }
 
 /// Performs layout of sections and segments then makes sure that the loadable segments don't

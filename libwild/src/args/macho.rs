@@ -189,7 +189,11 @@ impl platform::Args for MachOArgs {
     }
 
     fn should_export_all_dynamic_symbols(&self) -> bool {
-        self.export_list_path.is_none()
+        // With normal executable linking, preserve Wild's existing public-symbol export policy.
+        // Under `-dead_strip`, those definitions cannot all be roots: ld64 exports the surviving
+        // public atoms, not every definition that appeared in the input object. Shared objects
+        // and explicit exported-symbol lists use `export_symbols_mode` independently.
+        !self.gc_sections && self.export_list_path.is_none()
     }
 
     fn should_export_dynamic(&self, _lib_name: &[u8]) -> bool {
@@ -379,6 +383,28 @@ fn setup_argument_parser() -> ArgumentParser<MachOArgs> {
         .help("Remove unreferenced sections")
         .execute(|args, _modifier_stack| {
             args.gc_sections = true;
+            Ok(())
+        });
+
+    // Darwin's `-force_load path/to/libfoo.a` has the same extraction semantics as GNU
+    // `--whole-archive`, but it applies to one archive rather than changing a persistent parser
+    // mode. Keep it as an input-local modifier so archive loading continues to use the generic
+    // resolver and cannot accidentally affect a later archive.
+    parser
+        .declare_with_param()
+        .long("force_load")
+        .help("Load every member of an archive")
+        .execute(|args, modifier_stack, value| {
+            ensure!(!value.is_empty(), "-force_load requires an archive path");
+            args.common_mut().save_dir.handle_file(value);
+
+            let mut modifiers = *modifier_stack.last().unwrap();
+            modifiers.whole_archive = true;
+            args.common_mut().inputs.push(Input {
+                spec: InputSpec::File(Box::from(Path::new(value))),
+                search_first: None,
+                modifiers,
+            });
             Ok(())
         });
 
@@ -653,6 +679,32 @@ mod tests {
                 spec: InputSpec::Framework(name),
                 ..
             }] if name.as_ref() == "Security"
+        ));
+    }
+
+    #[test]
+    fn force_load_marks_only_its_archive_as_whole_archive() {
+        let mut args = MachOArgs::new().unwrap();
+        args.parse(["-force_load", "libforce.a", "libordinary.a"].iter())
+            .unwrap();
+
+        assert!(matches!(
+            args.common.inputs.as_slice(),
+            [
+                Input {
+                    spec: InputSpec::File(path),
+                    modifiers,
+                    ..
+                },
+                Input {
+                    spec: InputSpec::File(ordinary_path),
+                    modifiers: ordinary_modifiers,
+                    ..
+                },
+            ] if path.as_ref() == Path::new("libforce.a")
+                && modifiers.whole_archive
+                && ordinary_path.as_ref() == Path::new("libordinary.a")
+                && !ordinary_modifiers.whole_archive
         ));
     }
 

@@ -53,8 +53,22 @@ const STUB_TEMPLATE: &[u8] = &[
     0x00, 0x02, 0x1f, 0xd6, // BR   x16
 ];
 
+// ADRP+ADD+BR range-extension island. Unlike a symbol stub, this reaches the final target
+// directly and is placed in the primary `__TEXT,__text` allocation immediately after the object
+// which owns the island. Keeping the veneer out of `__stubs` is essential: the stubs section is
+// shared with dyld and can be outside the +/-128 MiB branch range.
+const THUNK_TEMPLATE: &[u8] = &[
+    0x10, 0x00, 0x00, 0x90, // ADRP x16, 0
+    0x10, 0x02, 0x00, 0x91, // ADD  x16, x16, #0
+    0x00, 0x02, 0x1f, 0xd6, // BR   x16
+];
+
+/// ARM64's `B` and `BL` relocations carry a signed, word-scaled 26-bit immediate.
+const MIN_BRANCH_RANGE: u64 = 128 * 1024 * 1024;
+
 const _ASSERTS: () = {
     assert!(STUB_TEMPLATE.len() as u64 == crate::macho::PLT_ENTRY_SIZE);
+    assert!(THUNK_TEMPLATE.len() % 4 == 0);
 };
 
 #[derive(Debug, Clone)]
@@ -269,7 +283,7 @@ impl crate::platform::Arch for MachOAArch64 {
             mask,
             range,
             size,
-            thunkable: false,
+            thunkable: rel.r_type == object::macho::ARM64_RELOC_BRANCH26,
         })
     }
 
@@ -296,6 +310,37 @@ impl crate::platform::Arch for MachOAArch64 {
 
     fn high_part_relocations() -> &'static [object::macho::RelocationInfo] {
         todo!()
+    }
+
+    fn thunk_config() -> Option<crate::platform::ThunkConfig> {
+        Some(crate::platform::ThunkConfig {
+            primary_function_part_id: const {
+                crate::macho::output_section_id::TEXT
+                    .part_id_with_alignment::<crate::macho::MachO>(
+                        crate::alignment::Alignment { exponent: 2 },
+                    )
+            },
+            min_branch_range: MIN_BRANCH_RANGE,
+            thunk_size: THUNK_TEMPLATE.len() as u64,
+        })
+    }
+
+    fn write_thunk(thunk_address: u64, target_address: u64, buf: &mut [u8]) {
+        debug_assert_eq!(buf.len(), THUNK_TEMPLATE.len());
+        buf.copy_from_slice(THUNK_TEMPLATE);
+
+        // The target can be anywhere in the Mach-O image, but an ADRP page delta itself is still
+        // signed 21 bits. Failures would otherwise silently truncate the page displacement.
+        let thunk_page = thunk_address & !PAGE_MASK_4KB;
+        let target_page = target_address & !PAGE_MASK_4KB;
+        let page_diff = (target_page as i64).wrapping_sub(thunk_page as i64);
+        let page_count = (page_diff / SIZE_4KB as i64) as u64 & 0x1f_ffff;
+        AArch64Instruction::Adr.write_to_value(page_count, false, &mut buf[0..4]);
+        AArch64Instruction::Add.write_to_value(
+            target_address & PAGE_MASK_4KB,
+            false,
+            &mut buf[4..8],
+        );
     }
 
     fn get_source_info<'data>(
@@ -378,6 +423,19 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("ARM64_RELOC_BRANCH26"));
+    }
+
+    #[test]
+    fn branch26_is_marked_thunkable() {
+        let relocation = MachOAArch64::relocation_from_raw(relocation(
+            object::macho::ARM64_RELOC_BRANCH26,
+            true,
+            2,
+        ))
+        .unwrap();
+
+        assert!(relocation.thunkable);
+        assert_eq!(MachOAArch64::thunk_config().unwrap().thunk_size, 12);
     }
 
     #[test]

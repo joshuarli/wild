@@ -17,7 +17,6 @@ use crate::layout::HandlerData as _;
 use crate::layout::Layout;
 use crate::layout::OutputRecordLayout;
 use crate::layout::Resolution;
-use crate::layout::SectionGcUnit;
 use crate::layout::StubLibraryLayoutState;
 use crate::layout::SymbolCopyInfo;
 use crate::layout::SymbolResolutions;
@@ -42,6 +41,8 @@ use crate::part_id::PartId;
 use crate::platform;
 use crate::platform::Args;
 use crate::platform::ObjectFile;
+use crate::platform::SectionHeader as _;
+use crate::platform::Symbol as _;
 use crate::program_segments::ProgramSegmentId;
 use crate::program_segments::ProgramSegments;
 use crate::resolution;
@@ -82,6 +83,7 @@ use object::read::macho::Segment;
 use std::borrow::Cow;
 use std::num::NonZeroU8;
 use std::num::NonZeroU64;
+use std::ops::Range;
 use std::slice::Iter;
 use std::sync::atomic::Ordering;
 
@@ -113,6 +115,10 @@ enum SinglePartSectionId {
     CodeSignature,
     ChainedFixupTable,
     ExportsTrie,
+    /// The final, page-indexed compact unwind table. Input `__compact_unwind` records are linker
+    /// metadata and are translated into this `__TEXT,__unwind_info` section after GC has assigned
+    /// every surviving function its final address.
+    UnwindInfo,
 
     // Must be last.
     Count,
@@ -130,9 +136,11 @@ pub(crate) mod part_id {
     pub(crate) const CODE_SIGNATURE: PartId = SinglePartSectionId::CodeSignature.part_id();
     pub(crate) const CHAINED_FIXUP_TABLE: PartId = SinglePartSectionId::ChainedFixupTable.part_id();
     pub(crate) const EXPORTS_TRIE: PartId = SinglePartSectionId::ExportsTrie.part_id();
+    pub(crate) const UNWIND_INFO: PartId = SinglePartSectionId::UnwindInfo.part_id();
 }
 
 pub(crate) mod output_section_id {
+    use super::MachO;
     use super::SinglePartSectionId;
     use crate::output_section_id::OutputSectionId;
 
@@ -151,6 +159,15 @@ pub(crate) mod output_section_id {
         SinglePartSectionId::ChainedFixupTable.output_section_id();
     pub(crate) const EXPORTS_TRIE: OutputSectionId =
         SinglePartSectionId::ExportsTrie.output_section_id();
+    pub(crate) const UNWIND_INFO: OutputSectionId =
+        SinglePartSectionId::UnwindInfo.output_section_id();
+
+    /// The primary ARM64 code section. Keeping it as a regular section gives range-extension
+    /// thunks an addressable 4-byte-aligned part that can be placed immediately after the object
+    /// which owns each island. `__stubs` is deliberately not used: it is reserved for dyld
+    /// symbol stubs and can be more than a branch range away from ordinary input code.
+    pub(crate) const TEXT: OutputSectionId =
+        crate::output_section_id::regular_section_base::<MachO>();
 }
 
 const LE: Endianness = Endianness::Little;
@@ -184,6 +201,30 @@ pub(crate) const CHAINED_FIXUP_IMPORT_SIZE: u64 = size_of::<u32>() as u64;
 pub(crate) const CHAINED_FIXUP_PAGE_START_SIZE: u64 = size_of::<u16>() as u64;
 pub(crate) const GOT_ENTRY_SIZE: u64 = 8;
 pub(crate) const PLT_ENTRY_SIZE: u64 = 12;
+
+/// `compact_unwind_entry` records in `__LD,__compact_unwind` are fixed-width. They are only an
+/// object-file representation: final Mach-O images contain the indexed `__unwind_info` encoding
+/// synthesized by `macho_writer`.
+pub(crate) const COMPACT_UNWIND_ENTRY_SIZE: usize = 32;
+
+/// The regular second-level unwind page is the conservative encoding: unlike compressed pages it
+/// has no 24-bit function-offset or 8-bit encoding-index limitation. A page stays within the
+/// format's 4 KiB page bound at this entry count.
+pub(crate) const COMPACT_UNWIND_REGULAR_PAGE_MAX_ENTRIES: usize = (4096 - 8) / 8;
+
+/// An upper bound for the final `__unwind_info` serialization of `entry_count` input compact
+/// unwind records. The writer filters dead-stripped functions after addresses are known, so this
+/// allocation deliberately uses the input count and leaves any tail zero-filled.
+pub(crate) fn compact_unwind_info_capacity(entry_count: usize) -> usize {
+    if entry_count == 0 {
+        return 0;
+    }
+
+    let page_count = entry_count.div_ceil(COMPACT_UNWIND_REGULAR_PAGE_MAX_ENTRIES);
+    // Header, up to three personalities, one top-level index per page plus its sentinel, one
+    // worst-case LSDA descriptor per entry, and the regular second-level page contents.
+    28 + 3 * 4 + (page_count + 1) * 12 + entry_count * 8 + page_count * 8 + entry_count * 8
+}
 
 type SectionHeader = Section64<crate::macho::Endianness>;
 type SectionTable<'data> = &'data [Section64<crate::macho::Endianness>];
@@ -264,6 +305,305 @@ impl<'data> Iterator for PairedRelocations<'data> {
     }
 }
 
+/// The subset of an ARM64 DWARF `.eh_frame` FDE needed to complete an otherwise sparse
+/// `__compact_unwind` record. Rust emits the personality and LSDA only here: its accompanying
+/// `__LD,__compact_unwind` entry contains the function and encoding, but leaves both optional
+/// target words zero. Offsets name relocation storage in the input `__eh_frame` section.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub(crate) struct EhFrameAugmentation {
+    pub(crate) function_relocation_offset: usize,
+    pub(crate) personality_relocation_offset: usize,
+    pub(crate) lsda_relocation_offset: usize,
+}
+
+#[derive(Debug, Copy, Clone)]
+struct EhFrameCie {
+    personality_relocation_offset: usize,
+}
+
+/// Read the standard DWARF32 ARM64 `zPLR` augmentation used by current Rust object files.
+///
+/// An `.eh_frame` section can contain many unrelated CIEs. CIEs without a personality/LSDA are
+/// intentionally ignored. A CIE that explicitly advertises all of `zPLR`, but uses a different
+/// pointer representation, fails clearly rather than silently producing a catchable panic with
+/// the wrong unwind target. The supported encoding is `P=0x9b` (pcrel indirect sdata4), and
+/// `L=R=0x10` (pcrel 64-bit), which is the arm64 Mach-O encoding produced by rustc/LLVM.
+pub(crate) fn eh_frame_augmentations(data: &[u8]) -> Result<Vec<EhFrameAugmentation>> {
+    let mut cies = std::collections::BTreeMap::<usize, EhFrameCie>::new();
+    let mut augmentations = Vec::new();
+    let mut record_start = 0usize;
+
+    while record_start < data.len() {
+        let length = eh_frame_u32(data, record_start)?;
+        if length == 0 {
+            // `.eh_frame` permits a terminating zero-length record. Its trailing bytes are
+            // alignment padding and do not describe more FDEs.
+            break;
+        }
+        ensure!(
+            length != u32::MAX,
+            "unsupported 64-bit DWARF __eh_frame record length"
+        );
+        let record_end = record_start
+            .checked_add(4)
+            .and_then(|offset| offset.checked_add(length as usize))
+            .context("truncated Mach-O __eh_frame record")?;
+        ensure!(
+            record_end <= data.len() && length >= 4,
+            "truncated Mach-O __eh_frame record"
+        );
+        let cie_pointer = eh_frame_u32(data, record_start + 4)?;
+        if cie_pointer == 0 {
+            if let Some(cie) = parse_eh_frame_cie(data, record_start, record_end)? {
+                cies.insert(record_start, cie);
+            }
+        } else {
+            let cie_start = record_start
+                .checked_add(4)
+                .and_then(|offset| offset.checked_sub(cie_pointer as usize))
+                .context("Mach-O __eh_frame FDE CIE pointer precedes the section")?;
+            if let Some(cie) = cies.get(&cie_start).copied() {
+                augmentations.push(parse_eh_frame_fde(
+                    data,
+                    record_start,
+                    record_end,
+                    cie,
+                )?);
+            }
+        }
+        record_start = record_end;
+    }
+
+    Ok(augmentations)
+}
+
+fn parse_eh_frame_cie(
+    data: &[u8],
+    record_start: usize,
+    record_end: usize,
+) -> Result<Option<EhFrameCie>> {
+    let mut offset = record_start + 8;
+    let version = *data
+        .get(offset)
+        .context("truncated Mach-O __eh_frame CIE version")?;
+    offset += 1;
+    let augmentation_start = offset;
+    while *data
+        .get(offset)
+        .context("unterminated Mach-O __eh_frame CIE augmentation string")?
+        != 0
+    {
+        offset += 1;
+        ensure!(
+            offset < record_end,
+            "unterminated Mach-O __eh_frame CIE augmentation string"
+        );
+    }
+    let augmentation = &data[augmentation_start..offset];
+    offset += 1;
+    if !augmentation.starts_with(b"z") {
+        return Ok(None);
+    }
+
+    eh_frame_uleb(data, record_end, &mut offset)?; // code alignment factor
+    eh_frame_sleb(data, record_end, &mut offset)?; // data alignment factor
+    if version == 1 {
+        offset = offset
+            .checked_add(1)
+            .context("Mach-O __eh_frame CIE return register overflows")?;
+        ensure!(
+            offset <= record_end,
+            "truncated Mach-O __eh_frame CIE return register"
+        );
+    } else {
+        eh_frame_uleb(data, record_end, &mut offset)?; // return-address register
+    }
+
+    let augmentation_size = usize::try_from(eh_frame_uleb(data, record_end, &mut offset)?)
+        .context("Mach-O __eh_frame CIE augmentation size overflows usize")?;
+    let augmentation_end = offset
+        .checked_add(augmentation_size)
+        .context("Mach-O __eh_frame CIE augmentation size overflows")?;
+    ensure!(
+        augmentation_end <= record_end,
+        "truncated Mach-O __eh_frame CIE augmentation data"
+    );
+
+    let mut personality_relocation_offset = None;
+    let mut lsda_encoding = None;
+    let mut fde_encoding = None;
+    for &directive in &augmentation[1..] {
+        match directive {
+            b'P' => {
+                let encoding = *data
+                    .get(offset)
+                    .context("truncated Mach-O __eh_frame personality encoding")?;
+                offset += 1;
+                let pointer_offset = offset;
+                offset = eh_frame_skip_encoded_value(data, augmentation_end, offset, encoding)?;
+                personality_relocation_offset = Some((pointer_offset, encoding));
+            }
+            b'L' => {
+                lsda_encoding = Some(
+                    *data
+                        .get(offset)
+                        .context("truncated Mach-O __eh_frame LSDA encoding")?,
+                );
+                offset += 1;
+            }
+            b'R' => {
+                fde_encoding = Some(
+                    *data
+                        .get(offset)
+                        .context("truncated Mach-O __eh_frame FDE encoding")?,
+                );
+                offset += 1;
+            }
+            b'S' => {}
+            _ => {
+                // The augmentation payload is not self-describing for unknown directives, so
+                // avoid guessing where the following relocation fields reside. This CIE cannot
+                // safely supplement compact unwind metadata.
+                return Ok(None);
+            }
+        }
+    }
+    ensure!(
+        offset == augmentation_end,
+        "unsupported Mach-O __eh_frame CIE augmentation layout"
+    );
+
+    let (personality_relocation_offset, personality_encoding) = match personality_relocation_offset
+    {
+        Some(value) => value,
+        None => return Ok(None),
+    };
+    let Some(lsda_encoding) = lsda_encoding else {
+        return Ok(None);
+    };
+    let Some(fde_encoding) = fde_encoding else {
+        return Ok(None);
+    };
+    ensure!(
+        personality_encoding == 0x9b && lsda_encoding == 0x10 && fde_encoding == 0x10,
+        "unsupported Mach-O __eh_frame zPLR encoding: expected P=0x9b, L=R=0x10"
+    );
+    Ok(Some(EhFrameCie {
+        personality_relocation_offset,
+    }))
+}
+
+fn parse_eh_frame_fde(
+    data: &[u8],
+    record_start: usize,
+    record_end: usize,
+    cie: EhFrameCie,
+) -> Result<EhFrameAugmentation> {
+    // `R=0x10` means the initial location and range are each an eight-byte field. `L=0x10`
+    // similarly makes the FDE augmentation's first payload an eight-byte LSDA address.
+    let function_relocation_offset = record_start + 8;
+    let augmentation_length_offset = function_relocation_offset
+        .checked_add(16)
+        .context("Mach-O __eh_frame FDE fields overflow")?;
+    ensure!(
+        augmentation_length_offset < record_end,
+        "truncated Mach-O __eh_frame zPLR FDE"
+    );
+    let mut offset = augmentation_length_offset;
+    let augmentation_size = usize::try_from(eh_frame_uleb(data, record_end, &mut offset)?)
+        .context("Mach-O __eh_frame FDE augmentation size overflows usize")?;
+    ensure!(
+        augmentation_size >= size_of::<u64>(),
+        "truncated Mach-O __eh_frame zPLR FDE LSDA"
+    );
+    let lsda_relocation_offset = offset;
+    let augmentation_end = offset
+        .checked_add(augmentation_size)
+        .context("Mach-O __eh_frame FDE augmentation size overflows")?;
+    ensure!(
+        augmentation_end <= record_end,
+        "truncated Mach-O __eh_frame FDE augmentation data"
+    );
+    Ok(EhFrameAugmentation {
+        function_relocation_offset,
+        personality_relocation_offset: cie.personality_relocation_offset,
+        lsda_relocation_offset,
+    })
+}
+
+fn eh_frame_u32(data: &[u8], offset: usize) -> Result<u32> {
+    let bytes = data
+        .get(offset..offset + size_of::<u32>())
+        .context("truncated Mach-O __eh_frame u32")?;
+    Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+fn eh_frame_uleb(data: &[u8], end: usize, offset: &mut usize) -> Result<u64> {
+    let mut value = 0u64;
+    let mut shift = 0u32;
+    loop {
+        ensure!(*offset < end, "truncated Mach-O __eh_frame ULEB128");
+        let byte = data[*offset];
+        *offset += 1;
+        ensure!(shift < 64 || byte & 0x7f == 0, "Mach-O __eh_frame ULEB128 overflows");
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+        shift += 7;
+    }
+}
+
+fn eh_frame_sleb(data: &[u8], end: usize, offset: &mut usize) -> Result<i64> {
+    let mut value = 0i64;
+    let mut shift = 0u32;
+    let byte = loop {
+        ensure!(*offset < end, "truncated Mach-O __eh_frame SLEB128");
+        let byte = data[*offset];
+        *offset += 1;
+        ensure!(shift < 64 || byte & 0x7f == 0, "Mach-O __eh_frame SLEB128 overflows");
+        value |= i64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            break byte;
+        }
+        shift += 7;
+    };
+    if shift < 63 && byte & 0x40 != 0 {
+        value |= -1i64 << (shift + 7);
+    }
+    Ok(value)
+}
+
+fn eh_frame_skip_encoded_value(
+    data: &[u8],
+    end: usize,
+    offset: usize,
+    encoding: u8,
+) -> Result<usize> {
+    let size = match encoding & 0x0f {
+        0x00 => size_of::<u64>(), // DW_EH_PE_absptr
+        0x02 | 0x0a => 2,         // udata2 / sdata2
+        0x03 | 0x0b => 4,         // udata4 / sdata4
+        0x04 | 0x0c => 8,         // udata8 / sdata8
+        0x01 => {
+            let mut cursor = offset;
+            eh_frame_uleb(data, end, &mut cursor)?;
+            return Ok(cursor);
+        }
+        0x09 => {
+            let mut cursor = offset;
+            eh_frame_sleb(data, end, &mut cursor)?;
+            return Ok(cursor);
+        }
+        _ => bail!("unsupported Mach-O __eh_frame pointer encoding 0x{encoding:02x}"),
+    };
+    let end_offset = offset
+        .checked_add(size)
+        .context("Mach-O __eh_frame encoded value overflows")?;
+    ensure!(end_offset <= end, "truncated Mach-O __eh_frame encoded value");
+    Ok(end_offset)
+}
+
 pub(crate) type FileHeader = object::macho::MachHeader64<Endianness>;
 pub(crate) type SegmentCommand = object::macho::SegmentCommand64<Endianness>;
 pub(crate) type SectionEntry = object::macho::Section64<Endianness>;
@@ -323,6 +663,9 @@ impl SegmentName {
     pub(crate) const DATA: Self = Self::from_bytes(b"__DATA");
     pub(crate) const DATA_CONST: Self = Self::from_bytes(b"__DATA_CONST");
     pub(crate) const LINKEDIT: Self = Self::from_bytes(b"__LINKEDIT");
+    /// `__LD` contains object-file linker metadata such as `__compact_unwind`. It is not a final
+    /// image segment, but compact unwind must be inspected before normal debug-section exclusion.
+    pub(crate) const LD: Self = Self::from_bytes(b"__LD");
     pub(crate) const LLVM: Self = Self::from_bytes(b"__LLVM");
     pub(crate) const DWARF: Self = Self::from_bytes(b"__DWARF");
 
@@ -362,6 +705,9 @@ pub(crate) struct LayoutExt {
 pub(crate) struct FinaliseSizesExt {
     imported_libraries: Vec<FileId>,
     imported_symbols: Vec<SymbolId>,
+    /// Reserved upper bound for the post-layout `__unwind_info` serialization. The epilogue owns
+    /// this synthetic data, so it also advances this part during final address assignment.
+    unwind_info_size: u64,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -387,6 +733,18 @@ pub(crate) struct File<'data> {
     #[allow(unused)]
     pub(crate) flags: object::macho::FileFlags,
     kind: ObjectKind<'data>,
+}
+
+/// Mach-O permits atom-level dead stripping only when the input file opts into
+/// `MH_SUBSECTIONS_VIA_SYMBOLS`. Keep the atom's input start in the GC work item: all aliases at
+/// the same address intentionally share one unit, while normal inputs retain section granularity.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum MachOGcUnit {
+    Section(object::SectionIndex),
+    Atom {
+        section_index: object::SectionIndex,
+        start: u64,
+    },
 }
 
 #[derive(Debug)]
@@ -682,7 +1040,7 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
 /// loadable output segment. Mach-O does not have an `SHF_ALLOC` equivalent; this is
 /// defined by the section's attributes and conventional segment role instead.
 fn is_non_alloc_section(flags: SectionFlags, segment_name: &[u8]) -> bool {
-    flags.intersects(S_ATTR_DEBUG)
+    (flags.intersects(S_ATTR_DEBUG) && SegmentName::from_bytes(segment_name) != SegmentName::LD)
         || matches!(
             SegmentName::from_bytes(segment_name),
             SegmentName::PAGEZERO
@@ -742,7 +1100,8 @@ impl platform::SectionHeader for SectionHeader {
     fn should_exclude(&self) -> bool {
         // TODO: We need support for sections backed by the Mach-O indirect symbol table for dynamic
         // linking.
-        self.flags.get(LE).intersects(S_ATTR_DEBUG)
+        (self.flags.get(LE).intersects(S_ATTR_DEBUG)
+            && SegmentName::from_bytes(self.segment_name()) != SegmentName::LD)
             || matches!(
                 SegmentName::from_bytes(self.segment_name()),
                 SegmentName::PAGEZERO
@@ -1143,7 +1502,7 @@ impl<'data> platform::VerneedTable<'data> for VerneedTable<'data> {
 
 impl platform::Platform for MachO {
     const NUM_SINGLE_PART_SECTIONS: u32 = SinglePartSectionId::Count as u32;
-    const NUM_BUILT_IN_REGULAR_SECTIONS: usize = 0;
+    const NUM_BUILT_IN_REGULAR_SECTIONS: usize = 1;
 
     // The macOS kernel caches code signature state by vnode. Reusing a previously executed output's
     // inode after changing its contents can therefore cause the new executable to SIGKILL, even
@@ -1215,7 +1574,7 @@ impl platform::Platform for MachO {
     type VersionNames<'data> = ();
     type VerneedTable<'data> = VerneedTable<'data>;
     type ResolvedObjectExt<'data> = ();
-    type GcUnit = crate::layout::SectionGcUnit;
+    type GcUnit = MachOGcUnit;
 
     /// Mach-O sections are associated with a SegmentName, while synthetic regions (FILE_HEADER,
     /// LOAD_COMMANDS, etc.) are not.
@@ -1261,7 +1620,11 @@ impl platform::Platform for MachO {
     fn frame_data_base_address(
         _memory_offsets: &crate::output_section_part_map::OutputSectionPartMap<u64>,
     ) -> u64 {
-        todo!()
+        // `SectionSlot::FrameData` marks input `__compact_unwind` metadata, which has no direct
+        // output address. Its records are translated by the writer after normal section and
+        // symbol layout; returning zero here prevents metadata-only slots from acquiring a
+        // misleading output-section address during generic finalisation.
+        0
     }
 
     fn activate_dynamic<'data>(
@@ -1294,6 +1657,12 @@ impl platform::Platform for MachO {
         _object: &crate::layout::ObjectLayoutState<'data, Self>,
         _memory_offsets: &mut crate::output_section_part_map::OutputSectionPartMap<u64>,
     ) {
+    }
+
+    fn file_thunk_config<'data>(_file: &Self::File<'data>) -> Option<platform::ThunkConfig> {
+        // Mach-O linking currently dispatches only to `MachOAArch64`; keep this format-level hook
+        // explicit so generic layout places each island in the primary `__TEXT,__text` part.
+        <crate::macho_aarch64::MachOAArch64 as platform::Arch>::thunk_config()
     }
 
     fn finalise_layout_dynamic<'data>(
@@ -1354,9 +1723,15 @@ impl platform::Platform for MachO {
         symbol: &Self::SymtabEntry,
         symbol_index: object::SymbolIndex,
     ) -> Result<Option<Self::GcUnit>> {
+        if let Some((section_index, range)) = object.atom_for_symbol(symbol, symbol_index)? {
+            return Ok(Some(MachOGcUnit::Atom {
+                section_index,
+                start: range.start,
+            }));
+        }
         Ok(object
             .symbol_section(symbol, symbol_index)?
-            .map(SectionGcUnit::new))
+            .map(MachOGcUnit::Section))
     }
 
     fn activate_object_gc<'data, 'scope, A: platform::Arch<Platform = Self>>(
@@ -1366,7 +1741,68 @@ impl platform::Platform for MachO {
         queue: &mut crate::layout::LocalWorkQueue<Self>,
         scope: &rayon::Scope<'scope>,
     ) -> Result {
-        object.activate_section_gc::<A>(common, resources, queue, scope)
+        // `MH_SUBSECTIONS_VIA_SYMBOLS` changes only symbol-triggered liveness. Explicitly
+        // retained sections and the no-GC path still keep the complete section, exactly as ld64
+        // does for `S_ATTR_NO_DEAD_STRIP` and `-no_dead_strip_inits_and_terms` style roots.
+        let no_gc = !resources.symbol_db.args.should_gc_sections();
+        for (index, slot) in object.sections.iter().enumerate() {
+            let should_load = matches!(
+                slot,
+                crate::resolution::SectionSlot::MustLoad(_)
+                    | crate::resolution::SectionSlot::UnloadedDebugInfo
+                    | crate::resolution::SectionSlot::MergeStrings(_)
+            ) || (no_gc && matches!(slot, crate::resolution::SectionSlot::Unloaded(_)));
+            if should_load {
+                queue.send_gc_unit_request::<A>(
+                    object.file_id,
+                    MachOGcUnit::Section(object::SectionIndex(index)),
+                    resources,
+                    scope,
+                );
+            }
+        }
+
+        // `__compact_unwind` is not an ordinary input section to copy. Process it while the
+        // object is active so its personality and LSDA dependencies participate in the same GC
+        // graph as the functions they describe. The final table itself is synthesized later,
+        // after all surviving functions have addresses.
+        let compact_unwind_sections = object
+            .sections
+            .iter()
+            .filter_map(|slot| match slot {
+                resolution::SectionSlot::FrameData(index) => Some(*index),
+                _ => None,
+            })
+            .collect_vec();
+        for section_index in compact_unwind_sections {
+            Self::load_exception_frame_data::<A>(
+                object,
+                common,
+                section_index,
+                resources,
+                queue,
+                scope,
+            )?;
+        }
+
+        // Rust's arm64 compact-unwind records do not repeat the personality or LSDA. Those
+        // dependencies appear in DWARF `zPLR` CIE/FDE augmentation data instead. Keep them in
+        // the normal graph even though `__eh_frame` itself remains object-file-only metadata.
+        let eh_frame_sections = object
+            .object
+            .enumerate_sections()
+            .filter_map(|(index, section)| (section.name() == b"__eh_frame").then_some(index))
+            .collect_vec();
+        for section_index in eh_frame_sections {
+            load_macho_eh_frame_data::<A>(
+                object,
+                section_index,
+                resources,
+                queue,
+                scope,
+            )?;
+        }
+        Ok(())
     }
 
     fn load_gc_unit<'data, 'scope, A: platform::Arch<Platform = Self>>(
@@ -1377,13 +1813,80 @@ impl platform::Platform for MachO {
         unit: Self::GcUnit,
         scope: &rayon::Scope<'scope>,
     ) -> Result {
-        object.handle_section_load_request::<A>(
-            common,
-            resources,
-            queue,
-            unit.section_index(),
-            scope,
-        )
+        match unit {
+            MachOGcUnit::Section(section_index) => {
+                object.handle_section_load_request::<A>(
+                    common,
+                    resources,
+                    queue,
+                    section_index,
+                    scope,
+                )?;
+                export_live_symbols_in_section(
+                    object,
+                    common,
+                    resources,
+                    section_index,
+                    None,
+                )
+            }
+            MachOGcUnit::Atom {
+                section_index,
+                start,
+            } => {
+                // `gc_sections == false` queues complete sections during activation. An early
+                // symbol request can race ahead of that queue, so it must also select the
+                // conventional whole-section path instead of compacting then later shrinking a
+                // preallocated section.
+                if !resources.symbol_db.args.should_gc_sections() {
+                    return object.handle_section_load_request::<A>(
+                        common,
+                        resources,
+                        queue,
+                        section_index,
+                        scope,
+                    );
+                }
+                let range = object.object.atom_range(section_index, start)?;
+                if !object.load_subsection::<A>(
+                    common,
+                    section_index,
+                    range.clone(),
+                    resources,
+                    queue,
+                    scope,
+                )? {
+                    return Ok(());
+                }
+                export_live_symbols_in_section(
+                    object,
+                    common,
+                    resources,
+                    section_index,
+                    Some(&range),
+                )?;
+
+                // A relocation belongs to the atom containing its source address. Do not let a
+                // dead neighbour retain targets merely because Mach-O stores relocations beside
+                // the complete input section.
+                for relocation in paired_relocations(object.relocations(section_index)?.relocations)
+                {
+                    let relocation = relocation?;
+                    if !range.contains(&u64::from(relocation.info.r_address)) {
+                        continue;
+                    }
+                    process_relocation::<A>(
+                        object,
+                        relocation.info,
+                        section_index,
+                        resources,
+                        queue,
+                        scope,
+                    )?;
+                }
+                Ok(())
+            }
+        }
     }
 
     fn load_object_section_relocations<'data, 'scope, A: platform::Arch<Platform = Self>>(
@@ -1493,6 +1996,7 @@ impl platform::Platform for MachO {
     {
         let mut imported_libraries = Vec::new();
         let mut imported_symbols = Vec::new();
+        let mut compact_unwind_entry_count = 0usize;
 
         // Mach-O bind ordinals name load commands, whose identity is their install name rather
         // than the input pathname. For example, the macOS SDK's `libSystem`, `libc`, and `libm`
@@ -1507,9 +2011,28 @@ impl platform::Platform for MachO {
             }
         };
 
-        for group in groups {
+        for group in groups.iter() {
             for file in &group.files {
                 match file {
+                    layout::FileLayoutState::Object(object) => {
+                        for slot in &object.sections {
+                            let resolution::SectionSlot::FrameData(section_index) = slot else {
+                                continue;
+                            };
+                            let section = object.object.section(*section_index)?;
+                            let data = object.object.raw_section_data(section)?;
+                            ensure!(
+                                data.len() % COMPACT_UNWIND_ENTRY_SIZE == 0,
+                                "{} has malformed __compact_unwind data: {} bytes is not a multiple of {}",
+                                object.input,
+                                data.len(),
+                                COMPACT_UNWIND_ENTRY_SIZE
+                            );
+                            compact_unwind_entry_count = compact_unwind_entry_count
+                                .checked_add(data.len() / COMPACT_UNWIND_ENTRY_SIZE)
+                                .context("too many Mach-O compact unwind entries")?;
+                        }
+                    }
                     layout::FileLayoutState::StubLibrary(state) => {
                         if state.format_specific.loaded {
                             add_imported_library(state.file_id());
@@ -1529,9 +2052,22 @@ impl platform::Platform for MachO {
             }
         }
 
+        // The final index is written after function addresses are known. Allocate an upper bound
+        // now from the epilogue group; dead stripping can only reduce the serialized size.
+        let unwind_info_capacity = compact_unwind_info_capacity(compact_unwind_entry_count);
+        if unwind_info_capacity > 0 {
+            let epilogue_group = groups
+                .last_mut()
+                .context("missing Mach-O epilogue group for __unwind_info")?;
+            epilogue_group
+                .common
+                .allocate(part_id::UNWIND_INFO, unwind_info_capacity as u64);
+        }
+
         Ok(FinaliseSizesExt {
             imported_libraries,
             imported_symbols,
+            unwind_info_size: unwind_info_capacity as u64,
         })
     }
 
@@ -1571,14 +2107,84 @@ impl platform::Platform for MachO {
     }
 
     fn load_exception_frame_data<'data, 'scope, A: platform::Arch<Platform = Self>>(
-        _object: &mut crate::layout::ObjectLayoutState<'data, Self>,
+        object: &mut crate::layout::ObjectLayoutState<'data, Self>,
         _common: &mut crate::layout::CommonGroupState<'data, Self>,
-        _eh_frame_section_index: object::SectionIndex,
-        _resources: &'scope crate::layout::GraphResources<'data, '_, Self>,
-        _queue: &mut crate::layout::LocalWorkQueue<Self>,
-        _scope: &rayon::Scope<'scope>,
+        compact_unwind_section_index: object::SectionIndex,
+        resources: &'scope crate::layout::GraphResources<'data, '_, Self>,
+        queue: &mut crate::layout::LocalWorkQueue<Self>,
+        scope: &rayon::Scope<'scope>,
     ) -> Result {
-        todo!()
+        let section = object.object.section(compact_unwind_section_index)?;
+        let data = object.object.raw_section_data(section)?;
+        ensure!(
+            data.len() % COMPACT_UNWIND_ENTRY_SIZE == 0,
+            "{} has malformed __compact_unwind data: {} bytes is not a multiple of {}",
+            object.input,
+            data.len(),
+            COMPACT_UNWIND_ENTRY_SIZE
+        );
+
+        // The object representation's relocations are dependencies even though the metadata
+        // section itself is never copied. In particular, an LSDA is otherwise unreferenced by
+        // normal instructions, and a personality often appears only in this section. Reuse the
+        // normal Mach-O relocation graph handling for externals so its GOT/dylib bookkeeping
+        // remains exactly consistent with an ordinary unsigned pointer relocation.
+        for relocation in object
+            .relocations(compact_unwind_section_index)?
+            .relocations
+        {
+            let info = relocation.info(LE);
+            ensure!(
+                info.r_type == macho::ARM64_RELOC_UNSIGNED
+                    && !info.r_pcrel
+                    && info.r_length == 3,
+                "unsupported __compact_unwind relocation in {}: expected ARM64_RELOC_UNSIGNED, r_pcrel=0, r_length=3",
+                object.input
+            );
+            let offset = usize::try_from(info.r_address)
+                .context("__compact_unwind relocation offset overflowed usize")?;
+            ensure!(
+                offset + size_of::<u64>() <= data.len()
+                    && matches!(offset % COMPACT_UNWIND_ENTRY_SIZE, 0 | 16 | 24),
+                "unsupported __compact_unwind relocation offset 0x{offset:x} in {}",
+                object.input
+            );
+
+            if info.r_extern {
+                process_relocation::<A>(
+                    object,
+                    info,
+                    compact_unwind_section_index,
+                    resources,
+                    queue,
+                    scope,
+                )?;
+            } else if offset % COMPACT_UNWIND_ENTRY_SIZE == 24 {
+                // `r_symbolnum` is a one-based section ordinal for non-external Mach-O
+                // relocations. Keeping the whole LSDA section is conservative but correct even
+                // when a producer does not emit subsection symbols for its exception table.
+                let section_ordinal = usize::try_from(info.r_symbolnum)
+                    .context("__compact_unwind section ordinal overflowed usize")?;
+                let target_section = section_ordinal.checked_sub(1).context(
+                    "__compact_unwind LSDA relocation has section ordinal zero",
+                )?;
+                ensure!(
+                    target_section < object.sections.len(),
+                    "__compact_unwind LSDA relocation refers to section {} but {} has only {} sections",
+                    section_ordinal,
+                    object.input,
+                    object.sections.len()
+                );
+                queue.send_gc_unit_request::<A>(
+                    object.file_id,
+                    MachOGcUnit::Section(object::SectionIndex(target_section)),
+                    resources,
+                    scope,
+                );
+            }
+        }
+
+        Ok(())
     }
 
     fn non_empty_section_loaded<'data, 'scope, A: platform::Arch<Platform = Self>>(
@@ -1653,14 +2259,23 @@ impl platform::Platform for MachO {
             })
             .sum::<u64>();
 
-        // `__got` is the first section in __DATA_CONST. Chained fixups record a start for every
-        // page through the last dynamic slot. The final GOT size is known here, whereas
-        // individual addresses are not assigned until later, so it gives an exact upper bound for
-        // the page-start array.
-        let got_page_count = mem_sizes
-            .get(part_id::GOT)
-            .div_ceil(MACHO_PAGE_ALIGNMENT.value());
-        fixup_table_size += CHAINED_FIXUP_PAGE_START_SIZE * got_page_count;
+        // Chained fixups may now occur in every output segment: imported GOT slots are binds and
+        // ordinary local data pointers are rebases. Segment addresses are assigned later, so use
+        // a bounded reservation here. Counting every non-empty part independently is an upper
+        // bound for the number of 16KiB pages after parts are packed into their segments.
+        let max_page_count = mem_sizes
+            .parts
+            .iter()
+            .copied()
+            .filter(|&size| size != 0)
+            .map(|size| size.div_ceil(MACHO_PAGE_ALIGNMENT.value()))
+            .sum::<u64>();
+        fixup_table_size += CHAINED_STARTS_IN_SEGMENT_FIXED_SIZE as u64
+            * u64::try_from(MAX_SEGMENT_COUNT - 1).unwrap();
+        fixup_table_size += CHAINED_FIXUP_PAGE_START_SIZE * max_page_count;
+        // Segment-start records are only u16-aligned; reserve the padding needed to align the
+        // following `dyld_chained_import` array to its u32 ABI alignment.
+        fixup_table_size += (size_of::<u32>() - 1) as u64;
 
         mem_sizes.increment(
             part_id::CHAINED_FIXUP_TABLE,
@@ -1697,12 +2312,13 @@ impl platform::Platform for MachO {
 
     fn finalise_layout_epilogue<'data>(
         _epilogue_state: &mut Self::EpilogueLayoutExt,
-        _memory_offsets: &mut crate::output_section_part_map::OutputSectionPartMap<u64>,
+        memory_offsets: &mut crate::output_section_part_map::OutputSectionPartMap<u64>,
         _symbol_db: &crate::symbol_db::SymbolDb<'data, Self>,
-        _format_specific: &Self::FinaliseSizesExt<'data>,
+        format_specific: &Self::FinaliseSizesExt<'data>,
         _dynsym_start_index: u32,
         _dynamic_symbol_defs: &[crate::layout::DynamicSymbolDefinition<Self>],
     ) -> Result {
+        memory_offsets.increment(part_id::UNWIND_INFO, format_specific.unwind_info_size);
         Ok(())
     }
 
@@ -1852,6 +2468,14 @@ impl platform::Platform for MachO {
             .zip(per_symbol_flags.range(state.symbol_id_range))
         {
             let symbol_id = state.symbol_id_range.input_to_id(sym_index);
+            if let Some(section_index) = state.object.symbol_section(sym, sym_index)? {
+                let input_offset = state
+                    .object
+                    .symbol_offset_in_section(sym, section_index)?;
+                if !state.input_offset_is_live(section_index, input_offset) {
+                    continue;
+                }
+            }
             if let Some(info) = SymbolCopyInfo::new(
                 state.object,
                 sym_index,
@@ -2001,7 +2625,12 @@ impl platform::Platform for MachO {
         builder.add_section(crate::output_section_id::FILE_HEADER);
         builder.add_section(output_section_id::LOAD_COMMANDS);
 
-        // Content of the sections (e.g. __text, __data).
+        // The ordinary `__TEXT,__text` section is regular rather than custom so ARM64 branch
+        // islands can be inserted between object allocations. It must precede the remaining
+        // executable custom sections, just as it does in ld64 output.
+        builder.add_section(output_section_id::TEXT);
+
+        // Content of the remaining sections (e.g. custom executable sections and __data).
         add_sections_in_segment(
             &mut builder,
             output_sections,
@@ -2011,6 +2640,9 @@ impl platform::Platform for MachO {
 
         builder.add_section(output_section_id::PLT_GOT);
         add_sections_in_segment(&mut builder, output_sections, &custom.ro, SegmentName::TEXT);
+        // The final compact-unwind index describes the preceding executable and read-only text
+        // sections, and itself belongs to `__TEXT` before the writable data segments.
+        builder.add_section(output_section_id::UNWIND_INFO);
         builder.add_section(output_section_id::GOT);
 
         for segment in [SegmentName::DATA_CONST, SegmentName::DATA] {
@@ -2095,6 +2727,112 @@ impl platform::Platform for MachO {
             None => write!(f, "{section_name}"),
         }
     }
+}
+
+fn load_macho_eh_frame_data<'data, 'scope, A: platform::Arch<Platform = MachO>>(
+    object: &mut crate::layout::ObjectLayoutState<'data, MachO>,
+    eh_frame_section_index: object::SectionIndex,
+    resources: &'scope crate::layout::GraphResources<'data, '_, MachO>,
+    queue: &mut crate::layout::LocalWorkQueue<MachO>,
+    scope: &rayon::Scope<'scope>,
+) -> Result {
+    let section = object.object.section(eh_frame_section_index)?;
+    let data = object.object.raw_section_data(section)?;
+    let augmentations = eh_frame_augmentations(data)?;
+    if augmentations.is_empty() {
+        return Ok(());
+    }
+
+    let mut relocations = std::collections::BTreeMap::new();
+    for relocation in object.relocations(eh_frame_section_index)?.relocations {
+        let info = relocation.info(LE);
+        if matches!(
+            info.r_type,
+            macho::ARM64_RELOC_POINTER_TO_GOT | macho::ARM64_RELOC_UNSIGNED
+        ) {
+            let offset = usize::try_from(info.r_address)
+                .context("Mach-O __eh_frame relocation offset overflowed usize")?;
+            ensure!(
+                relocations.insert(offset, info).is_none(),
+                "duplicate Mach-O __eh_frame relocation at offset 0x{offset:x} in {}",
+                object.input
+            );
+        }
+    }
+
+    let mut personality_offsets = std::collections::BTreeSet::new();
+    let mut lsda_offsets = std::collections::BTreeSet::new();
+    for augmentation in augmentations {
+        personality_offsets.insert(augmentation.personality_relocation_offset);
+        lsda_offsets.insert(augmentation.lsda_relocation_offset);
+    }
+    for offset in personality_offsets {
+        let info = *relocations.get(&offset).with_context(|| {
+            format!(
+                "missing personality relocation at Mach-O __eh_frame offset 0x{offset:x} in {}",
+                object.input
+            )
+        })?;
+        ensure!(
+            info.r_type == macho::ARM64_RELOC_POINTER_TO_GOT
+                && info.r_extern
+                && info.r_pcrel
+                && info.r_length == 2,
+            "unsupported Mach-O __eh_frame personality relocation in {}: expected external ARM64_RELOC_POINTER_TO_GOT, r_pcrel=1, r_length=2",
+            object.input
+        );
+        process_relocation::<A>(
+            object,
+            info,
+            eh_frame_section_index,
+            resources,
+            queue,
+            scope,
+        )?;
+    }
+    for offset in lsda_offsets {
+        let info = *relocations.get(&offset).with_context(|| {
+            format!(
+                "missing LSDA relocation at Mach-O __eh_frame offset 0x{offset:x} in {}",
+                object.input
+            )
+        })?;
+        ensure!(
+            info.r_type == macho::ARM64_RELOC_UNSIGNED && info.r_length == 3,
+            "unsupported Mach-O __eh_frame LSDA relocation in {}: expected ARM64_RELOC_UNSIGNED with r_length=3",
+            object.input
+        );
+        if info.r_extern {
+            process_relocation::<A>(
+                object,
+                info,
+                eh_frame_section_index,
+                resources,
+                queue,
+                scope,
+            )?;
+        } else {
+            let section_ordinal = usize::try_from(info.r_symbolnum)
+                .context("Mach-O __eh_frame LSDA section ordinal overflowed usize")?;
+            let target_section = section_ordinal
+                .checked_sub(1)
+                .context("Mach-O __eh_frame LSDA relocation has section ordinal zero")?;
+            ensure!(
+                target_section < object.sections.len(),
+                "Mach-O __eh_frame LSDA relocation refers to section {} but {} has only {} sections",
+                section_ordinal,
+                object.input,
+                object.sections.len()
+            );
+            queue.send_gc_unit_request::<A>(
+                object.file_id,
+                MachOGcUnit::Section(object::SectionIndex(target_section)),
+                resources,
+                scope,
+            );
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn install_name<'data>(
@@ -2198,6 +2936,26 @@ const SECTION_DEFINITIONS: [BuiltInSectionDetails; NUM_BUILT_IN_SECTIONS] = {
         min_alignment: Alignment { exponent: 2 },
         ..DEFAULT_DEFS
     };
+    defs[output_section_id::UNWIND_INFO.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionIdentity::new(
+            SectionName(b"__unwind_info"),
+            Some(SegmentName::TEXT),
+        )),
+        min_alignment: Alignment { exponent: 2 },
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::TEXT.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionIdentity::new(
+            SectionName(b"__text"),
+            Some(SegmentName::TEXT),
+        )),
+        section_flags: macho::S_REGULAR
+            .to_flags()
+            .with(macho::S_ATTR_PURE_INSTRUCTIONS)
+            .with(macho::S_ATTR_SOME_INSTRUCTIONS),
+        min_alignment: Alignment { exponent: 2 },
+        ..DEFAULT_DEFS
+    };
 
     defs
 };
@@ -2237,7 +2995,10 @@ fn allocate_plt(memory_offsets: &mut OutputSectionPartMap<u64>) -> NonZeroU64 {
 }
 
 const DEFAULT_SECTION_RULES: &[SectionRule<'static>] = &[
-    // TODO: Add a Mach-O output section ID and rule for `__compact_unwind`.
+    // This is object-file linker metadata, not a section to copy into the final image. It must
+    // remain visible to the graph loader so it can retain its LSDA and personality dependencies;
+    // `macho_writer::write_compact_unwind_info` emits the final `__unwind_info` representation.
+    SectionRule::exact(b"__compact_unwind", crate::layout_rules::SectionRuleOutcome::EhFrame),
 ];
 
 fn section_header_name_for_segment<'data>(
@@ -2361,6 +3122,16 @@ fn process_relocation<'data, 'scope, A: platform::Arch<Platform = MachO>>(
         flags.merge(resources.local_flags_for_symbol(local_symbol_id));
 
         let relocation = A::relocation_from_raw(rel_info)?;
+        // Record range-limited calls while the graph still knows their source section. The
+        // generic thunk planner decides after GC whether this particular call can remain direct
+        // and, if not, assigns a nearby `__TEXT,__text` island to its owning object.
+        crate::thunks::handle_thunk_extensions_for_relocation::<A>(
+            object.section_part_id(section_index, &resources.symbol_db.section_part_ids),
+            resources,
+            local_symbol_id,
+            symbol_id,
+            rel_info,
+        );
         let mut flags_to_add = layout::resolution_flags(relocation.kind);
         if target_is_dynamic {
             flags_to_add |= ValueFlags::GOT;
@@ -2397,6 +3168,57 @@ fn process_relocation<'data, 'scope, A: platform::Arch<Platform = MachO>>(
     Ok(())
 }
 
+/// During ordinary executable linking Mach-O exports public object definitions. Under
+/// `-dead_strip`, that policy must run *after* atom liveness is known: making every external
+/// definition a root first would retain the very atoms dead stripping is meant to discard.
+fn export_live_symbols_in_section<'data>(
+    object: &layout::ObjectLayoutState<'data, MachO>,
+    common: &mut layout::CommonGroupState<'data, MachO>,
+    resources: &layout::GraphResources<'data, '_, MachO>,
+    section_index: object::SectionIndex,
+    atom: Option<&Range<u64>>,
+) -> Result {
+    if !resources.symbol_db.args.should_gc_sections()
+        || !resources.symbol_db.output_kind.is_executable()
+        || resources.symbol_db.export_list.is_some()
+    {
+        return Ok(());
+    }
+
+    for (symbol_index, symbol) in object.object.enumerate_symbols() {
+        if object.object.symbol_section(symbol, symbol_index)? != Some(section_index)
+            || platform::Symbol::is_undefined(symbol)
+            || symbol.is_local()
+            || symbol.visibility() != Visibility::Default
+        {
+            continue;
+        }
+
+        let offset = object
+            .object
+            .symbol_offset_in_section(symbol, section_index)?;
+        if let Some(atom) = atom
+            && !(atom.start <= offset && offset < atom.end)
+        {
+            continue;
+        }
+
+        let symbol_id = object.symbol_id_range.input_to_id(symbol_index);
+        if !resources.symbol_db.is_canonical(symbol_id) {
+            continue;
+        }
+        let old_flags = resources
+            .per_symbol_flags
+            .get_atomic(symbol_id)
+            .fetch_or(ValueFlags::EXPORT_DYNAMIC);
+        if !old_flags.needs_export_dynamic() {
+            layout::export_dynamic(common, symbol_id, resources.symbol_db)?;
+        }
+    }
+
+    Ok(())
+}
+
 fn is_dynamic_library(file: &SequencedInput<MachO>) -> bool {
     match file {
         SequencedInput::StubLibrary(_) => true,
@@ -2406,6 +3228,107 @@ fn is_dynamic_library(file: &SequencedInput<MachO>) -> bool {
 }
 
 impl<'data> File<'data> {
+    fn uses_subsections_via_symbols(&self) -> bool {
+        self.flags.0 & macho::MH_SUBSECTIONS_VIA_SYMBOLS.0 != 0
+    }
+
+    /// Returns the atom containing `symbol`. Leading bytes are owned by the first symbol atom and
+    /// trailing bytes by the last one, matching ld64's useful conservative interpretation of
+    /// section labels. Symbols sharing an address are aliases of the same atom. A section symbol
+    /// at its end becomes a zero-sized atom, so referencing it has a stable end-of-section
+    /// address without inventing data to copy.
+    fn atom_for_symbol(
+        &self,
+        symbol: &SymtabEntry,
+        symbol_index: object::SymbolIndex,
+    ) -> Result<Option<(object::SectionIndex, Range<u64>)>> {
+        if !self.uses_subsections_via_symbols() {
+            return Ok(None);
+        }
+        let Some(section_index) = self.symbol_section(symbol, symbol_index)? else {
+            return Ok(None);
+        };
+        // C-string sections are represented by the generic string-merging pool, which already
+        // owns their non-linear input-to-output mapping. Keep that path whole-section until the
+        // merger itself has an atom-aware liveness model.
+        if self.section(section_index)?.is_merge_section() {
+            return Ok(None);
+        }
+        let start = self.symbol_offset_in_section(symbol, section_index)?;
+        let range = self.atom_range(section_index, start)?;
+        Ok(Some((section_index, range)))
+    }
+
+    fn atom_range(
+        &self,
+        section_index: object::SectionIndex,
+        start: u64,
+    ) -> Result<Range<u64>> {
+        let section = self.section(section_index)?;
+        let section_size = self.section_size(section)?;
+        let starts = self.atom_starts(section_index, section_size)?;
+        // The synthetic zero boundary gives the first symbol ownership of any leading bytes.
+        // Later atoms begin at real symbol boundaries. This also accepts aliases without
+        // allocating a separate atom for every symbol table entry at the same address.
+        let mut start_index = starts
+            .partition_point(|candidate| *candidate <= start)
+            .checked_sub(1)
+            .context("Mach-O symbol is before the start of its section")?;
+        // A symbol exactly at section end is a zero-size label. Keep the preceding atom instead
+        // of creating an empty output fragment: it gives the label the compacted end address and
+        // conservatively retains the bytes that establish that address.
+        if start == section_size && starts.get(start_index) == Some(&section_size) && start_index > 0
+        {
+            start_index -= 1;
+        }
+        let end = starts.get(start_index + 1).copied().unwrap_or(section_size);
+        Ok(start..end)
+    }
+
+    fn atom_starts(
+        &self,
+        section_index: object::SectionIndex,
+        section_size: u64,
+    ) -> Result<Vec<u64>> {
+        let mut starts = vec![0];
+        for (symbol_index, symbol) in self.enumerate_symbols() {
+            if self.symbol_section(symbol, symbol_index)? != Some(section_index) {
+                continue;
+            }
+            let offset = self.symbol_offset_in_section(symbol, section_index)?;
+            ensure!(
+                offset <= section_size,
+                "Mach-O symbol lies past the end of its section while forming dead-strip atoms"
+            );
+            starts.push(offset);
+        }
+        starts.sort_unstable();
+        starts.dedup();
+
+        // Do not create an atom boundary through a relocation field. The relocation belongs to
+        // the atom containing its first byte, but its storage must remain contiguous even when a
+        // symbol labels the middle of a pointer or instruction operand. Merging those boundaries
+        // is conservative and avoids silently patching a dead neighbouring atom.
+        for relocation in paired_relocations(self.relocations(section_index, &())?.relocations) {
+            let relocation = relocation?;
+            let relocation_start = u64::from(relocation.info.r_address);
+            let width = 1u64
+                .checked_shl(u32::from(relocation.info.r_length))
+                .context("Mach-O relocation width is invalid")?;
+            let relocation_end = relocation_start
+                .checked_add(width)
+                .context("Mach-O relocation range overflows")?;
+            ensure!(
+                relocation_end <= section_size,
+                "Mach-O relocation extends past the end of its section"
+            );
+            starts.retain(|boundary| {
+                *boundary == 0 || !(*boundary > relocation_start && *boundary < relocation_end)
+            });
+        }
+        Ok(starts)
+    }
+
     fn sections(&self) -> &'data [SectionHeader] {
         self.kind.sections()
     }
@@ -2442,6 +3365,70 @@ impl SinglePartSectionId {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::args::RelocationModel;
+    use crate::output_kind::OutputKind;
+    use crate::output_section_id::OutputSections;
+
+    #[test]
+    fn eh_frame_zplr_reports_relocation_storage() {
+        // One DWARF32 CIE with `zPLR`, then an FDE referring back to it. Keep this byte-level
+        // regression independent of a Rust toolchain so malformed length/LEB handling is caught
+        // before a real object reaches the compact-unwind metadata path.
+        let mut data = vec![
+            24, 0, 0, 0, // CIE length
+            0, 0, 0, 0, // CIE marker
+            1, b'z', b'P', b'L', b'R', 0, 1, 0x78, 30, 7, 0x9b,
+            0, 0, 0, 0, // personality pointer relocation storage
+            0x10, 0x10, 0x0c, 0x1f, 0,
+            29, 0, 0, 0, // FDE length
+            32, 0, 0, 0, // CIE pointer: (FDE + 4) - CIE
+        ];
+        data.extend_from_slice(&[0; 16]); // function and range
+        data.push(8); // FDE augmentation size
+        data.extend_from_slice(&[0; 8]); // LSDA relocation storage
+        data.extend_from_slice(&[0; 4]); // final zero-length record
+
+        assert_eq!(
+            eh_frame_augmentations(&data).unwrap(),
+            vec![EhFrameAugmentation {
+                function_relocation_offset: 36,
+                personality_relocation_offset: 19,
+                lsda_relocation_offset: 53,
+            }]
+        );
+    }
+
+    #[test]
+    fn regular_text_section_requires_the_text_segment_identity() {
+        let mut output_sections = OutputSections::<MachO>::with_base_address(
+            MACHO_START_MEM_ADDRESS,
+            OutputKind::StaticExecutable(RelocationModel::NonRelocatable),
+        );
+        let text_identity = SectionIdentity::new(SectionName(b"__text"), Some(SegmentName::TEXT));
+        let text_id = output_sections.add_named_section(
+            text_identity,
+            Alignment { exponent: 2 },
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+        );
+        assert_eq!(text_id, output_section_id::TEXT);
+
+        let data_identity = SectionIdentity::new(SectionName(b"__text"), Some(SegmentName::DATA));
+        let data_id = output_sections.add_named_section(
+            data_identity,
+            Alignment { exponent: 2 },
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+        );
+        assert_ne!(data_id, output_section_id::TEXT);
+        assert!(data_id.is_custom::<MachO>());
+    }
 
     fn raw_relocation(
         r_address: u32,
@@ -2531,6 +3518,10 @@ mod tests {
         assert!(is_non_alloc_section(
             macho::S_REGULAR.to_flags().with(S_ATTR_DEBUG),
             SegmentName::TEXT.into_bytes().as_slice()
+        ));
+        assert!(!is_non_alloc_section(
+            macho::S_REGULAR.to_flags().with(S_ATTR_DEBUG),
+            SegmentName::LD.into_bytes().as_slice()
         ));
         assert!(is_non_alloc_section(
             macho::S_REGULAR.to_flags(),
