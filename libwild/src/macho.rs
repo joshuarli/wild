@@ -62,8 +62,10 @@ use object::macho::N_SECT;
 use object::macho::N_WEAK_DEF;
 use object::macho::S_ATTR_DEBUG;
 use object::macho::S_ATTR_EXT_RELOC;
+use object::macho::S_ATTR_LIVE_SUPPORT;
 use object::macho::S_ATTR_LOC_RELOC;
 use object::macho::S_ATTR_NO_DEAD_STRIP;
+use object::macho::S_ATTR_NO_TOC;
 use object::macho::S_ATTR_PURE_INSTRUCTIONS;
 use object::macho::S_ATTR_SOME_INSTRUCTIONS;
 use object::macho::S_CSTRING_LITERALS;
@@ -115,6 +117,10 @@ enum SinglePartSectionId {
     CodeSignature,
     ChainedFixupTable,
     ExportsTrie,
+    /// The selected DWARF CIE/FDE records used by ARM64 compact-unwind DWARF rows. Input
+    /// `__eh_frame` is object metadata; the writer rebuilds its backward CIE references after
+    /// GC and concatenation, then emits this final `__TEXT,__eh_frame` section.
+    EhFrame,
     /// The final, page-indexed compact unwind table. Input `__compact_unwind` records are linker
     /// metadata and are translated into this `__TEXT,__unwind_info` section after GC has assigned
     /// every surviving function its final address.
@@ -136,6 +142,7 @@ pub(crate) mod part_id {
     pub(crate) const CODE_SIGNATURE: PartId = SinglePartSectionId::CodeSignature.part_id();
     pub(crate) const CHAINED_FIXUP_TABLE: PartId = SinglePartSectionId::ChainedFixupTable.part_id();
     pub(crate) const EXPORTS_TRIE: PartId = SinglePartSectionId::ExportsTrie.part_id();
+    pub(crate) const EH_FRAME: PartId = SinglePartSectionId::EhFrame.part_id();
     pub(crate) const UNWIND_INFO: PartId = SinglePartSectionId::UnwindInfo.part_id();
 }
 
@@ -159,6 +166,7 @@ pub(crate) mod output_section_id {
         SinglePartSectionId::ChainedFixupTable.output_section_id();
     pub(crate) const EXPORTS_TRIE: OutputSectionId =
         SinglePartSectionId::ExportsTrie.output_section_id();
+    pub(crate) const EH_FRAME: OutputSectionId = SinglePartSectionId::EhFrame.output_section_id();
     pub(crate) const UNWIND_INFO: OutputSectionId =
         SinglePartSectionId::UnwindInfo.output_section_id();
 
@@ -224,6 +232,21 @@ pub(crate) fn compact_unwind_info_capacity(entry_count: usize) -> usize {
     // Header, up to three personalities, one top-level index per page plus its sentinel, one
     // worst-case LSDA descriptor per entry, and the regular second-level page contents.
     28 + 3 * 4 + (page_count + 1) * 12 + entry_count * 8 + page_count * 8 + entry_count * 8
+}
+
+/// Allocate enough room for every input record plus the sole output terminator. The final writer
+/// only retains CIEs that have a live FDE, so the actual serialization can be smaller, but it
+/// never needs more bytes than the complete input sections and one four-byte terminator. The
+/// synthetic section has 8-byte pointer alignment, so its reserved part must end on that boundary
+/// even though the terminator itself is four bytes.
+pub(crate) fn eh_frame_capacity(input_size: usize) -> Result<usize> {
+    let size = input_size
+        .checked_add(size_of::<u32>())
+        .context("Mach-O __eh_frame input is too large")?;
+    Ok(size
+        .checked_add(7)
+        .context("Mach-O __eh_frame alignment overflows")?
+        & !7)
 }
 
 type SectionHeader = Section64<crate::macho::Endianness>;
@@ -316,9 +339,32 @@ pub(crate) struct EhFrameAugmentation {
     pub(crate) lsda_relocation_offset: usize,
 }
 
-#[derive(Debug, Copy, Clone)]
-struct EhFrameCie {
-    personality_relocation_offset: usize,
+/// A parsed ARM64 CIE. `record_range` includes its DWARF length word and `personality` names
+/// the four-byte `DW_EH_PE_pcrel | sdata4 | indirect` field when this is a `zPLR` CIE.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EhFrameCie {
+    pub(crate) record_range: Range<usize>,
+    pub(crate) personality_relocation_offset: Option<usize>,
+}
+
+/// A parsed ARM64 FDE. The output writer copies the record, rewrites `cie_pointer`, and patches
+/// the encoded pointer fields at these offsets using final image addresses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EhFrameFde {
+    pub(crate) record_range: Range<usize>,
+    pub(crate) cie_record_start: usize,
+    pub(crate) function_relocation_offset: usize,
+    pub(crate) lsda_relocation_offset: Option<usize>,
+}
+
+/// The only CIE/FDE grammar currently emitted by the ARM64 Mach-O Rust and Clang producers we
+/// support: DWARF32 with `zR` or `zPLR`, with final pointers encoded as `pcrel` 64-bit values.
+/// Keep raw ranges rather than decoded instructions so non-pointer DWARF programs survive byte
+/// for byte while their address-bearing fields are rebuilt at the final output location.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct EhFrameRecords {
+    pub(crate) cies: std::collections::BTreeMap<usize, EhFrameCie>,
+    pub(crate) fdes: Vec<EhFrameFde>,
 }
 
 /// Read the standard DWARF32 ARM64 `zPLR` augmentation used by current Rust object files.
@@ -329,15 +375,39 @@ struct EhFrameCie {
 /// the wrong unwind target. The supported encoding is `P=0x9b` (pcrel indirect sdata4), and
 /// `L=R=0x10` (pcrel 64-bit), which is the arm64 Mach-O encoding produced by rustc/LLVM.
 pub(crate) fn eh_frame_augmentations(data: &[u8]) -> Result<Vec<EhFrameAugmentation>> {
-    let mut cies = std::collections::BTreeMap::<usize, EhFrameCie>::new();
-    let mut augmentations = Vec::new();
+    let records = parse_eh_frame_records(data)?;
+    Ok(records
+        .fdes
+        .iter()
+        .filter_map(|fde| {
+            let personality_relocation_offset = records
+                .cies
+                .get(&fde.cie_record_start)?
+                .personality_relocation_offset?;
+            Some(EhFrameAugmentation {
+                function_relocation_offset: fde.function_relocation_offset,
+                personality_relocation_offset,
+                lsda_relocation_offset: fde.lsda_relocation_offset?,
+            })
+        })
+        .collect())
+}
+
+/// Parse all records that may appear in the final table. A record with a CIE we do not understand
+/// cannot safely be copied because its function/LSDA pointer locations are not self-describing;
+/// reject it now rather than emitting an unwind table that fails only during process unwinding.
+pub(crate) fn parse_eh_frame_records(data: &[u8]) -> Result<EhFrameRecords> {
+    let mut records = EhFrameRecords::default();
     let mut record_start = 0usize;
 
     while record_start < data.len() {
         let length = eh_frame_u32(data, record_start)?;
         if length == 0 {
-            // `.eh_frame` permits a terminating zero-length record. Its trailing bytes are
-            // alignment padding and do not describe more FDEs.
+            // `.eh_frame` permits one terminator followed only by alignment padding.
+            ensure!(
+                data[record_start..].iter().all(|&byte| byte == 0),
+                "nonzero bytes after Mach-O __eh_frame terminator"
+            );
             break;
         }
         ensure!(
@@ -354,34 +424,36 @@ pub(crate) fn eh_frame_augmentations(data: &[u8]) -> Result<Vec<EhFrameAugmentat
         );
         let cie_pointer = eh_frame_u32(data, record_start + 4)?;
         if cie_pointer == 0 {
-            if let Some(cie) = parse_eh_frame_cie(data, record_start, record_end)? {
-                cies.insert(record_start, cie);
-            }
+            let cie = parse_eh_frame_cie(data, record_start, record_end)?;
+            ensure!(
+                records.cies.insert(record_start, cie).is_none(),
+                "duplicate Mach-O __eh_frame CIE at offset 0x{record_start:x}"
+            );
         } else {
             let cie_start = record_start
                 .checked_add(4)
                 .and_then(|offset| offset.checked_sub(cie_pointer as usize))
                 .context("Mach-O __eh_frame FDE CIE pointer precedes the section")?;
-            if let Some(cie) = cies.get(&cie_start).copied() {
-                augmentations.push(parse_eh_frame_fde(
-                    data,
-                    record_start,
-                    record_end,
-                    cie,
-                )?);
-            }
+            let cie = records.cies.get(&cie_start).with_context(|| {
+                format!(
+                    "Mach-O __eh_frame FDE at offset 0x{record_start:x} refers to unknown CIE at offset 0x{cie_start:x}"
+                )
+            })?;
+            records
+                .fdes
+                .push(parse_eh_frame_fde(data, record_start, record_end, cie, cie_start)?);
         }
         record_start = record_end;
     }
 
-    Ok(augmentations)
+    Ok(records)
 }
 
 fn parse_eh_frame_cie(
     data: &[u8],
     record_start: usize,
     record_end: usize,
-) -> Result<Option<EhFrameCie>> {
+) -> Result<EhFrameCie> {
     let mut offset = record_start + 8;
     let version = *data
         .get(offset)
@@ -401,9 +473,11 @@ fn parse_eh_frame_cie(
     }
     let augmentation = &data[augmentation_start..offset];
     offset += 1;
-    if !augmentation.starts_with(b"z") {
-        return Ok(None);
-    }
+    ensure!(
+        matches!(augmentation, b"zR" | b"zPLR"),
+        "unsupported Mach-O __eh_frame CIE augmentation {:?}: expected zR or zPLR",
+        String::from_utf8_lossy(augmentation)
+    );
 
     eh_frame_uleb(data, record_end, &mut offset)?; // code alignment factor
     eh_frame_sleb(data, record_end, &mut offset)?; // data alignment factor
@@ -429,76 +503,53 @@ fn parse_eh_frame_cie(
         "truncated Mach-O __eh_frame CIE augmentation data"
     );
 
-    let mut personality_relocation_offset = None;
-    let mut lsda_encoding = None;
-    let mut fde_encoding = None;
-    for &directive in &augmentation[1..] {
-        match directive {
-            b'P' => {
-                let encoding = *data
-                    .get(offset)
-                    .context("truncated Mach-O __eh_frame personality encoding")?;
-                offset += 1;
-                let pointer_offset = offset;
-                offset = eh_frame_skip_encoded_value(data, augmentation_end, offset, encoding)?;
-                personality_relocation_offset = Some((pointer_offset, encoding));
-            }
-            b'L' => {
-                lsda_encoding = Some(
-                    *data
-                        .get(offset)
-                        .context("truncated Mach-O __eh_frame LSDA encoding")?,
-                );
-                offset += 1;
-            }
-            b'R' => {
-                fde_encoding = Some(
-                    *data
-                        .get(offset)
-                        .context("truncated Mach-O __eh_frame FDE encoding")?,
-                );
-                offset += 1;
-            }
-            b'S' => {}
-            _ => {
-                // The augmentation payload is not self-describing for unknown directives, so
-                // avoid guessing where the following relocation fields reside. This CIE cannot
-                // safely supplement compact unwind metadata.
-                return Ok(None);
-            }
-        }
-    }
-    ensure!(
-        offset == augmentation_end,
-        "unsupported Mach-O __eh_frame CIE augmentation layout"
-    );
-
-    let (personality_relocation_offset, personality_encoding) = match personality_relocation_offset
-    {
-        Some(value) => value,
-        None => return Ok(None),
+    let personality_relocation_offset = if augmentation == b"zR" {
+        let fde_encoding = *data
+            .get(offset)
+            .context("truncated Mach-O __eh_frame zR FDE encoding")?;
+        offset += 1;
+        ensure!(
+            fde_encoding == 0x10 && offset == augmentation_end,
+            "unsupported Mach-O __eh_frame zR encoding: expected R=0x10"
+        );
+        None
+    } else {
+        let personality_encoding = *data
+            .get(offset)
+            .context("truncated Mach-O __eh_frame personality encoding")?;
+        offset += 1;
+        let pointer_offset = offset;
+        offset = eh_frame_skip_encoded_value(data, augmentation_end, offset, personality_encoding)?;
+        let lsda_encoding = *data
+            .get(offset)
+            .context("truncated Mach-O __eh_frame LSDA encoding")?;
+        offset += 1;
+        let fde_encoding = *data
+            .get(offset)
+            .context("truncated Mach-O __eh_frame FDE encoding")?;
+        offset += 1;
+        ensure!(
+            personality_encoding == 0x9b
+                && lsda_encoding == 0x10
+                && fde_encoding == 0x10
+                && offset == augmentation_end,
+            "unsupported Mach-O __eh_frame zPLR encoding: expected P=0x9b, L=R=0x10"
+        );
+        Some(pointer_offset)
     };
-    let Some(lsda_encoding) = lsda_encoding else {
-        return Ok(None);
-    };
-    let Some(fde_encoding) = fde_encoding else {
-        return Ok(None);
-    };
-    ensure!(
-        personality_encoding == 0x9b && lsda_encoding == 0x10 && fde_encoding == 0x10,
-        "unsupported Mach-O __eh_frame zPLR encoding: expected P=0x9b, L=R=0x10"
-    );
-    Ok(Some(EhFrameCie {
+    Ok(EhFrameCie {
+        record_range: record_start..record_end,
         personality_relocation_offset,
-    }))
+    })
 }
 
 fn parse_eh_frame_fde(
     data: &[u8],
     record_start: usize,
     record_end: usize,
-    cie: EhFrameCie,
-) -> Result<EhFrameAugmentation> {
+    cie: &EhFrameCie,
+    cie_record_start: usize,
+) -> Result<EhFrameFde> {
     // `R=0x10` means the initial location and range are each an eight-byte field. `L=0x10`
     // similarly makes the FDE augmentation's first payload an eight-byte LSDA address.
     let function_relocation_offset = record_start + 8;
@@ -512,11 +563,19 @@ fn parse_eh_frame_fde(
     let mut offset = augmentation_length_offset;
     let augmentation_size = usize::try_from(eh_frame_uleb(data, record_end, &mut offset)?)
         .context("Mach-O __eh_frame FDE augmentation size overflows usize")?;
-    ensure!(
-        augmentation_size >= size_of::<u64>(),
-        "truncated Mach-O __eh_frame zPLR FDE LSDA"
-    );
-    let lsda_relocation_offset = offset;
+    let lsda_relocation_offset = if cie.personality_relocation_offset.is_some() {
+        ensure!(
+            augmentation_size == size_of::<u64>(),
+            "unsupported Mach-O __eh_frame zPLR FDE augmentation size {augmentation_size}: expected 8"
+        );
+        Some(offset)
+    } else {
+        ensure!(
+            augmentation_size == 0,
+            "unsupported Mach-O __eh_frame zR FDE augmentation size {augmentation_size}: expected 0"
+        );
+        None
+    };
     let augmentation_end = offset
         .checked_add(augmentation_size)
         .context("Mach-O __eh_frame FDE augmentation size overflows")?;
@@ -524,9 +583,10 @@ fn parse_eh_frame_fde(
         augmentation_end <= record_end,
         "truncated Mach-O __eh_frame FDE augmentation data"
     );
-    Ok(EhFrameAugmentation {
+    Ok(EhFrameFde {
+        record_range: record_start..record_end,
+        cie_record_start,
         function_relocation_offset,
-        personality_relocation_offset: cie.personality_relocation_offset,
         lsda_relocation_offset,
     })
 }
@@ -708,6 +768,8 @@ pub(crate) struct FinaliseSizesExt {
     /// Reserved upper bound for the post-layout `__unwind_info` serialization. The epilogue owns
     /// this synthetic data, so it also advances this part during final address assignment.
     unwind_info_size: u64,
+    /// Reserved upper bound for selected CIE/FDE records and their one final terminator.
+    eh_frame_size: u64,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -1997,6 +2059,7 @@ impl platform::Platform for MachO {
         let mut imported_libraries = Vec::new();
         let mut imported_symbols = Vec::new();
         let mut compact_unwind_entry_count = 0usize;
+        let mut eh_frame_input_size = 0usize;
 
         // Mach-O bind ordinals name load commands, whose identity is their install name rather
         // than the input pathname. For example, the macOS SDK's `libSystem`, `libc`, and `libm`
@@ -2032,6 +2095,15 @@ impl platform::Platform for MachO {
                                 .checked_add(data.len() / COMPACT_UNWIND_ENTRY_SIZE)
                                 .context("too many Mach-O compact unwind entries")?;
                         }
+                        for (_, section) in object.object.enumerate_sections() {
+                            if section.name() != b"__eh_frame" {
+                                continue;
+                            }
+                            let data = object.object.raw_section_data(section)?;
+                            eh_frame_input_size = eh_frame_input_size
+                                .checked_add(data.len())
+                                .context("too much Mach-O __eh_frame input")?;
+                        }
                     }
                     layout::FileLayoutState::StubLibrary(state) => {
                         if state.format_specific.loaded {
@@ -2063,11 +2135,23 @@ impl platform::Platform for MachO {
                 .common
                 .allocate(part_id::UNWIND_INFO, unwind_info_capacity as u64);
         }
+        let eh_frame_size = eh_frame_capacity(eh_frame_input_size)?;
+        if eh_frame_input_size > 0 {
+            let epilogue_group = groups
+                .last_mut()
+                .context("missing Mach-O epilogue group for __eh_frame")?;
+            epilogue_group
+                .common
+                .allocate(part_id::EH_FRAME, eh_frame_size as u64);
+        }
 
         Ok(FinaliseSizesExt {
             imported_libraries,
             imported_symbols,
             unwind_info_size: unwind_info_capacity as u64,
+            eh_frame_size: (eh_frame_input_size > 0)
+                .then_some(eh_frame_size as u64)
+                .unwrap_or(0),
         })
     }
 
@@ -2318,6 +2402,7 @@ impl platform::Platform for MachO {
         _dynsym_start_index: u32,
         _dynamic_symbol_defs: &[crate::layout::DynamicSymbolDefinition<Self>],
     ) -> Result {
+        memory_offsets.increment(part_id::EH_FRAME, format_specific.eh_frame_size);
         memory_offsets.increment(part_id::UNWIND_INFO, format_specific.unwind_info_size);
         Ok(())
     }
@@ -2640,9 +2725,11 @@ impl platform::Platform for MachO {
 
         builder.add_section(output_section_id::PLT_GOT);
         add_sections_in_segment(&mut builder, output_sections, &custom.ro, SegmentName::TEXT);
-        // The final compact-unwind index describes the preceding executable and read-only text
-        // sections, and itself belongs to `__TEXT` before the writable data segments.
+        // Apple places the compact-unwind index before the coalesced DWARF table. The DWARF
+        // rows' rewritten pcrel fields are independent of this order, but preserving the native
+        // section arrangement lets libunwind discover both representations conventionally.
         builder.add_section(output_section_id::UNWIND_INFO);
+        builder.add_section(output_section_id::EH_FRAME);
         builder.add_section(output_section_id::GOT);
 
         for segment in [SegmentName::DATA_CONST, SegmentName::DATA] {
@@ -2934,6 +3021,18 @@ const SECTION_DEFINITIONS: [BuiltInSectionDetails; NUM_BUILT_IN_SECTIONS] = {
             .with(macho::S_ATTR_PURE_INSTRUCTIONS)
             .with(macho::S_ATTR_SOME_INSTRUCTIONS),
         min_alignment: Alignment { exponent: 2 },
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::EH_FRAME.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionIdentity::new(
+            SectionName(b"__eh_frame"),
+            Some(SegmentName::TEXT),
+        )),
+        section_flags: macho::S_COALESCED
+            .to_flags()
+            .with(S_ATTR_LIVE_SUPPORT)
+            .with(S_ATTR_NO_TOC),
+        min_alignment: Alignment { exponent: 3 },
         ..DEFAULT_DEFS
     };
     defs[output_section_id::UNWIND_INFO.as_usize()] = BuiltInSectionDetails {
@@ -3396,6 +3495,42 @@ mod tests {
                 lsda_relocation_offset: 53,
             }]
         );
+
+        let records = parse_eh_frame_records(&data).unwrap();
+        assert_eq!(records.cies.len(), 1);
+        assert_eq!(records.fdes.len(), 1);
+        assert_eq!(
+            records.fdes[0],
+            EhFrameFde {
+                record_range: 28..61,
+                cie_record_start: 0,
+                function_relocation_offset: 36,
+                lsda_relocation_offset: Some(53),
+            }
+        );
+    }
+
+    #[test]
+    fn eh_frame_zr_retains_an_fde_without_personality_or_lsda() {
+        // The first CIE in a rustc object is commonly `zR`: it describes ordinary functions
+        // that have no personality or LSDA. It still needs a final FDE because compact unwind's
+        // DWARF mode delegates recovery to this table.
+        let mut data = vec![
+            13, 0, 0, 0, // CIE length
+            0, 0, 0, 0, // CIE marker
+            1, b'z', b'R', 0, 1, 0x78, 30, 1, 0x10,
+            21, 0, 0, 0, // FDE length
+            21, 0, 0, 0, // CIE pointer: (FDE + 4) - CIE
+        ];
+        data.extend_from_slice(&[0; 16]); // function and range
+        data.push(0); // FDE augmentation size
+        data.extend_from_slice(&[0; 4]); // final zero-length record
+
+        let records = parse_eh_frame_records(&data).unwrap();
+        assert_eq!(records.cies[&0].personality_relocation_offset, None);
+        assert_eq!(records.fdes.len(), 1);
+        assert_eq!(records.fdes[0].lsda_relocation_offset, None);
+        assert!(eh_frame_augmentations(&data).unwrap().is_empty());
     }
 
     #[test]

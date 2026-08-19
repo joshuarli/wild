@@ -50,7 +50,7 @@ than supported facilities:
 | Chained fixups | Plans address-ordered imported binds and local rebases per segment; gaps, leading local slots, 16 KiB pages, and malformed encodings are handled. Wider pointer-format/arm64e qualification remains. | partial; unqualified |
 | Dylib output / rpaths / exports | Emits `MH_DYLIB`, `LC_ID_DYLIB`, requested `LC_RPATH`, and omits executable-only commands; C runtime smoke passes. Dependency ordinals, weak/reexport behavior, and Rust dylib qualification remain. | partial; unqualified |
 | Dead strip / atoms | `MH_SUBSECTIONS_VIA_SYMBOLS` inputs are split into live symbol-delimited spans under `-dead_strip`; whole-section behavior is retained otherwise. | partial; differential smoke green |
-| TLS, compact unwind, DWARF, string merging | A local C TLS descriptor fixture executes successfully. ARM64 compact frame/frameless rows, personality pointers, and LSDAs are synthesized and a C++ throw/catch fixture passes. ARM64 DWARF-mode unwind rows are rejected because final `__eh_frame` serialization is not implemented. | partial; unqualified |
+| TLS, compact unwind, DWARF, string merging | A local C TLS descriptor fixture executes successfully. ARM64 compact frame/frameless rows, personality pointers, and LSDAs are synthesized and a C++ throw/catch fixture passes. Bounded ARM64 DWARF-mode rows now serialize their live `__eh_frame` CIE/FDE records and pass a Rust `panic=unwind` / `catch_unwind` smoke under `-dead_strip`; ordinary debug DWARF remains dropped. | partial; bounded unwind smoke green |
 
 ## Compatibility matrix
 
@@ -62,7 +62,7 @@ than supported facilities:
 | framework | none | pending | pending | n/a | unqualified |
 | dead strip | `macho/dead-strip` | code/data/export parity pass | C runtime pass | pending | atom smoke green |
 | TLS | `macho/tls-local` | structural comparison pending | C runtime pass; Rust static/dylib TLS re-qualification pending | pending | local executable smoke green |
-| compact unwind | `macho/exception` C++ throw/catch | structural section/header check; runtime pass | Rust `panic=unwind` needs final `__eh_frame` | pending | bounded C++ support; Rust blocked |
+| compact unwind | `macho/exception` C++ throw/catch; `macho/rust-panic-unwind` | structural section/header check; C++ and Rust runtime pass | ARM64 Rust `panic=unwind` / `catch_unwind` under `-dead_strip` | pending | bounded ARM64 support |
 | DWARF / dSYM / LLDB | none | pending | pending | pending | unqualified |
 | chained fixups | existing output inspection only | pending | pending | pending | unqualified |
 | branch islands | `macho/branch-island`, `macho/branch-islands` | Apple links forced overflows | C runtime pass | multiple islands pass | ARM64 smoke green |
@@ -81,7 +81,7 @@ passed wherever Wild is listed as failing.
 | Proc macro crate | rustc segfaulted before general local rebases | re-qualify after rebase work |
 | Rust `thread_local!` / `cargo test` | default `cargo test` now passes through Wild; `thread_local!` needs re-qualification | exercise static/dylib TLS matrix |
 | C++ throw/catch | links, emits `__TEXT,__unwind_info`, and catches at runtime | broaden compact-unwind differential coverage |
-| Rust `panic=unwind` | intentionally rejected when a live row uses ARM64 DWARF mode (`0x03000000`) | select, relocate, and serialize final `__TEXT,__eh_frame` CIE/FDE records |
+| Rust `panic=unwind` | `macho/rust-panic-unwind` selects live CIE/FDE records, rewrites DWARF compact-unwind FDE offsets, and catches a panic at runtime under `-dead_strip` | broaden CIE/FDE grammar and crate/stress coverage |
 | DWARF / `dsymutil` | debug sections are dropped; `dsymutil` reports no debug symbols | retain and relocate debug sections |
 | `-dead_strip` and `-force_load` | dead C code/data and unreferenced forced archive member are covered | add stress/edge corpus |
 | 138 MiB fragmented branch | Apple and Wild both link/run through nearby islands | larger stress qualification |
@@ -120,8 +120,8 @@ RUSTFLAGS="-C linker=clang -C link-arg=--ld-path=$PWD/target/debug/wild" \
 ```
 
 This is a smoke result only. It is not evidence for dynamic TLS, proc macros, Rust panic/unwind,
-or debug information and the other qualification gates
-listed below. The invocation selects Wild; it does not fall back to Apple ld.
+or debug information and the other qualification gates listed below. The invocation selects Wild;
+it does not fall back to Apple ld.
 
 ### Local chained-rebase regression
 
@@ -167,6 +167,11 @@ relaxation APIs; none removes the known correctness gaps listed above.
 * Chained-fixup generation now uses actual dynamic GOT addresses, handles local gaps and multiple
   16 KiB pages, and validates its chain encoding. The minimal stable Cargo binary links and runs
   with Wild after its first dynamic bind at `__got + 0x68`.
+* ARM64 DWARF compact-unwind rows now retain only live `__eh_frame` FDEs, serialize their final
+  CIE/FDE records, and rewrite the compact-unwind low 24-bit FDE offsets. The serializer supports
+  the Rust-produced DWARF32 `zR` / `zPLR` CIE grammar with an indirect PC-relative personality
+  pointer; for a local personality it adds the required validated chained GOT rebase. Permanent
+  `macho/rust-panic-unwind` runs Rust `panic=unwind` / `catch_unwind` with `-dead_strip`.
 
 ## Deferred / deliberately unsupported today
 
@@ -177,7 +182,7 @@ relaxation APIs; none removes the known correctness gaps listed above.
 
 ## Next work items
 
-1. Serialize final `__TEXT,__eh_frame` and retain/relocate ordinary DWARF for Rust panic and
+1. Broaden final `__TEXT,__eh_frame` CIE/FDE grammar and retain/relocate ordinary debug DWARF for
    debugger workflows.
 2. Complete dynamic TLS, subtractor relocations, and full dylib/proc-macro qualification.
 3. Expand the Apple-differential corpus and ARM64 Rust crate-type/stress qualification.

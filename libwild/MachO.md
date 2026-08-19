@@ -139,11 +139,24 @@ page. This deliberately trades a small amount of output size for straightforward
 compressed pages are an optimization, not a compatibility requirement. The final encoding supports
 the format's three distinct personality slots and reports a diagnostic if an input needs more.
 
-This is intentionally a bounded ARM64 implementation. `UNWIND_ARM64_MODE_DWARF` (`0x03000000`)
-requires a correctly selected and relocated final `__TEXT,__eh_frame` table; Wild does not yet
-serialize that table and therefore rejects a live compact-unwind row using DWARF mode. This is a
-link-time diagnostic rather than an output that aborts while unwinding. Frame and frameless rows,
-including C++ `throw`/`catch` with compact personality and LSDA metadata, are covered.
+This is intentionally a bounded ARM64 implementation. For a live
+`UNWIND_ARM64_MODE_DWARF` (`0x03000000`) record, Wild selects the paired input `__eh_frame` FDE
+by its input function relocation (not by a merged output symbol), retains its CIE only when it has
+a live FDE, and serializes a final `__TEXT,__eh_frame` table. The supported Rust grammar is
+DWARF32 CIE augmentation `zR` with `R = 0x10`, or `zPLR` with `P = 0x9b` (indirect PC-relative
+signed 4-byte personality pointer) and `L` / `R = 0x10`, plus the corresponding PC-relative FDE
+CIE, function, and optional LSDA fields. The writer rewrites every DWARF compact-unwind encoding's
+low 24 bits to that FDE's final section offset and sets `UNWIND_HAS_LSDA` when applicable.
+
+An indirect local personality pointer uses the already allocated GOT cell and contributes one
+validated local chained rebase to the final fixup plan; imported personalities use the normal
+bind path. This matters because `__eh_frame` is linker metadata rather than a loaded input
+section, so its `POINTER_TO_GOT` relocation is not discovered by the ordinary loaded-section
+scan. The plan is deduplicated by GOT address and rejects conflicting targets. Unsupported
+augmentation, pointer encodings, relocation forms, or malformed CIE/FDE relationships remain
+link-time diagnostics. Frame and frameless rows, including C++ `throw`/`catch` with compact
+personality and LSDA metadata, remain covered; this does not retain general debug DWARF or claim
+`dsymutil` / debugger support.
 
 ```
 ❯ llvm-objdump --unwind-info ~/Programming/testcases/a.out

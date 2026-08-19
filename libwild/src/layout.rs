@@ -934,6 +934,15 @@ pub(crate) struct EpilogueLayout<P: Platform> {
     pub(crate) dynsym_start_index: u32,
 }
 
+/// One retained input atom and the alignment that its output start must preserve. Atom-level
+/// dead stripping can remove the bytes that originally padded a later atom, so concatenating the
+/// remaining ranges directly is not enough for BSS objects such as atomics and mutexes.
+#[derive(Debug, Clone)]
+pub(crate) struct LiveSubsection {
+    pub(crate) range: Range<u64>,
+    alignment: Alignment,
+}
+
 #[derive(Debug)]
 pub(crate) struct ObjectLayout<'data, P: Platform> {
     pub(crate) input: InputRef<'data>,
@@ -952,7 +961,7 @@ pub(crate) struct ObjectLayout<'data, P: Platform> {
     /// This belongs to the generic layout record because address assignment and symbol resolution
     /// need the same input-to-output mapping as a format-specific writer. Mach-O currently uses
     /// it for `MH_SUBSECTIONS_VIA_SYMBOLS`; other formats retain the `None` fast path.
-    pub(crate) live_subsections: Vec<Option<Vec<Range<u64>>>>,
+    pub(crate) live_subsections: Vec<Option<Vec<LiveSubsection>>>,
 
     /// SFrame section ranges for this object, relative to the start of the .sframe output section.
     pub(crate) sframe_ranges: Vec<std::ops::Range<usize>>,
@@ -1363,7 +1372,7 @@ pub(crate) struct ObjectLayoutState<'data, P: Platform> {
 
     /// See [`ObjectLayout::live_subsections`]. Entries are created only for sections whose input
     /// format explicitly opts into atom-level dead stripping.
-    live_subsections: Vec<Option<Vec<Range<u64>>>>,
+    live_subsections: Vec<Option<Vec<LiveSubsection>>>,
 
     /// Mapping from sections to their corresponding relocation section.
     pub(crate) relocations: P::RelocationSections,
@@ -4305,6 +4314,12 @@ impl<'data, P: Platform> ObjectLayoutState<'data, P> {
             "input subsection range has an invalid end before its start"
         );
 
+        let header = self.object.section(section_index)?;
+        let section_alignment = Alignment::new(self.object.section_alignment(header)?)?;
+        let subsection = LiveSubsection {
+            alignment: subsection_alignment(section_alignment, range.start),
+            range: range.clone(),
+        };
         let new_size = {
             let ranges = self
                 .live_subsections
@@ -4312,30 +4327,26 @@ impl<'data, P: Platform> ObjectLayoutState<'data, P> {
                 .context("subsection refers to a section outside the object")?
                 .get_or_insert_with(Vec::new);
 
-            if ranges.iter().any(|existing| *existing == range) {
+            if ranges.iter().any(|existing| existing.range == range) {
                 return Ok(false);
             }
 
-            let insertion_index = ranges.partition_point(|existing| existing.start < range.start);
-            if insertion_index > 0 && ranges[insertion_index - 1].end > range.start {
+            let insertion_index = ranges.partition_point(|existing| existing.range.start < range.start);
+            if insertion_index > 0 && ranges[insertion_index - 1].range.end > range.start {
                 bail!("overlapping live input subsections are not representable");
             }
             if ranges
                 .get(insertion_index)
-                .is_some_and(|next| range.end > next.start)
+                .is_some_and(|next| range.end > next.range.start)
             {
                 bail!("overlapping live input subsections are not representable");
             }
-            ranges.insert(insertion_index, range.clone());
+            ranges.insert(insertion_index, subsection);
 
-            ranges.iter().try_fold(0u64, |size, span| {
-                size.checked_add(span.end - span.start)
-                    .context("live input subsections exceed u64")
-            })?
+            live_subsection_size(ranges)?
         };
 
         let part_id = self.section_part_id(section_index, &resources.symbol_db.section_part_ids);
-        let header = self.object.section(section_index)?;
         let new_section = Section { size: new_size };
         let (old_capacity, first_subsection, unloaded) = match self.sections[section_index.0] {
             SectionSlot::Unloaded(unloaded) | SectionSlot::MustLoad(unloaded) => (0, true, unloaded),
@@ -6194,20 +6205,50 @@ impl<'data, P: Platform> ObjectLayout<'data, P> {
     pub(crate) fn live_input_ranges(
         &self,
         section_index: SectionIndex,
-    ) -> Option<&[Range<u64>]> {
+    ) -> Option<&[LiveSubsection]> {
         self.live_subsections
             .get(section_index.0)
             .and_then(Option::as_deref)
     }
 }
 
-fn output_offset_for_input(ranges: Option<&[Range<u64>]>, input_offset: u64) -> Option<u64> {
-    let Some(ranges) = ranges else {
+fn subsection_alignment(section_alignment: Alignment, start: u64) -> Alignment {
+    let start_alignment_exponent = if start == 0 {
+        section_alignment.exponent
+    } else {
+        start.trailing_zeros().min(u32::from(section_alignment.exponent)) as u8
+    };
+    Alignment {
+        exponent: start_alignment_exponent,
+    }
+}
+
+fn live_subsection_size(subsections: &[LiveSubsection]) -> Result<u64> {
+    subsections.iter().try_fold(0u64, |size, subsection| {
+        let aligned_size = size
+            .checked_add(subsection.alignment.mask())
+            .map(|size| size & !subsection.alignment.mask())
+            .context("live input subsection alignment overflows")?;
+        aligned_size
+            .checked_add(subsection.range.end - subsection.range.start)
+            .context("live input subsections exceed u64")
+    })
+}
+
+fn output_offset_for_input(
+    subsections: Option<&[LiveSubsection]>,
+    input_offset: u64,
+) -> Option<u64> {
+    let Some(subsections) = subsections else {
         return Some(input_offset);
     };
 
-    let mut output_offset = 0;
-    for (index, range) in ranges.iter().enumerate() {
+    let mut output_offset = 0u64;
+    for (index, subsection) in subsections.iter().enumerate() {
+        output_offset = output_offset
+            .checked_add(subsection.alignment.mask())
+            .map(|offset| offset & !subsection.alignment.mask())?;
+        let range = &subsection.range;
         if range.start == range.end && input_offset == range.start {
             return Some(output_offset);
         }
@@ -6218,28 +6259,33 @@ fn output_offset_for_input(ranges: Option<&[Range<u64>]>, input_offset: u64) -> 
 
         // A label at the end of the final retained atom is a valid zero-size alias for the end
         // of the compacted section. Do not let the same rule bridge a dead gap between atoms.
-        if index + 1 == ranges.len() && input_offset == range.end {
+        if index + 1 == subsections.len() && input_offset == range.end {
             return Some(output_offset);
         }
     }
     None
 }
 
-fn input_offset_is_live(ranges: Option<&[Range<u64>]>, input_offset: u64) -> bool {
-    let Some(ranges) = ranges else {
+fn input_offset_is_live(subsections: Option<&[LiveSubsection]>, input_offset: u64) -> bool {
+    let Some(subsections) = subsections else {
         return true;
     };
-    ranges.iter().any(|range| {
+    subsections.iter().any(|subsection| {
+        let range = &subsection.range;
         (range.start == range.end && input_offset == range.start)
             || (input_offset >= range.start && input_offset < range.end)
     })
 }
 
-fn input_range_is_live(ranges: Option<&[Range<u64>]>, input_range: Range<u64>) -> bool {
-    let Some(ranges) = ranges else {
+fn input_range_is_live(
+    subsections: Option<&[LiveSubsection]>,
+    input_range: Range<u64>,
+) -> bool {
+    let Some(subsections) = subsections else {
         return true;
     };
-    ranges.iter().any(|range| {
+    subsections.iter().any(|subsection| {
+        let range = &subsection.range;
         input_range.start >= range.start
             && input_range.end >= input_range.start
             && input_range.end <= range.end

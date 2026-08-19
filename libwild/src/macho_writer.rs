@@ -10,6 +10,7 @@ use crate::file_writer::SizedOutput;
 use crate::file_writer::split_buffers_by_alignment;
 use crate::file_writer::split_output_by_group;
 use crate::file_writer::split_output_into_sections;
+use crate::input_data::FileId;
 use crate::layout::EpilogueLayout;
 use crate::layout::FileLayout;
 use crate::layout::Layout;
@@ -53,6 +54,7 @@ use crate::macho::SymtabCommand;
 use crate::macho::UuidCommand;
 use crate::macho::code_signature_identifier;
 use crate::macho::code_signature_padded_identifier_size;
+use crate::macho::EhFrameFde;
 use crate::macho::eh_frame_augmentations;
 use crate::macho::get_segment_sections;
 use crate::macho::load_dylib_command_size;
@@ -60,6 +62,7 @@ use crate::macho::rpath_command_size;
 use crate::macho::output_section_id;
 use crate::macho::output_section_id::LOAD_COMMANDS;
 use crate::macho::part_id;
+use crate::macho::parse_eh_frame_records;
 use crate::output_section_id::OrderEvent;
 use crate::output_section_id::OutputSectionId;
 use crate::output_section_id::SectionName;
@@ -132,7 +135,6 @@ use rayon::slice::ParallelSlice;
 use sha2::Digest;
 use sha2::Sha256;
 use std::collections::BTreeMap;
-use std::collections::BTreeSet;
 use std::ops::BitAnd;
 use tracing::debug_span;
 use zerocopy::FromZeros;
@@ -180,12 +182,21 @@ pub(crate) fn write<'data, A: Arch<Platform = MachO>>(
     let mut section_buffers = split_output_into_sections(layout, &mut sized_output.out).0;
     write_plt_entries::<A>(layout, section_buffers.get_mut(output_section_id::PLT_GOT))?;
     write_merged_strings(layout, &mut section_buffers);
-    write_compact_unwind_info(layout, section_buffers.get_mut(output_section_id::UNWIND_INFO))?;
+    let eh_frame_plan = write_eh_frame(layout, section_buffers.get_mut(output_section_id::EH_FRAME))?;
+    write_compact_unwind_info(
+        layout,
+        section_buffers.get_mut(output_section_id::UNWIND_INFO),
+        &eh_frame_plan.fde_offsets,
+    )?;
     drop(section_buffers);
 
     // Plan before encoding: local relocations still contain their link-time target addresses.
     // The same plan drives both the starts table and the in-place chained pointer words.
-    let chained_fixups = chained_fixups(layout, &sized_output.out)?;
+    let chained_fixups = chained_fixups(
+        layout,
+        &sized_output.out,
+        &eh_frame_plan.personality_got_rebases,
+    )?;
     let mut section_buffers = split_output_into_sections(layout, &mut sized_output.out).0;
     write_chained_fixup_table(
         layout,
@@ -220,16 +231,564 @@ fn write_merged_strings(
     });
 }
 
+/// The source identity shared by one DWARF compact-unwind row and its matching input FDE.
+///
+/// Final function addresses are not unique while dead stripping/weak canonicalisation are in
+/// flight: two source objects can contribute metadata for the same selected implementation. A
+/// compact-unwind row may use either a local section relocation or an external symbol; reducing
+/// both forms to the defining source section and offset selects the exact FDE record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct EhFrameFdeIdentity {
+    file_id: FileId,
+    function_section_index: usize,
+    function_input_offset: u64,
+}
+
+/// Final `__TEXT,__eh_frame` FDE offsets, indexed by their input FDE identity.
+///
+/// ARM64 compact-unwind DWARF encodings reserve their low 24 bits for this section-relative FDE
+/// offset. The output table is rebuilt after atom GC, so retaining the input placeholder would
+/// direct libunwind to an unrelated record.
+type FinalEhFrameFdeOffsets = BTreeMap<EhFrameFdeIdentity, u32>;
+
+/// Final data shared by the two Mach-O unwind formats and the chained-fixup writer.
+///
+/// A `zPLR` CIE points indirectly through a local personality GOT cell. That cell has no live
+/// source storage once `__eh_frame` is rebuilt, so normal relocation scanning cannot discover
+/// the dyld rebase. Carry the exact, validated GOT-cell-to-code mapping from the one bounded
+/// producer that understands this metadata rather than treating every input metadata relocation
+/// as a live pointer.
+#[derive(Debug, Default)]
+struct FinalEhFramePlan {
+    fde_offsets: FinalEhFrameFdeOffsets,
+    personality_got_rebases: BTreeMap<u64, u64>,
+}
+
+/// Rebuild the final ARM64 `__TEXT,__eh_frame` table from live input CIE/FDE records.
+///
+/// Unlike ELF's section-relative relocation stream, Mach-O producers encode an FDE's pcrel
+/// function and LSDA fields as an `ARM64_RELOC_SUBTRACTOR`/`ARM64_RELOC_UNSIGNED` pair. The
+/// subtractor is the input field label, which ceases to be meaningful as soon as records from
+/// several objects are concatenated. Copying bytes (or applying the object relocation) would
+/// therefore leave a stale pcrel base. This writer owns the final fields explicitly: it selects
+/// FDEs whose function survives atom GC, emits just their CIEs, rewrites every backward CIE
+/// offset, and encodes final image addresses against their new field locations.
+fn write_eh_frame(
+    layout: &MachOLayout<'_>,
+    output: &mut [u8],
+) -> Result<FinalEhFramePlan> {
+    if output.is_empty() {
+        return Ok(FinalEhFramePlan::default());
+    }
+
+    timing_phase!("Write Mach-O eh_frame");
+    let section_address = layout.mem_address_of_built_in(output_section_id::EH_FRAME);
+    let mut serialized = Vec::new();
+    let mut plan = FinalEhFramePlan::default();
+
+    for group in &layout.group_layouts {
+        for file in &group.files {
+            let FileLayout::Object(object) = file else {
+                continue;
+            };
+            for (section_index, section) in object.object.enumerate_sections() {
+                if section.name() != b"__eh_frame" {
+                    continue;
+                }
+                let data = object.object.raw_section_data(section)?;
+                if data.is_empty() {
+                    continue;
+                }
+                let records = parse_eh_frame_records(data)?;
+                if records.fdes.is_empty() {
+                    continue;
+                }
+                let relocations = eh_frame_relocations(object, section_index)?;
+
+                // Keep an FDE only when the target function has an output resolution. This is
+                // the same live/dead distinction compact-unwind uses; a dead atom can leave an
+                // input FDE behind, but must not acquire a final unwind range.
+                let mut live_by_cie =
+                    BTreeMap::<usize, Vec<(&EhFrameFde, u64, EhFrameFdeIdentity)>>::new();
+                for fde in &records.fdes {
+                    let Some(function_address) = eh_frame_difference_target_address(
+                        object,
+                        &relocations,
+                        fde.function_relocation_offset,
+                        "function",
+                        false,
+                    )? else {
+                        continue;
+                    };
+                    let identity = eh_frame_fde_identity(
+                        object,
+                        &relocations,
+                        fde.function_relocation_offset,
+                    )?;
+                    live_by_cie
+                        .entry(fde.cie_record_start)
+                        .or_default()
+                        .push((fde, function_address, identity));
+                }
+
+                for (cie_start, fdes) in live_by_cie {
+                    let cie = records.cies.get(&cie_start).with_context(|| {
+                        format!(
+                            "Mach-O __eh_frame FDE references missing CIE at offset 0x{cie_start:x} in {}",
+                            object.input
+                        )
+                    })?;
+                    let output_cie_start = serialized.len();
+                    serialized.extend_from_slice(&data[cie.record_range.clone()]);
+
+                    if let Some(personality_offset) = cie.personality_relocation_offset {
+                        let personality = eh_frame_personality_got_address(
+                            layout,
+                            object,
+                            &relocations,
+                            personality_offset,
+                        )?;
+                        if let Some(rebase) = personality.local_got_rebase {
+                            insert_local_got_rebase(
+                                &mut plan.personality_got_rebases,
+                                rebase,
+                                "Mach-O __eh_frame personality",
+                            )?;
+                        }
+                        let output_field_offset = output_cie_start
+                            .checked_add(personality_offset - cie.record_range.start)
+                            .context("Mach-O __eh_frame personality output offset overflows")?;
+                        write_eh_frame_pcrel_i32(
+                            &mut serialized,
+                            output_field_offset,
+                            section_address,
+                            personality.got_address,
+                            "personality GOT slot",
+                        )?;
+                    }
+
+                    for (fde, function_address, identity) in fdes {
+                        let output_fde_start = serialized.len();
+                        let output_fde_offset = u32::try_from(output_fde_start)
+                            .context("Mach-O __eh_frame FDE offset exceeds u32")?;
+                        ensure!(
+                            output_fde_offset <= ARM64_UNWIND_DWARF_FDE_OFFSET_MASK,
+                            "Mach-O __eh_frame FDE offset 0x{output_fde_offset:x} exceeds the 24-bit ARM64 compact-unwind DWARF field"
+                        );
+                        ensure!(
+                            plan.fde_offsets
+                                .insert(identity, output_fde_offset)
+                                .is_none(),
+                            "ambiguous Mach-O __eh_frame FDEs for input function section {} offset 0x{:x} in file {:?}",
+                            identity.function_section_index,
+                            identity.function_input_offset,
+                            identity.file_id
+                        );
+                        serialized.extend_from_slice(&data[fde.record_range.clone()]);
+                        let cie_pointer = output_fde_start
+                            .checked_add(size_of::<u32>())
+                            .and_then(|address_after_pointer| {
+                                address_after_pointer.checked_sub(output_cie_start)
+                            })
+                            .context("Mach-O __eh_frame CIE pointer underflows")?;
+                        let cie_pointer = u32::try_from(cie_pointer)
+                            .context("Mach-O __eh_frame CIE pointer exceeds DWARF32")?;
+                        write_eh_frame_u32(
+                            &mut serialized,
+                            output_fde_start + size_of::<u32>(),
+                            cie_pointer,
+                            "CIE pointer",
+                        )?;
+
+                        let function_field_offset = output_fde_start
+                            .checked_add(
+                                fde.function_relocation_offset - fde.record_range.start,
+                            )
+                            .context("Mach-O __eh_frame function output offset overflows")?;
+                        write_eh_frame_pcrel_i64(
+                            &mut serialized,
+                            function_field_offset,
+                            section_address,
+                            function_address,
+                            "function",
+                        )?;
+
+                        if let Some(lsda_relocation_offset) = fde.lsda_relocation_offset {
+                            let lsda_address = eh_frame_difference_target_address(
+                                object,
+                                &relocations,
+                                lsda_relocation_offset,
+                                "LSDA",
+                                true,
+                            )?
+                            .expect("required __eh_frame LSDA target");
+                            let output_field_offset = output_fde_start
+                                .checked_add(lsda_relocation_offset - fde.record_range.start)
+                                .context("Mach-O __eh_frame LSDA output offset overflows")?;
+                            write_eh_frame_pcrel_i64(
+                                &mut serialized,
+                                output_field_offset,
+                                section_address,
+                                lsda_address,
+                                "LSDA",
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // One final terminator is required by libunwind. Remaining over-allocation stays zeroed, but
+    // this explicit record means even a table with no surviving FDE has a well-formed end marker.
+    serialized.extend_from_slice(&0u32.to_le_bytes());
+    ensure!(
+        serialized.len() <= output.len(),
+        "allocated {} bytes for Mach-O __eh_frame but need {}",
+        output.len(),
+        serialized.len()
+    );
+    output.fill(0);
+    output[..serialized.len()].copy_from_slice(&serialized);
+    Ok(plan)
+}
+
+/// Preserve every relocation at an offset. Pointer fields have an exact required shape below;
+/// retaining rather than pre-filtering records makes an unsupported producer form a diagnostic
+/// instead of accidentally looking like an unreferenced field.
+fn eh_frame_relocations(
+    object: &ObjectLayout<'_, MachO>,
+    section_index: object::SectionIndex,
+) -> Result<BTreeMap<usize, Vec<RelocationInfo>>> {
+    let mut relocations = BTreeMap::<usize, Vec<RelocationInfo>>::new();
+    for relocation in object.relocations(section_index)?.relocations {
+        let info = relocation.info(LE);
+        let offset = usize::try_from(info.r_address)
+            .context("Mach-O __eh_frame relocation offset overflowed usize")?;
+        relocations.entry(offset).or_default().push(info);
+    }
+    Ok(relocations)
+}
+
+/// The input `UNSIGNED` relocation names the FDE's function. Pair it with the source file so
+/// weak/canonicalised functions that share a final address cannot select each other's records.
+fn eh_frame_fde_identity(
+    object: &ObjectLayout<'_, MachO>,
+    relocations: &BTreeMap<usize, Vec<RelocationInfo>>,
+    function_relocation_offset: usize,
+) -> Result<EhFrameFdeIdentity> {
+    let fields = relocations.get(&function_relocation_offset).with_context(|| {
+        format!(
+            "missing Mach-O __eh_frame function relocation at offset 0x{function_relocation_offset:x} in {}",
+            object.input
+        )
+    })?;
+    let unsigned = fields
+        .iter()
+        .find(|info| info.r_type == macho::ARM64_RELOC_UNSIGNED)
+        .with_context(|| {
+            format!(
+                "missing ARM64_RELOC_UNSIGNED in Mach-O __eh_frame function relocation at offset 0x{function_relocation_offset:x} in {}",
+                object.input
+            )
+        })?;
+    ensure!(
+        unsigned.r_extern,
+        "unsupported local Mach-O __eh_frame function relocation at offset 0x{function_relocation_offset:x} in {}",
+        object.input
+    );
+    eh_frame_fde_identity_for_symbol(object, SymbolIndex(unsigned.r_symbolnum as usize), 0)
+}
+
+fn eh_frame_fde_identity_for_symbol(
+    object: &ObjectLayout<'_, MachO>,
+    symbol_index: SymbolIndex,
+    addend: u64,
+) -> Result<EhFrameFdeIdentity> {
+    let symbol = object.object.symbol(symbol_index)?;
+    let section_index = object
+        .object
+        .symbol_section(symbol, symbol_index)?
+        .with_context(|| {
+            format!(
+                "Mach-O DWARF compact-unwind function symbol {} in {} is not section-defined",
+                symbol_index.0, object.input
+            )
+        })?;
+    let function_input_offset = object
+        .object
+        .symbol_offset_in_section(symbol, section_index)?
+        .checked_add(addend)
+        .context("Mach-O DWARF compact-unwind function input offset overflows")?;
+    Ok(EhFrameFdeIdentity {
+        file_id: object.file_id,
+        function_section_index: section_index.0,
+        function_input_offset,
+    })
+}
+
+/// Resolve one `SUBTRACTOR`/`UNSIGNED` field to the unsigned target's final address. The other
+/// relocation names the old input field label; the serializer deliberately substitutes the new
+/// output field as the pcrel base instead of trying to preserve that stale symbol.
+fn eh_frame_difference_target_address(
+    object: &ObjectLayout<'_, MachO>,
+    relocations: &BTreeMap<usize, Vec<RelocationInfo>>,
+    offset: usize,
+    field_name: &str,
+    required: bool,
+) -> Result<Option<u64>> {
+    let fields = relocations.get(&offset).with_context(|| {
+        format!(
+            "missing Mach-O __eh_frame {field_name} relocation at offset 0x{offset:x} in {}",
+            object.input
+        )
+    })?;
+    ensure!(
+        fields.len() == 2,
+        "unsupported Mach-O __eh_frame {field_name} relocation sequence at offset 0x{offset:x} in {}: expected one ARM64_RELOC_SUBTRACTOR and one ARM64_RELOC_UNSIGNED",
+        object.input
+    );
+    let subtractor = fields
+        .iter()
+        .find(|info| info.r_type == macho::ARM64_RELOC_SUBTRACTOR)
+        .with_context(|| {
+            format!(
+                "unsupported Mach-O __eh_frame {field_name} relocation sequence at offset 0x{offset:x} in {}: missing ARM64_RELOC_SUBTRACTOR",
+                object.input
+            )
+        })?;
+    let unsigned = fields
+        .iter()
+        .find(|info| info.r_type == macho::ARM64_RELOC_UNSIGNED)
+        .with_context(|| {
+            format!(
+                "unsupported Mach-O __eh_frame {field_name} relocation sequence at offset 0x{offset:x} in {}: missing ARM64_RELOC_UNSIGNED",
+                object.input
+            )
+        })?;
+    ensure!(
+        subtractor.r_extern
+            && unsigned.r_extern
+            && !subtractor.r_pcrel
+            && !unsigned.r_pcrel
+            && subtractor.r_length == 3
+            && unsigned.r_length == 3,
+        "unsupported Mach-O __eh_frame {field_name} relocation at offset 0x{offset:x} in {}: expected external non-pcrel 64-bit SUBTRACTOR/UNSIGNED pair",
+        object.input
+    );
+
+    let symbol_index = SymbolIndex(unsigned.r_symbolnum as usize);
+    let address = eh_frame_input_symbol_address(object, symbol_index, field_name)?;
+    if required {
+        return address.with_context(|| {
+            format!(
+                "Mach-O __eh_frame {field_name} symbol at input index {} is dead or has no output address in {}",
+                symbol_index.0,
+                object.input
+            )
+        })
+        .map(Some);
+    }
+    Ok(address)
+}
+
+/// Return an FDE pointer target only if its *input* definition survived into this object’s final
+/// section. `merged_symbol_resolution` is deliberately not suitable here: it follows the
+/// canonical definition and can have an address after this object's atom was dead-stripped.
+/// An FDE describes that input atom, so its `ARM64_RELOC_UNSIGNED` symbol must map through this
+/// object's section and `output_offset_for_input` before its CIE may be retained.
+fn eh_frame_input_symbol_address(
+    object: &ObjectLayout<'_, MachO>,
+    symbol_index: SymbolIndex,
+    field_name: &str,
+) -> Result<Option<u64>> {
+    let symbol = object.object.symbol(symbol_index)?;
+    let section_index = object
+        .object
+        .symbol_section(symbol, symbol_index)?
+        .with_context(|| {
+            format!(
+                "Mach-O __eh_frame {field_name} relocation at input symbol index {} in {} does not name a section-defined symbol",
+                symbol_index.0,
+                object.input
+            )
+        })?;
+    let input_offset = object
+        .object
+        .symbol_offset_in_section(symbol, section_index)?;
+    let Some(section_address) = object
+        .section_resolutions
+        .get(section_index.0)
+        .and_then(|resolution| resolution.address())
+    else {
+        return Ok(None);
+    };
+    let Some(output_offset) = object.output_offset_for_input(section_index, input_offset) else {
+        return Ok(None);
+    };
+    section_address
+        .checked_add(output_offset)
+        .map(Some)
+        .context("Mach-O __eh_frame target output address overflows")
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EhFramePersonalityGot {
+    got_address: u64,
+    local_got_rebase: Option<ChainedFixup>,
+}
+
+fn eh_frame_personality_got_address(
+    layout: &MachOLayout<'_>,
+    object: &ObjectLayout<'_, MachO>,
+    relocations: &BTreeMap<usize, Vec<RelocationInfo>>,
+    offset: usize,
+) -> Result<EhFramePersonalityGot> {
+    let fields = relocations.get(&offset).with_context(|| {
+        format!(
+            "missing Mach-O __eh_frame personality relocation at offset 0x{offset:x} in {}",
+            object.input
+        )
+    })?;
+    ensure!(
+        fields.len() == 1,
+        "unsupported Mach-O __eh_frame personality relocation sequence at offset 0x{offset:x} in {}",
+        object.input
+    );
+    let relocation = fields[0];
+    ensure!(
+        relocation.r_type == macho::ARM64_RELOC_POINTER_TO_GOT
+            && relocation.r_extern
+            && relocation.r_pcrel
+            && relocation.r_length == 2,
+        "unsupported Mach-O __eh_frame personality relocation in {}: expected external ARM64_RELOC_POINTER_TO_GOT, r_pcrel=1, r_length=2",
+        object.input
+    );
+    let symbol_id = object
+        .symbol_id_range
+        .input_to_id(SymbolIndex(relocation.r_symbolnum as usize));
+    let got_address = layout
+        .merged_symbol_resolution(symbol_id)
+        .with_context(|| {
+            format!(
+                "unresolved Mach-O __eh_frame personality symbol {} in {}",
+                layout.symbol_debug(symbol_id),
+                object.input
+            )
+        })?
+        .format_specific
+        .got_address
+        .map(|address| address.get())
+        .with_context(|| {
+            format!(
+                "missing GOT slot for Mach-O __eh_frame personality symbol {} in {}",
+                layout.symbol_debug(symbol_id),
+                object.input
+            )
+        })?;
+    Ok(EhFramePersonalityGot {
+        got_address,
+        local_got_rebase: local_got_rebase_for_symbol(layout, symbol_id)?,
+    })
+}
+
+fn write_eh_frame_u32(
+    data: &mut [u8],
+    offset: usize,
+    value: u32,
+    field_name: &str,
+) -> Result {
+    let field = data
+        .get_mut(offset..offset + size_of::<u32>())
+        .with_context(|| format!("truncated output Mach-O __eh_frame {field_name}"))?;
+    field.copy_from_slice(&value.to_le_bytes());
+    Ok(())
+}
+
+fn write_eh_frame_pcrel_i32(
+    data: &mut [u8],
+    offset: usize,
+    section_address: u64,
+    target: u64,
+    field_name: &str,
+) -> Result {
+    let field_address = section_address
+        .checked_add(offset as u64)
+        .context("Mach-O __eh_frame field address overflows")?;
+    let delta = i128::from(target) - i128::from(field_address);
+    let delta = i32::try_from(delta)
+        .with_context(|| format!("Mach-O __eh_frame {field_name} is more than 2GiB away"))?;
+    write_eh_frame_u32(data, offset, delta as u32, field_name)
+}
+
+fn write_eh_frame_pcrel_i64(
+    data: &mut [u8],
+    offset: usize,
+    section_address: u64,
+    target: u64,
+    field_name: &str,
+) -> Result {
+    let field_address = section_address
+        .checked_add(offset as u64)
+        .context("Mach-O __eh_frame field address overflows")?;
+    let delta = i128::from(target) - i128::from(field_address);
+    let delta = i64::try_from(delta)
+        .with_context(|| format!("Mach-O __eh_frame {field_name} pcrel value overflows i64"))?;
+    let field = data
+        .get_mut(offset..offset + size_of::<u64>())
+        .with_context(|| format!("truncated output Mach-O __eh_frame {field_name}"))?;
+    field.copy_from_slice(&delta.to_le_bytes());
+    Ok(())
+}
+
 /// A compact-unwind record after its object-file relocations have been resolved to final image
 /// addresses. The final Mach-O table stores all of these addresses as 32-bit offsets from the
 /// image base, so retaining the full addresses here makes range validation straightforward.
+const ARM64_UNWIND_MODE_MASK: u32 = 0x0f00_0000;
+const ARM64_UNWIND_MODE_DWARF: u32 = 0x0300_0000;
+const ARM64_UNWIND_DWARF_FDE_OFFSET_MASK: u32 = 0x00ff_ffff;
+const COMPACT_UNWIND_HAS_LSDA: u32 = 0x4000_0000;
+
 #[derive(Debug)]
 struct CompactUnwindEntry {
     function_address: u64,
     function_length: u32,
     encoding: u32,
+    eh_frame_fde_identity: Option<EhFrameFdeIdentity>,
     personality_address: Option<u64>,
     lsda_address: Option<u64>,
+}
+
+/// Replace the object-file placeholder in every DWARF compact-unwind row with the FDE's final
+/// offset in the rebuilt `__TEXT,__eh_frame`. Keep the personality and mode bits intact: in
+/// particular, 0x53000000 becomes 0x53000000 | fde_offset rather than a plain 0x03000000 row.
+fn rewrite_arm64_dwarf_fde_offsets(
+    entries: &mut [CompactUnwindEntry],
+    fde_offsets: &FinalEhFrameFdeOffsets,
+) -> Result {
+    for entry in entries {
+        if entry.encoding & ARM64_UNWIND_MODE_MASK != ARM64_UNWIND_MODE_DWARF {
+            continue;
+        }
+        let identity = entry.eh_frame_fde_identity.with_context(|| {
+            format!(
+                "missing input Mach-O __eh_frame FDE identity for DWARF compact-unwind function at 0x{:x}",
+                entry.function_address
+            )
+        })?;
+        let fde_offset = fde_offsets.get(&identity).with_context(|| {
+            format!(
+                "missing final Mach-O __eh_frame FDE for DWARF compact-unwind function at 0x{:x}",
+                entry.function_address
+            )
+        })?;
+        ensure!(
+            *fde_offset <= ARM64_UNWIND_DWARF_FDE_OFFSET_MASK,
+            "Mach-O __eh_frame FDE offset 0x{fde_offset:x} exceeds the 24-bit ARM64 compact-unwind DWARF field"
+        );
+        entry.encoding = (entry.encoding & !ARM64_UNWIND_DWARF_FDE_OFFSET_MASK) | *fde_offset;
+    }
+    Ok(())
 }
 
 /// Synthesize `__TEXT,__unwind_info` from object-file `__LD,__compact_unwind` records.
@@ -239,7 +798,11 @@ struct CompactUnwindEntry {
 /// table. We always emit the regular page form (kind 2). It is larger than the compressed form
 /// but has no artificial encoding-count or function-offset limit and is the format's specified
 /// lossless fallback.
-fn write_compact_unwind_info(layout: &MachOLayout<'_>, output: &mut [u8]) -> Result {
+fn write_compact_unwind_info(
+    layout: &MachOLayout<'_>,
+    output: &mut [u8],
+    eh_frame_fde_offsets: &FinalEhFrameFdeOffsets,
+) -> Result {
     if output.is_empty() {
         return Ok(());
     }
@@ -266,16 +829,7 @@ fn write_compact_unwind_info(layout: &MachOLayout<'_>, output: &mut [u8]) -> Res
     }
 
     entries.sort_by_key(|entry| entry.function_address);
-    // ARM64's DWARF mode delegates actual frame recovery to a final `__TEXT,__eh_frame` table.
-    // Wild does not yet serialize that relocation-rich table, so emitting an apparently complete
-    // `__unwind_info` would turn a deterministic link-time limitation into a process-time abort.
-    // Frame and frameless compact encodings remain self-contained and are supported below.
-    const ARM64_UNWIND_MODE_MASK: u32 = 0x0f00_0000;
-    const ARM64_UNWIND_MODE_DWARF: u32 = 0x0300_0000;
-    ensure!(
-        entries.iter().all(|entry| entry.encoding & ARM64_UNWIND_MODE_MASK != ARM64_UNWIND_MODE_DWARF),
-        "ARM64 compact unwind DWARF mode requires final __TEXT,__eh_frame serialization, which Wild does not yet implement"
-    );
+    rewrite_arm64_dwarf_fde_offsets(&mut entries, eh_frame_fde_offsets)?;
     for adjacent in entries.windows(2) {
         let previous_end = adjacent[0]
             .function_address
@@ -369,12 +923,13 @@ fn read_compact_unwind_entries(
         let personality_addend = compact_unwind_u64(data, record_offset + 16)?;
         let lsda_addend = compact_unwind_u64(data, record_offset + 24)?;
 
+        let function_relocation = *relocations.get(&record_offset).context(
+            "__compact_unwind function has no relocation",
+        )?;
         let Some(function_address) = compact_unwind_function_address(
             layout,
             object,
-            *relocations.get(&record_offset).context(
-                "__compact_unwind function has no relocation",
-            )?,
+            function_relocation,
             function_addend,
             function_length,
         )?
@@ -383,6 +938,12 @@ fn read_compact_unwind_entries(
             // LSDA must disappear with it rather than retaining an invalid input address.
             continue;
         };
+        let eh_frame_fde_identity =
+            (encoding & ARM64_UNWIND_MODE_MASK == ARM64_UNWIND_MODE_DWARF)
+                .then(|| {
+                    compact_unwind_dwarf_fde_identity(object, function_relocation, function_addend)
+                })
+                .transpose()?;
 
         let personality_address = compact_unwind_optional_target_address(
             layout,
@@ -403,6 +964,7 @@ fn read_compact_unwind_entries(
             function_address,
             function_length,
             encoding,
+            eh_frame_fde_identity,
             personality_address,
             lsda_address,
         });
@@ -603,6 +1165,37 @@ fn compact_unwind_function_address(
     compact_unwind_target_address(layout, object, relocation, addend)
 }
 
+/// Reduce either Mach-O compact-unwind function-relocation form to the defining input location
+/// that its FDE's unsigned relocation also names.
+fn compact_unwind_dwarf_fde_identity(
+    object: &ObjectLayout<'_, MachO>,
+    relocation: RelocationInfo,
+    addend: u64,
+) -> Result<EhFrameFdeIdentity> {
+    if relocation.r_extern {
+        return eh_frame_fde_identity_for_symbol(
+            object,
+            SymbolIndex(relocation.r_symbolnum as usize),
+            addend,
+        );
+    }
+
+    let section_ordinal = usize::try_from(relocation.r_symbolnum)
+        .context("DWARF compact-unwind function section ordinal overflowed usize")?;
+    let function_section_index = section_ordinal
+        .checked_sub(1)
+        .context("DWARF compact-unwind function relocation has section ordinal zero")?;
+    let section = object.object.section(object::SectionIndex(function_section_index))?;
+    let function_input_offset = addend
+        .checked_sub(section.addr.get(LE))
+        .context("DWARF compact-unwind function target precedes its input section")?;
+    Ok(EhFrameFdeIdentity {
+        file_id: object.file_id,
+        function_section_index,
+        function_input_offset,
+    })
+}
+
 fn compact_unwind_u32(data: &[u8], offset: usize) -> Result<u32> {
     let bytes = data
         .get(offset..offset + size_of::<u32>())
@@ -776,7 +1369,15 @@ fn serialize_compact_unwind_info(
             u16::try_from(page.len()).context("too many entries in compact-unwind page")?,
         );
         for entry in *page {
-            let mut encoding = entry.encoding & !PERSONALITY_MASK;
+            // The LSDA table is authoritative in the final representation. Object producers
+            // such as rustc leave the compact-unwind LSDA word empty and describe it only in
+            // the paired zPLR FDE, so `merge_eh_frame_augmentations` may have supplied it after
+            // reading the input encoding. Keep the generic bit and the descriptor together:
+            // libunwind only follows the LSDA table for rows with `UNWIND_HAS_LSDA` set.
+            let mut encoding = entry.encoding & !(PERSONALITY_MASK | COMPACT_UNWIND_HAS_LSDA);
+            if entry.lsda_address.is_some() {
+                encoding |= COMPACT_UNWIND_HAS_LSDA;
+            }
             if let Some(personality) = entry.personality_address {
                 let index = personalities
                     .iter()
@@ -1335,9 +1936,77 @@ fn local_rebase_fixups(
 /// slide the locally defined target rather than resolve an import. The old writer only populated
 /// `format_specific.imported_symbols`, leaving these slots as zero. Rust's test formatter reaches
 /// local trait-format functions through this path.
-fn local_got_rebase_fixups(layout: &MachOLayout<'_>) -> Result<Vec<ChainedFixup>> {
-    let mut fixups = Vec::new();
-    let mut seen_got_addresses = BTreeSet::new();
+fn local_got_rebase_for_symbol(
+    layout: &MachOLayout<'_>,
+    local_symbol_id: SymbolId,
+) -> Result<Option<ChainedFixup>> {
+    let symbol_id = layout.symbol_db.definition(local_symbol_id);
+    let FileLayout::Object(definition) = layout
+        .file_layout(layout.symbol_db.file_id_for_symbol(symbol_id))
+    else {
+        // Dynamic symbols use `ImportedSymbolWithResolution` and become binds.
+        return Ok(None);
+    };
+
+    let symbol_index = definition.symbol_id_range.id_to_input(symbol_id);
+    let symbol = definition.object.symbol(symbol_index)?;
+    let section_index = definition
+        .object
+        .symbol_section(symbol, symbol_index)?
+        .context("local Mach-O GOT target is not section-defined")?;
+    let section_address = definition.section_resolutions[section_index.0]
+        .address()
+        .context("local Mach-O GOT target section has no output address")?;
+    let target = section_address
+        .checked_add(
+            definition
+                .output_offset_for_input(
+                    section_index,
+                    definition
+                        .object
+                        .symbol_offset_in_section(symbol, section_index)?,
+                )
+                .context("local Mach-O GOT target is in a dead atom")?,
+        )
+        .context("local Mach-O GOT target address overflows")?;
+    let got_address = layout
+        .symbol_resolutions
+        .get(symbol_id)
+        .and_then(|resolution| resolution.format_specific.got_address)
+        .context("local Mach-O GOT relocation has no allocated GOT slot")?
+        .get();
+
+    Ok(Some(ChainedFixup {
+        address: got_address,
+        kind: ChainedFixupKind::Rebase { target },
+    }))
+}
+
+fn insert_local_got_rebase(
+    rebases: &mut BTreeMap<u64, u64>,
+    fixup: ChainedFixup,
+    source: &str,
+) -> Result {
+    let ChainedFixupKind::Rebase { target } = fixup.kind else {
+        bail!("{source} produced a non-rebase local GOT fixup");
+    };
+    if let Some(&previous) = rebases.get(&fixup.address) {
+        ensure!(
+            previous == target,
+            "conflicting local Mach-O GOT rebases at 0x{:x}: {source} targets 0x{target:x}, previous target is 0x{previous:x}",
+            fixup.address
+        );
+    } else {
+        rebases.insert(fixup.address, target);
+    }
+    Ok(())
+}
+
+fn local_got_rebase_fixups(
+    layout: &MachOLayout<'_>,
+    eh_frame_personality_rebases: &BTreeMap<u64, u64>,
+) -> Result<Vec<ChainedFixup>> {
+    let mut rebases = eh_frame_personality_rebases.clone();
 
     for group in &layout.group_layouts {
         for file in &group.files {
@@ -1371,57 +2040,28 @@ fn local_got_rebase_fixups(layout: &MachOLayout<'_>) -> Result<Vec<ChainedFixup>
                     }
 
                     let (_, _, local_symbol_id) = get_resolution(info, object, layout)?;
-                    let symbol_id = layout.symbol_db.definition(local_symbol_id);
-                    let FileLayout::Object(definition) = layout
-                        .file_layout(layout.symbol_db.file_id_for_symbol(symbol_id))
-                    else {
-                        // Dynamic symbols use `ImportedSymbolWithResolution` and become binds.
-                        continue;
-                    };
-
-                    let symbol_index = definition.symbol_id_range.id_to_input(symbol_id);
-                    let symbol = definition.object.symbol(symbol_index)?;
-                    let section_index = definition
-                        .object
-                        .symbol_section(symbol, symbol_index)?
-                        .context("local Mach-O GOT target is not section-defined")?;
-                    let section_address = definition.section_resolutions[section_index.0]
-                        .address()
-                        .context("local Mach-O GOT target section has no output address")?;
-                    let target = section_address
-                        .checked_add(
-                            definition
-                                .output_offset_for_input(
-                                    section_index,
-                                    definition
-                                        .object
-                                        .symbol_offset_in_section(symbol, section_index)?,
-                                )
-                                .context("local Mach-O GOT target is in a dead atom")?,
-                        )
-                        .context("local Mach-O GOT target address overflows")?;
-                    let got_address = layout
-                        .symbol_resolutions
-                        .get(symbol_id)
-                        .and_then(|resolution| resolution.format_specific.got_address)
-                        .context("local Mach-O GOT relocation has no allocated GOT slot")?
-                        .get();
-
-                    if seen_got_addresses.insert(got_address) {
-                        fixups.push(ChainedFixup {
-                            address: got_address,
-                            kind: ChainedFixupKind::Rebase { target },
-                        });
+                    if let Some(fixup) = local_got_rebase_for_symbol(layout, local_symbol_id)? {
+                        insert_local_got_rebase(&mut rebases, fixup, "Mach-O source relocation")?;
                     }
                 }
             }
         }
     }
 
-    Ok(fixups)
+    Ok(rebases
+        .into_iter()
+        .map(|(address, target)| ChainedFixup {
+            address,
+            kind: ChainedFixupKind::Rebase { target },
+        })
+        .collect())
 }
 
-fn chained_fixups(layout: &MachOLayout<'_>, output: &[u8]) -> Result<ChainedFixups> {
+fn chained_fixups(
+    layout: &MachOLayout<'_>,
+    output: &[u8],
+    eh_frame_personality_rebases: &BTreeMap<u64, u64>,
+) -> Result<ChainedFixups> {
     let symbols = &layout.format_specific.imported_symbols;
     let got_layout = layout.section_layouts.get(output_section_id::GOT);
     let mut fixups_by_segment = (0..layout.segment_layouts.segments.len())
@@ -1449,7 +2089,7 @@ fn chained_fixups(layout: &MachOLayout<'_>, output: &[u8]) -> Result<ChainedFixu
         fixups_by_segment[segment_index].push(fixup);
     }
 
-    for fixup in local_got_rebase_fixups(layout)? {
+    for fixup in local_got_rebase_fixups(layout, eh_frame_personality_rebases)? {
         let (segment_index, _) = segment_for_address(layout, fixup.address, GOT_ENTRY_SIZE)?;
         fixups_by_segment[segment_index].push(fixup);
     }
@@ -2130,12 +2770,19 @@ fn write_section_raw<'out, 'data>(
 
         if let Some(ranges) = object.live_input_ranges(section_index) {
             let input = object.object.raw_section_data(object_section)?;
-            let mut output_offset = 0usize;
-            for range in ranges {
+            let mut copied_end = 0usize;
+            for subsection in ranges {
+                let range = &subsection.range;
                 let input_start = usize::try_from(range.start)
                     .context("Mach-O subsection start does not fit usize")?;
                 let input_end = usize::try_from(range.end)
                     .context("Mach-O subsection end does not fit usize")?;
+                let output_offset = usize::try_from(
+                    object
+                        .output_offset_for_input(section_index, range.start)
+                        .context("live Mach-O subsection has no compacted output offset")?,
+                )
+                .context("Mach-O subsection output offset does not fit usize")?;
                 let span_size = input_end
                     .checked_sub(input_start)
                     .context("Mach-O subsection has an invalid range")?;
@@ -2147,21 +2794,27 @@ fn write_section_raw<'out, 'data>(
                     "Mach-O subsection copy exceeds its allocated output section"
                 );
 
+                ensure!(
+                    copied_end <= output_offset,
+                    "Mach-O subsection compacted output order is invalid"
+                );
+                out[copied_end..output_offset].fill(0);
+
                 // Zero-fill sections have no backing file data. For a partially backed section,
                 // copy the available prefix and explicitly initialise the rest rather than
                 // relying on an output-file implementation's initial contents.
-                let copied_end = input_end.min(input.len());
-                if input_start < copied_end {
-                    out[output_offset..output_offset + copied_end - input_start]
-                        .copy_from_slice(&input[input_start..copied_end]);
+                let input_copied_end = input_end.min(input.len());
+                if input_start < input_copied_end {
+                    out[output_offset..output_offset + input_copied_end - input_start]
+                        .copy_from_slice(&input[input_start..input_copied_end]);
                 }
-                if copied_end < input_end {
-                    out[output_offset + copied_end - input_start..output_end].fill(0);
+                if input_copied_end < input_end {
+                    out[output_offset + input_copied_end - input_start..output_end].fill(0);
                 }
-                output_offset = output_end;
+                copied_end = output_end;
             }
             ensure!(
-                output_offset == out.len(),
+                copied_end == out.len(),
                 "Mach-O live-subsection sizes do not match section allocation"
             );
         } else {
@@ -2964,12 +3617,42 @@ mod tests {
     }
 
     #[test]
+    fn eh_frame_personality_got_rebases_deduplicate_and_reject_conflicts() {
+        let got = MACHO_START_MEM_ADDRESS + 0x6000;
+        let target = MACHO_START_MEM_ADDRESS + 0x1200;
+        let mut rebases = BTreeMap::new();
+        let rebase = ChainedFixup {
+            address: got,
+            kind: ChainedFixupKind::Rebase { target },
+        };
+
+        insert_local_got_rebase(&mut rebases, rebase, "first CIE").unwrap();
+        insert_local_got_rebase(&mut rebases, rebase, "second CIE").unwrap();
+        assert_eq!(rebases, BTreeMap::from([(got, target)]));
+
+        let error = insert_local_got_rebase(
+            &mut rebases,
+            ChainedFixup {
+                address: got,
+                kind: ChainedFixupKind::Rebase {
+                    target: target + 4,
+                },
+            },
+            "conflicting CIE",
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("conflicting local Mach-O GOT rebases"));
+        assert_eq!(rebases, BTreeMap::from([(got, target)]));
+    }
+
+    #[test]
     fn compact_unwind_regular_page_preserves_personality_and_lsda() {
         let entries = [
             CompactUnwindEntry {
                 function_address: MACHO_START_MEM_ADDRESS + 0x100,
                 function_length: 0x20,
                 encoding: 0x4400_0000,
+                eh_frame_fde_identity: None,
                 personality_address: Some(MACHO_START_MEM_ADDRESS + 0x4000),
                 lsda_address: Some(MACHO_START_MEM_ADDRESS + 0x300),
             },
@@ -2977,6 +3660,7 @@ mod tests {
                 function_address: MACHO_START_MEM_ADDRESS + 0x200,
                 function_length: 0x10,
                 encoding: 0x0400_0000,
+                eh_frame_fde_identity: None,
                 personality_address: None,
                 lsda_address: None,
             },
@@ -3014,5 +3698,92 @@ mod tests {
         assert_eq!(word(76), 0x5400_0000);
         assert_eq!(word(80), 0x200);
         assert_eq!(word(84), 0x0400_0000);
+    }
+
+    #[test]
+    fn arm64_dwarf_compact_unwind_rows_use_final_eh_frame_fde_offsets() {
+        let function_address = MACHO_START_MEM_ADDRESS + 0x1234;
+        let mut entries = [CompactUnwindEntry {
+            function_address,
+            function_length: 0x20,
+            // Preserve the personality and DWARF mode bits while replacing the object placeholder.
+            encoding: 0x5300_0000,
+            eh_frame_fde_identity: Some(EhFrameFdeIdentity {
+                file_id: FileId::new(0, 1),
+                function_section_index: 1,
+                function_input_offset: 0x1234,
+            }),
+            personality_address: Some(MACHO_START_MEM_ADDRESS + 0x4000),
+            lsda_address: Some(MACHO_START_MEM_ADDRESS + 0x8000),
+        }];
+        let fde_offsets = BTreeMap::from([(
+            EhFrameFdeIdentity {
+                file_id: FileId::new(0, 1),
+                function_section_index: 1,
+                function_input_offset: 0x1234,
+            },
+            0x2dc,
+        )]);
+
+        rewrite_arm64_dwarf_fde_offsets(&mut entries, &fde_offsets).unwrap();
+
+        assert_eq!(entries[0].encoding, 0x5300_02dc);
+    }
+
+    #[test]
+    fn compact_unwind_marks_dwarf_row_with_merged_lsda() {
+        // Rust's input compact-unwind row has no LSDA bit: its `zPLR` FDE supplies the LSDA
+        // during final-link synthesis. The final regular-page row must advertise the descriptor
+        // we emitted or libunwind will skip its personality handler.
+        let entries = [CompactUnwindEntry {
+            function_address: MACHO_START_MEM_ADDRESS + 0x100,
+            function_length: 0x20,
+            encoding: ARM64_UNWIND_MODE_DWARF | 0x2dc,
+            eh_frame_fde_identity: None,
+            personality_address: Some(MACHO_START_MEM_ADDRESS + 0x4000),
+            lsda_address: Some(MACHO_START_MEM_ADDRESS + 0x300),
+        }];
+
+        let data = serialize_compact_unwind_info(
+            &entries,
+            &[MACHO_START_MEM_ADDRESS + 0x4000],
+        )
+        .unwrap();
+        let word = |offset| u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+
+        assert_eq!(word(56), 0x100);
+        assert_eq!(word(60), 0x300);
+        assert_eq!(word(76), 0x5300_02dc);
+    }
+
+    #[test]
+    fn eh_frame_pointer_fields_are_rebased_against_their_final_locations() {
+        let section_address = MACHO_START_MEM_ADDRESS + 0x4000;
+        let mut data = [0u8; 24];
+
+        // An FDE moved 0x20 bytes after its CIE has a backward CIE reference from the word
+        // immediately following its length field. Its function/LSDA fields are pcrel from their
+        // final storage, not from the input object's discarded `ltmp` labels.
+        write_eh_frame_u32(&mut data, 4, 0x24, "CIE pointer").unwrap();
+        write_eh_frame_pcrel_i64(
+            &mut data,
+            8,
+            section_address,
+            section_address + 0x180,
+            "function",
+        )
+        .unwrap();
+        write_eh_frame_pcrel_i64(
+            &mut data,
+            16,
+            section_address,
+            section_address + 0x2c0,
+            "LSDA",
+        )
+        .unwrap();
+
+        assert_eq!(u32::from_le_bytes(data[4..8].try_into().unwrap()), 0x24);
+        assert_eq!(i64::from_le_bytes(data[8..16].try_into().unwrap()), 0x178);
+        assert_eq!(i64::from_le_bytes(data[16..24].try_into().unwrap()), 0x2b0);
     }
 }
