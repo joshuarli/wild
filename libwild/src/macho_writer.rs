@@ -20,13 +20,14 @@ use crate::layout::Resolution;
 use crate::layout::Section;
 use crate::layout::SymbolCopyInfo;
 use crate::macho::BuildVersionCommand;
-use crate::macho::CHAINED_FIXUP_PAGE_START_SIZE;
 use crate::macho::CS_BLOB_HEADERS_SIZE;
 use crate::macho::CS_BLOCK_SIZE;
 use crate::macho::CS_BLOCK_SIZE_EXP;
 use crate::macho::CS_CODE_DIRECTORY_SIZE;
 use crate::macho::CS_HASH_SIZE;
 use crate::macho::CS_HEADERS_SIZE;
+use crate::macho::CHAINED_STARTS_IN_IMAGE_OFFSET;
+use crate::macho::CHAINED_STARTS_IN_SEGMENT_FIXED_SIZE;
 use crate::macho::ChainedFixupsHeader;
 use crate::macho::ChainedStartsInSegment;
 use crate::macho::CodeSignatureCommand;
@@ -73,6 +74,8 @@ use crate::timing_phase;
 use crate::value_flags::ValueFlags;
 use crate::verbose_timing_phase;
 use itertools::Itertools;
+#[cfg(test)]
+use linker_utils::elf::AArch64Instruction;
 use linker_utils::elf::RelocationKind;
 use linker_utils::utils::slice_from_all_bytes_mut;
 use object::BigEndian;
@@ -92,6 +95,7 @@ use object::macho::CS_SUPPORTSEXECSEG;
 use object::macho::CSSLOT_CODEDIRECTORY;
 use object::macho::DYLD_CHAINED_IMPORT;
 use object::macho::DYLD_CHAINED_PTR_64_OFFSET;
+use object::macho::DYLD_CHAINED_PTR_START_NONE;
 use object::macho::LC_BUILD_VERSION;
 use object::macho::LC_CODE_SIGNATURE;
 use object::macho::LC_DYLD_CHAINED_FIXUPS;
@@ -108,6 +112,7 @@ use object::macho::LoadCommand;
 use object::macho::MH_CIGAM_64;
 use object::macho::MH_DYLIB;
 use object::macho::MH_EXECUTE;
+use object::macho::MH_HAS_TLV_DESCRIPTORS;
 use object::macho::N_ABS;
 use object::macho::N_SECT;
 use object::macho::PLATFORM_MACOS;
@@ -399,18 +404,205 @@ fn exported_symbol_is_weak(layout: &MachOLayout<'_>, symbol_id: SymbolId) -> Res
     Ok(object.object.symbol(symbol_index)?.is_weak())
 }
 
-fn write_got_entries(layout: &MachOLayout<'_>, got: &mut [u8]) -> Result {
+/// `DYLD_CHAINED_PTR_64` has one chain start per 16KiB page. The `next` field connects
+/// every imported GOT bind in the same page, in four-byte units.
+#[derive(Debug, PartialEq, Eq)]
+struct GotChainedFixups {
+    /// One entry for every `__DATA_CONST` page through the last GOT fixup.
+    page_starts: Vec<u16>,
+    /// Every GOT slot that dyld must process, in ascending address order.
+    fixups: Vec<GotFixup>,
+    /// The `next` field for each entry in `fixups`.
+    next_by_fixup: Vec<u16>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GotFixup {
+    address: u64,
+    /// The index of the `dyld_chained_import` record for a dynamically imported symbol.
+    import_index: usize,
+}
+
+fn plan_got_chained_fixups(
+    got_start: u64,
+    got_size: u64,
+    segment_start: u64,
+    segment_size: u64,
+    mut fixups: Vec<GotFixup>,
+) -> Result<GotChainedFixups> {
+    const POINTER_STRIDE: u64 = 4;
+    const MAX_NEXT: u64 = (1 << 12) - 1;
+
+    let page_size = MACHO_PAGE_ALIGNMENT.value();
+    ensure!(
+        got_start >= segment_start,
+        "__got starts before its __DATA_CONST segment"
+    );
+    let got_end = got_start
+        .checked_add(got_size)
+        .ok_or_else(|| error!("__got range overflows the Mach-O address space"))?;
+    let segment_end = segment_start
+        .checked_add(segment_size)
+        .ok_or_else(|| error!("__DATA_CONST range overflows the Mach-O address space"))?;
+    ensure!(
+        got_end <= segment_end,
+        "__got is outside its __DATA_CONST segment"
+    );
+
+    if fixups.is_empty() {
+        return Ok(GotChainedFixups {
+            page_starts: Vec::new(),
+            fixups,
+            next_by_fixup: Vec::new(),
+        });
+    }
+
+    fixups.sort_by_key(|fixup| fixup.address);
+
+    let mut locations = Vec::with_capacity(fixups.len());
+    for (index, fixup) in fixups.iter().enumerate() {
+        let address = fixup.address;
+        if index != 0 {
+            let previous_address = fixups[index - 1].address;
+            ensure!(
+                address > previous_address,
+                "Mach-O GOT fixups must have distinct addresses: {previous_address:#x} then {address:#x}"
+            );
+        }
+        ensure!(
+            address >= got_start && address.checked_add(GOT_ENTRY_SIZE).is_some_and(|end| end <= got_end),
+            "Mach-O GOT fixup at {address:#x} is outside __got"
+        );
+        ensure!(
+            address % GOT_ENTRY_SIZE == 0,
+            "Mach-O GOT fixup at {address:#x} is not pointer aligned"
+        );
+
+        let segment_offset = address - segment_start;
+        let page_index = usize::try_from(segment_offset / page_size)
+            .map_err(|_| error!("dynamic GOT bind page index does not fit usize"))?;
+        let page_offset = segment_offset % page_size;
+        locations.push((page_index, page_offset, address));
+    }
+
+    let page_count = locations.last().unwrap().0 + 1;
+    ensure!(
+        page_count <= usize::from(u16::MAX),
+        "__DATA_CONST has too many pages for Mach-O chained fixups"
+    );
+    let mut page_starts = vec![DYLD_CHAINED_PTR_START_NONE; page_count];
+    let mut next_by_fixup = vec![0; fixups.len()];
+
+    for (index, &(page_index, page_offset, address)) in locations.iter().enumerate() {
+        ensure!(
+            page_offset <= u64::from(u16::MAX),
+            "Mach-O GOT fixup page offset does not fit chained fixups"
+        );
+
+        if index == 0 || locations[index - 1].0 != page_index {
+            page_starts[page_index] = page_offset as u16;
+            continue;
+        }
+
+        let previous_address = locations[index - 1].2;
+        let delta = address.checked_sub(previous_address).ok_or_else(|| {
+            error!(
+                "Mach-O GOT fixups must be sorted by address: {previous_address:#x} then {address:#x}"
+            )
+        })?;
+        ensure!(
+            delta % POINTER_STRIDE == 0,
+            "Mach-O GOT fixup distance {delta:#x} is not a chained-fixup stride"
+        );
+        let next = delta / POINTER_STRIDE;
+        ensure!(
+            next <= MAX_NEXT,
+            "Mach-O GOT fixup distance {delta:#x} exceeds the chained-fixup next field"
+        );
+        next_by_fixup[index - 1] = next as u16;
+    }
+
+    Ok(GotChainedFixups {
+        page_starts,
+        fixups,
+        next_by_fixup,
+    })
+}
+
+fn got_chained_fixups(layout: &MachOLayout<'_>) -> Result<GotChainedFixups> {
+    let symbols = &layout.format_specific.imported_symbols;
     let got_layout = layout.section_layouts.get(output_section_id::GOT);
 
-    let sorted_symbols = &layout.format_specific.imported_symbols;
-    for (i, imported_symbol) in sorted_symbols.iter().enumerate() {
-        let offset = imported_symbol
-            .got_address
-            .get()
+    if symbols.is_empty() {
+        return Ok(GotChainedFixups {
+            page_starts: Vec::new(),
+            fixups: Vec::new(),
+            next_by_fixup: Vec::new(),
+        });
+    }
+
+    let (_, data_const_segment) = layout
+        .segment_layouts
+        .segments
+        .iter()
+        .enumerate()
+        .find(|(_, segment)| {
+            layout.program_segments.segment_def(segment.id).name == SegmentName::DATA_CONST
+        })
+        .ok_or_else(|| error!("Mach-O GOT fixups require a __DATA_CONST segment"))?;
+
+    let fixups = symbols
+        .iter()
+        .enumerate()
+        .map(|(import_index, symbol)| GotFixup {
+            address: symbol.got_address.get(),
+            import_index,
+        })
+        .collect_vec();
+
+    plan_got_chained_fixups(
+        got_layout.mem_offset,
+        got_layout.mem_size,
+        data_const_segment.sizes.mem_offset,
+        data_const_segment.sizes.mem_size,
+        fixups,
+    )
+}
+
+fn chained_bind_word(ordinal: usize, next: u16) -> Result<u64> {
+    ensure!(
+        ordinal <= 0x00ff_ffff,
+        "Mach-O chained-fixup import ordinal does not fit 24 bits"
+    );
+    ensure!(
+        next <= 0x0fff,
+        "Mach-O chained-fixup next value does not fit 12 bits"
+    );
+
+    Ok((1u64 << 63) | (u64::from(next) << 51) | ordinal as u64)
+}
+
+fn write_got_entries(layout: &MachOLayout<'_>, got: &mut [u8]) -> Result {
+    let got_layout = layout.section_layouts.get(output_section_id::GOT);
+    let chained_fixups = got_chained_fixups(layout)?;
+    for (fixup, &next) in chained_fixups
+        .fixups
+        .iter()
+        .zip(&chained_fixups.next_by_fixup)
+    {
+        let offset: usize = fixup
+            .address
             .checked_sub(got_layout.mem_offset)
             .ok_or_else(|| error!("GOT entry address is before __got"))?
-            as usize;
-        let end = offset + GOT_ENTRY_SIZE as usize;
+            .try_into()
+            .map_err(|_| error!("GOT entry offset does not fit the output file"))?;
+        let end = offset
+            .checked_add(GOT_ENTRY_SIZE as usize)
+            .ok_or_else(|| error!("GOT entry range overflows the output file"))?;
+        ensure!(
+            end <= got.len(),
+            "GOT entry is outside the allocated __got section"
+        );
 
         /* DYLD_CHAINED_PTR_64 format:
         uint64_t dyld_chained_ptr_64_bind:
@@ -420,12 +612,8 @@ fn write_got_entries(layout: &MachOLayout<'_>, got: &mut [u8]) -> Result {
           next: 12 // 4-byte stride
           bind: 1 // == 1
         */
-        let bind = 1u64 << 63;
-        // TODO: when crossing a page boundary, next is equal to zero
-        let next = if i == sorted_symbols.len() - 1 { 0 } else { 2 };
-        let next = next << 51;
-        let ordinal = i as u64;
-        got[offset..end].copy_from_slice(&(bind | next | ordinal).to_le_bytes());
+        let encoded = chained_bind_word(fixup.import_index, next)?;
+        got[offset..end].copy_from_slice(&encoded.to_le_bytes());
     }
 
     Ok(())
@@ -486,6 +674,13 @@ fn populate_file_header(
     let mut flags = macho::MH_DYLDLINK | macho::MH_NOUNDEFS | macho::MH_TWOLEVEL;
     if layout.symbol_db.output_kind.is_executable() {
         flags |= macho::MH_PIE;
+    }
+    if layout.output_sections.ids_with_info().any(|(section_id, _)| {
+        layout.output_sections.will_emit_section(section_id)
+            && layout.output_sections.section_flags(section_id).typ()
+                == macho::S_THREAD_LOCAL_VARIABLES
+    }) {
+        flags |= MH_HAS_TLV_DESCRIPTORS;
     }
     header.flags.set(LE, flags);
     header.reserved.set(LE, 0);
@@ -653,8 +848,19 @@ fn write_object_section<'data, A: Arch<Platform = MachO>>(
         .address()
         .context("Attempted to apply relocations to a section that we didn't load")?;
 
-    for rel in object_layout.relocations(section_index)?.relocations {
-        apply_relocation::<A>(object_layout, section_address, rel.info(LE), layout, out)?;
+    for relocation in crate::macho::paired_relocations(
+        object_layout.relocations(section_index)?.relocations,
+    ) {
+        let relocation = relocation?;
+        apply_relocation::<A>(
+            object_layout,
+            section_index,
+            section_address,
+            relocation.info,
+            relocation.addend,
+            layout,
+            out,
+        )?;
     }
 
     Ok(())
@@ -663,8 +869,10 @@ fn write_object_section<'data, A: Arch<Platform = MachO>>(
 #[inline(always)]
 fn apply_relocation<'data, A: Arch<Platform = MachO>>(
     object_layout: &ObjectLayout<'data, MachO>,
+    source_section_index: object::SectionIndex,
     section_address: u64,
     rel: RelocationInfo,
+    addend: i64,
     layout: &MachOLayout<'data>,
     out: &mut [u8],
 ) -> Result {
@@ -679,24 +887,33 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
     .entered();
 
     let rel_info = A::relocation_from_raw(rel)?;
-    let (resolution, _symbol_index, local_symbol_id) = get_resolution(rel, object_layout, layout)?;
+    let (resolution, symbol_index, local_symbol_id) = get_resolution(rel, object_layout, layout)?;
     let flags = layout.flags_for_symbol(local_symbol_id);
 
     let mask = get_page_mask(rel_info.mask);
-    let value = match rel_info.kind {
-        RelocationKind::Absolute => resolution.raw_value.bitand(mask.symbol_plus_addend),
-        RelocationKind::AbsoluteLowPart => resolution.raw_value.bitand(mask.symbol_plus_addend),
-        RelocationKind::Relative => resolution
-            .raw_value
+    let symbol_plus_addend = resolution.raw_value.wrapping_add(addend as u64);
+    let mut value = match rel_info.kind {
+        RelocationKind::Absolute => symbol_plus_addend.bitand(mask.symbol_plus_addend),
+        RelocationKind::AbsoluteLowPart => symbol_plus_addend.bitand(mask.symbol_plus_addend),
+        RelocationKind::Relative => symbol_plus_addend
             .bitand(mask.symbol_plus_addend)
             .wrapping_sub(place.bitand(mask.place)),
-        RelocationKind::GotRelative => resolution
-            .raw_value
+        RelocationKind::GotRelative => symbol_plus_addend
             .bitand(mask.symbol_plus_addend)
             .wrapping_sub(place.bitand(mask.place)),
-        RelocationKind::Got => resolution.raw_value.bitand(mask.symbol_plus_addend),
+        RelocationKind::Got => symbol_plus_addend.bitand(mask.symbol_plus_addend),
         _ => todo!(),
     };
+
+    if let Some(tls_data_start) = tlv_descriptor_tls_data_start(
+        rel,
+        source_section_index,
+        symbol_index,
+        object_layout,
+        layout,
+    )? {
+        value = tls_storage_offset(resolution.raw_value, tls_data_start)?;
+    }
 
     tracing::trace!(
             %flags,
@@ -704,8 +921,13 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
             %rel_info.size,
             value,
             value_hex = %HexU64::new(value),
+            addend,
             symbol_name = %layout.symbol_db.symbol_name_for_display(local_symbol_id),
             "relocation applied");
+
+    if rel.r_type == object::macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12 {
+        rewrite_tlvp_load_as_add(&mut out[offset_in_section as usize..])?;
+    }
 
     rel_info
         .write_to_buffer(value, &mut out[offset_in_section as usize..])
@@ -718,6 +940,91 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
         })?;
 
     Ok(())
+}
+
+/// Mach-O assemblers emit an unsigned-immediate `ldr` for a TLVP page-offset relocation. The
+/// linker must turn that instruction into `add` before inserting the descriptor's low 12 bits:
+/// TLVP computes the address of a `__thread_vars` descriptor, while the following instruction
+/// loads and calls the descriptor's bootstrap pointer. Leaving the `ldr` in place dereferences
+/// the descriptor address too early.
+fn rewrite_tlvp_load_as_add(out: &mut [u8]) -> Result {
+    const LDR_X_UNSIGNED_IMMEDIATE: u32 = 0xf940_0000;
+    const LDR_X_UNSIGNED_IMMEDIATE_MASK: u32 = 0xffc0_0000;
+    const ADD_X_IMMEDIATE: u32 = 0x9100_0000;
+    const REGISTER_OPERANDS_MASK: u32 = 0x0000_03ff;
+
+    ensure!(
+        out.len() >= size_of::<u32>(),
+        "ARM64_RELOC_TLVP_LOAD_PAGEOFF12 is outside of the input section"
+    );
+    let instruction = u32::from_le_bytes(out[..size_of::<u32>()].try_into().unwrap());
+    ensure!(
+        instruction & LDR_X_UNSIGNED_IMMEDIATE_MASK == LDR_X_UNSIGNED_IMMEDIATE,
+        "ARM64_RELOC_TLVP_LOAD_PAGEOFF12 requires a 64-bit unsigned-immediate LDR, got instruction 0x{instruction:08x}"
+    );
+
+    // Both forms encode Xn at bits 5..10 and Xt/Xd at bits 0..5. The immediate is deliberately
+    // discarded: it is replaced by the relocation with ADD's unscaled immediate encoding.
+    let add = ADD_X_IMMEDIATE | (instruction & REGISTER_OPERANDS_MASK);
+    out[..size_of::<u32>()].copy_from_slice(&add.to_le_bytes());
+    Ok(())
+}
+
+/// A `tlv_descriptor` stores the target's byte offset in the image TLS template, rather than a
+/// VM address. This only applies to the data-pointer relocation within
+/// `S_THREAD_LOCAL_VARIABLES`; the preceding `__tlv_bootstrap` relocation remains a callable
+/// address (or PLT stub).
+fn tlv_descriptor_tls_data_start(
+    rel: RelocationInfo,
+    source_section_index: object::SectionIndex,
+    symbol_index: SymbolIndex,
+    object_layout: &ObjectLayout<'_, MachO>,
+    layout: &MachOLayout<'_>,
+) -> Result<Option<u64>> {
+    if rel.r_type != object::macho::ARM64_RELOC_UNSIGNED {
+        return Ok(None);
+    }
+
+    let source = object_layout.object.section(source_section_index)?;
+    if source.flags.get(LE).typ() != macho::S_THREAD_LOCAL_VARIABLES {
+        return Ok(None);
+    }
+
+    let target = object_layout.object.symbol(symbol_index)?;
+    let Some(target_section_index) = object_layout.object.symbol_section(target, symbol_index)?
+    else {
+        return Ok(None);
+    };
+    let target_section = object_layout.object.section(target_section_index)?;
+    if !matches!(
+        target_section.flags.get(LE).typ(),
+        macho::S_THREAD_LOCAL_REGULAR | macho::S_THREAD_LOCAL_ZEROFILL
+    ) {
+        return Ok(None);
+    }
+
+    layout
+        .output_sections
+        .ids_with_info()
+        .filter(|(section_id, _)| layout.output_sections.will_emit_section(*section_id))
+        .filter_map(|(section_id, _)| {
+            matches!(
+                layout.output_sections.section_flags(section_id).typ(),
+                macho::S_THREAD_LOCAL_REGULAR | macho::S_THREAD_LOCAL_ZEROFILL
+            )
+            .then(|| layout.section_layouts.get(section_id).mem_offset)
+        })
+        .min()
+        .context("TLV descriptor references TLS storage, but the output has no TLS storage section")
+        .map(Some)
+}
+
+fn tls_storage_offset(symbol_address: u64, tls_data_start: u64) -> Result<u64> {
+    symbol_address.checked_sub(tls_data_start).with_context(|| {
+        format!(
+            "TLV descriptor target address 0x{symbol_address:x} is before TLS storage start 0x{tls_data_start:x}"
+        )
+    })
 }
 
 fn write_section_raw<'out, 'data>(
@@ -979,8 +1286,14 @@ fn write_code_signature_command(layout: &MachOLayout, command: &mut CodeSignatur
 }
 
 fn write_chained_fixup_table(layout: &MachOLayout, chained_fixup_table: &mut [u8]) -> Result {
+    // The starts-in-image offset is 8-byte aligned while the packed header is 28 bytes. The
+    // four-byte wire padding must not retain data from an update-in-place output: it contributes
+    // to both the deterministic UUID hash and the code signature.
+    chained_fixup_table.fill(0);
+
     let symbols = &layout.format_specific.imported_symbols;
     let active_segments = &layout.segment_layouts.segments;
+    let chained_fixups = got_chained_fixups(layout)?;
 
     // The __PAGEZERO segment needs to be added manually.
     let segment_count = active_segments.len() + 1;
@@ -989,16 +1302,17 @@ fn write_chained_fixup_table(layout: &MachOLayout, chained_fixup_table: &mut [u8
         "unexpected number of active segments"
     );
     let starts_in_image_len = size_of::<u32>() * (segment_count + 1);
-    let starts_in_segment_len =
-        size_of::<ChainedStartsInSegment>() + CHAINED_FIXUP_PAGE_START_SIZE as usize;
+    let starts_in_segment_len = CHAINED_STARTS_IN_SEGMENT_FIXED_SIZE
+        + chained_fixups.page_starts.len() * size_of::<u16>();
     let imports_len = size_of::<u32>() * symbols.len();
 
-    let starts_offset = size_of::<ChainedFixupsHeader>();
+    let starts_offset = CHAINED_STARTS_IN_IMAGE_OFFSET;
     let imports_offset = starts_offset + starts_in_image_len + starts_in_segment_len;
     let symbols_offset = imports_offset + imports_len;
 
     let (header, rest) = from_bytes_mut::<ChainedFixupsHeader>(chained_fixup_table)
         .map_err(|_| error!("Invalid chained fixups header allocation"))?;
+    let (_, rest) = rest.split_at_mut(starts_offset - size_of::<ChainedFixupsHeader>());
     let (starts_in_image, rest) = slice_from_bytes_mut::<U32<Endianness>>(rest, segment_count + 1)
         .map_err(|_| error!("Invalid chained fixups starts allocation"))?;
 
@@ -1016,8 +1330,8 @@ fn write_chained_fixup_table(layout: &MachOLayout, chained_fixup_table: &mut [u8
     starts_in_image[0].set(LE, segment_count as u32);
     starts_in_image[1..].fill(U32::new(LE, 0));
 
-    // Early exit if we don't have any GOT entry to be encoded.
-    if layout.section_layouts.get(output_section_id::GOT).mem_size == 0 {
+    // If __got has no bind, no starts table is needed.
+    if chained_fixups.page_starts.is_empty() {
         rest.zero();
         return Ok(());
     }
@@ -1029,14 +1343,19 @@ fn write_chained_fixup_table(layout: &MachOLayout, chained_fixup_table: &mut [u8
             layout.program_segments.segment_def(segment.id).name == SegmentName::DATA_CONST
         })
         .ok_or_else(|| error!("non-empty __got requires __DATA_CONST segment"))?;
+    let text_segment = active_segments
+        .iter()
+        .find(|segment| {
+            layout.program_segments.segment_def(segment.id).name == SegmentName::TEXT
+        })
+        .ok_or_else(|| error!("Mach-O chained fixups require a __TEXT segment"))?;
 
     // Accounts for both seg_count and __PAGEZERO.
     starts_in_image[data_const_segment_index + 2].set(LE, starts_in_image_len as u32);
 
-    let (starts_in_segment, rest) = from_bytes_mut::<ChainedStartsInSegment>(rest)
+    let (starts_in_segment_bytes, rest) = rest.split_at_mut(starts_in_segment_len);
+    let (starts_in_segment, _) = from_bytes_mut::<ChainedStartsInSegment>(starts_in_segment_bytes)
         .map_err(|_| error!("Invalid chained fixups starts in segment allocation"))?;
-    let (page_starts, rest) = slice_from_bytes_mut::<U16<Endianness>>(rest, 1)
-        .map_err(|_| error!("Invalid chained fixups page starts allocation"))?;
     let (imports, string_pool) = slice_from_bytes_mut::<U32<Endianness>>(rest, symbols.len())
         .map_err(|_| error!("Invalid chained fixups imports allocation"))?;
 
@@ -1050,17 +1369,29 @@ fn write_chained_fixup_table(layout: &MachOLayout, chained_fixup_table: &mut [u8
         .set(LE, DYLD_CHAINED_PTR_64_OFFSET);
     starts_in_segment
         .segment_offset
-        .set(LE, data_const_segment.sizes.file_offset as u64);
+        .set(
+            LE,
+            data_const_segment
+                .sizes
+                .mem_offset
+                .checked_sub(text_segment.sizes.mem_offset)
+                .ok_or_else(|| error!("__DATA_CONST is before __TEXT"))?,
+        );
     starts_in_segment.max_valid_pointer.set(LE, 0);
-    // TODO:
-    starts_in_segment.page_count.set(LE, 1);
-    page_starts[0].set(LE, 0);
+    starts_in_segment
+        .page_count
+        .set(LE, u16::try_from(chained_fixups.page_starts.len())?);
+    let (page_starts, _) = slice_from_bytes_mut::<U16<Endianness>>(
+        &mut starts_in_segment_bytes[CHAINED_STARTS_IN_SEGMENT_FIXED_SIZE..],
+        chained_fixups.page_starts.len(),
+    )
+    .map_err(|_| error!("Invalid chained fixups page starts allocation"))?;
+    for (output, start) in page_starts.iter_mut().zip(&chained_fixups.page_starts) {
+        output.set(LE, *start);
+    }
 
-    // 4) fill up all imported symbols chunked by the pages
-    // TODO: support more pages
-    assert!(symbols.len() < MACHO_PAGE_ALIGNMENT.value() as usize / size_of::<u32>());
-
-    let sorted_symbols = &layout.format_specific.imported_symbols;
+    // 4) fill up imports in the same order used by the GOT bind pointers.
+    let sorted_symbols = symbols;
     let mut symbol_offsets = Vec::with_capacity(sorted_symbols.len());
     let mut str_offset = 0;
     for imported_symbol in sorted_symbols {
@@ -1433,5 +1764,60 @@ mod tests {
         assert_eq!(command.path.offset.get(LE) as usize, size_of::<RpathCommand>());
         assert_eq!(&path_buffer[..path.len()], path);
         assert!(path_buffer[path.len()..].iter().all(|&byte| byte == 0));
+    }
+
+    #[test]
+    fn tlvp_pageoff_rewrites_ldr_to_add_preserving_registers() {
+        // ldr x5, [x3, #0x40]
+        let mut instruction = 0xf940_2065u32.to_le_bytes();
+
+        rewrite_tlvp_load_as_add(&mut instruction).unwrap();
+
+        // add x5, x3, #0; relocation application fills the immediate afterwards.
+        assert_eq!(u32::from_le_bytes(instruction), 0x9100_0065);
+        AArch64Instruction::Add.write_to_value(0x44, false, &mut instruction);
+        assert_eq!(u32::from_le_bytes(instruction), 0x9101_1065);
+    }
+
+    #[test]
+    fn tlvp_pageoff_rejects_non_ldr_instruction() {
+        let mut instruction = 0x9100_0000u32.to_le_bytes();
+
+        let error = rewrite_tlvp_load_as_add(&mut instruction).unwrap_err();
+
+        assert!(error.to_string().contains("unsigned-immediate LDR"));
+    }
+
+    #[test]
+    fn tlv_descriptor_data_pointer_is_an_offset_within_tls_storage() {
+        assert_eq!(tls_storage_offset(0x1_0000_8014, 0x1_0000_8000).unwrap(), 0x14);
+
+        let error = tls_storage_offset(0x1_0000_7ff8, 0x1_0000_8000).unwrap_err();
+        assert!(error.to_string().contains("before TLS storage start"));
+    }
+
+    #[test]
+    fn chained_fixups_start_a_new_chain_on_each_got_page() {
+        let page = MACHO_PAGE_ALIGNMENT.value();
+        let plan = plan_got_chained_fixups(
+            0x1_0000,
+            page + 0x10,
+            0x1_0000,
+            page * 2,
+            vec![
+                GotFixup {
+                    address: 0x1_0000 + page - GOT_ENTRY_SIZE,
+                    import_index: 0,
+                },
+                GotFixup {
+                    address: 0x1_0000 + page + GOT_ENTRY_SIZE,
+                    import_index: 1,
+                },
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(plan.page_starts, vec![(page - GOT_ENTRY_SIZE) as u16, GOT_ENTRY_SIZE as u16]);
+        assert_eq!(plan.next_by_fixup, vec![0, 0]);
     }
 }

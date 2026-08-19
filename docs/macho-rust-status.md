@@ -28,7 +28,7 @@ Baseline checks completed on this host:
 
 * `cargo build --profile ci --workspace --no-default-features` — pass.
 * `WILD_TEST_IGNORE_FORMAT=1 cargo test --profile ci --workspace --features macho` — pass
-  (170 `libwild` tests, 24 Mach-O integration tests, recorder tests, and remaining workspace/doc
+  (179 `libwild` tests, 27 Mach-O integration tests, recorder tests, and remaining workspace/doc
   tests).
 * Without `WILD_TEST_IGNORE_FORMAT=1`, only tidy tests fail because this host lacks `taplo` and
   `clang-format`; this is the same exemption configured for the macOS CI job. No formatter or
@@ -46,23 +46,23 @@ than supported facilities:
 | --- | --- | --- |
 | Mach-O argument semantics | Models ARM64, dylib/executable, install names, rpaths, export lists, framework paths, and strip options. `-dead_strip` currently uses section-level generic GC only. | partial; atom GC unqualified |
 | Section/symbol classification | Handles data access, debug/non-alloc, `__DATA_CONST`, TLV storage, no-dead-strip, C strings, and Mach-O-specific no-op hooks. | partial |
-| ARM64 relocations / thunks | Validates supported standalone forms and handles `POINTER_TO_GOT`; paired, TLVP, authenticated, and branch-island paths are explicitly diagnosed or absent. | partial; unqualified |
-| Chained fixups | `libwild/src/macho_writer.rs` documents a one-page limitation and asserts the corresponding import limit. | unqualified |
+| ARM64 relocations / thunks | Validates supported standalone forms, `POINTER_TO_GOT`, local executable TLVP descriptors, and paired `ADDEND` forms. `SUBTRACTOR`, dynamic-TLVP, authenticated, and branch-island paths remain explicitly diagnosed or absent. | partial; unqualified |
+| Chained fixups | Plans dynamic `__got` binds by actual address: gaps and leading local slots are skipped, 16 KiB pages have independent starts, and malformed encodings are rejected. Additional bind segments/rebases remain unqualified. | partial; unqualified |
 | Dylib output / rpaths / exports | Emits `MH_DYLIB`, `LC_ID_DYLIB`, requested `LC_RPATH`, and omits executable-only commands; C runtime smoke passes. Dependency ordinals, weak/reexport behavior, and Rust dylib qualification remain. | partial; unqualified |
 | Dead strip / atoms | `-dead_strip` is not yet wired to the generic liveness model. | unqualified |
-| TLS, compact unwind, DWARF, string merging | No end-to-end qualification exists. | unqualified |
+| TLS, compact unwind, DWARF, string merging | A local C TLS descriptor fixture executes successfully; Rust reaches paired relocations after TLS. Dylib TLS, compact unwind, and DWARF remain unqualified. | partial; unqualified |
 | x86_64 Mach-O | File-kind detection rejects non-ARM64 input. | not started |
 
 ## Compatibility matrix
 
 | Facility | Minimal fixture | Apple differential | Rust integration | Stress test | Status |
 | --- | --- | --- | --- | --- | --- |
-| ARM64 executable | existing `wild/tests/sources/macho/trivial` | pending | pending | n/a | baseline only |
+| ARM64 executable | existing `wild/tests/sources/macho/trivial` | pending | fresh stable Cargo bin links and runs; default `cargo test` has a direct-local-pointer rebase crash | n/a | bin smoke green; test unqualified |
 | SDK `.tbd` / libSystem | existing `trivial-libsystem` | pending | pending | n/a | baseline only |
 | dylib | `trivial-dynamic` now links its `foo.c` dylib with Wild and consumes it at runtime | pass | C runtime pass | n/a | smoke green |
 | framework | none | pending | pending | n/a | unqualified |
 | dead strip | none | pending | pending | pending | unqualified |
-| TLS | none | pending | pending | pending | unqualified |
+| TLS | `macho/tls-local` | structural comparison pending | C runtime pass; Rust reaches the next relocation blocker | pending | local executable smoke green |
 | compact unwind | none | pending | pending | pending | unqualified |
 | DWARF / dSYM / LLDB | none | pending | pending | pending | unqualified |
 | chained fixups | existing output inspection only | pending | pending | pending | unqualified |
@@ -74,16 +74,23 @@ than supported facilities:
 * Existing CI build: `cargo build --profile ci --workspace --no-default-features`.
 * Rust-to-Darwin command capture: [`darwin-linker-recorder.md`](darwin-linker-recorder.md)
   documents the new `darwin-linker-recorder` wrapper and its exact NUL-delimited replay records.
+* A fresh stable `aarch64-apple-darwin` Cargo binary was captured through that recorder. Its final
+  Clang-driver invocation contained object files, Rust archives, `-lSystem -lc -lm`, `-arch arm64`,
+  `-mmacosx-version-min=11.0.0`, `-Wl,-dead_strip`, `-o`, and `-nodefaultlibs`; Apple clang
+  completed the delegated link successfully. The capture is deliberately ephemeral because its
+  absolute paths contain Cargo hash and temporary-directory components; `argv.nul` is the durable
+  recording format for future corpus fixtures.
 * Every future Rust/Cargo qualification must record the exact linker argv, working directory,
   SDK path, toolchain version, and proof that Wild performed the final link. No Apple-linker
   fallback is accepted as a passing Wild qualification.
 
-### Unresolved correctness reproducer: ordinary Rust TLS/TLVP
+### Current Rust smoke: local executable links and runs
 
-An otherwise empty current stable Cargo binary already pulls in Rust runtime TLS and requires
-`ARM64_RELOC_TLVP_LOAD_PAGEOFF12`. This is intentionally diagnosed rather than linked incorrectly.
-On the baseline host, the following fails during the final Wild link with
-`ARM64_RELOC_TLVP_LOAD_PAGEOFF12 requires Mach-O TLVP support`:
+The following current-stable Cargo binary now links through Wild and executes successfully. The
+Rust link includes local TLVP descriptors, paired addends from `libstd`, SDK stub aliases for
+`libSystem`, and a `__got` whose first dynamic bind follows `0x68` bytes of local slots. The
+chained-fixup plan records the first page start as `0x68`, so dyld begins the chain at the first
+actual bind rather than decoding a local slot as a pointer.
 
 ```sh
 cargo build -p wild-linker --features macho --bin wild
@@ -93,9 +100,18 @@ RUSTFLAGS="-C linker=clang -C link-arg=--ld-path=$PWD/target/debug/wild" \
   cargo run --manifest-path "$scratch/Cargo.toml"
 ```
 
-The failed link is evidence that the invocation selects Wild; it is not a fallback. The required
-fix spans TLV section and descriptor layout, TLVP relocations, chained fixups, liveness, and
-runtime behavior, so it remains the next foundational blocker for the Rust qualification path.
+This is a smoke result only. It is not evidence for dynamic TLS, proc macros, panic/unwind,
+framework linking from Rust, debug information, branch islands, or the other qualification gates
+listed below. The invocation selects Wild; it does not fall back to Apple ld.
+
+### Unresolved correctness reproducer: Rust test-harness local data pointer
+
+A fresh default `cargo test` links through Wild but its executable currently faults at runtime.
+The test harness has a local function pointer in ordinary `__DATA`; Wild's chained-fixup writer
+currently models imported `__DATA_CONST,__got` binds but does not emit a rebase for that local
+pointer. The minimal reproducer is the smoke command above with `cargo test` substituted for
+`cargo run`. This must be solved by a general, per-segment local-rebase model; a GOT-only repair
+was deliberately removed because it left the ordinary `__DATA` pointer unslid under ASLR.
 
 ## Upstream audit
 
@@ -121,8 +137,19 @@ relaxation APIs; none removes the known correctness gaps listed above.
   Mach-O symtab entries retain the correct output section. This fixed an integration regression
   exposed by enabling C-string merging.
 * AArch64 relocation validation now rejects malformed standalone encodings deterministically,
-  supports both `ARM64_RELOC_POINTER_TO_GOT` representations, and reports paired/TLVP/arm64e
-  forms explicitly instead of treating them as unknown or silently applying an invalid result.
+  supports both `ARM64_RELOC_POINTER_TO_GOT` representations, local executable TLVP descriptors,
+  and paired `ADDEND` forms. It reports subtractor, dynamic-TLVP, and arm64e forms explicitly
+  instead of treating them as unknown or silently applying an invalid result. `macho/tls-local`
+  proves a C local TLS variable links and has per-process runtime initialization through the native
+  dyld bootstrap path; `macho/reloc-addend` proves a positive paired page addend at runtime.
+* Mach-O allocation now reserves every GOT/PLT entry that resolution creation will consume. The
+  minimal stable Cargo smoke therefore advances past its empty-`__got` layout invariant.
+* Mach-O dynamic-library inputs are deduplicated by install name, rather than their distinct SDK
+  stub paths, and all aliases use the retained load-command ordinal. `macho/dylib-dedup` proves
+  Rust's `-lSystem -lc -lm` no longer makes dyld reject duplicate `libSystem` commands.
+* Chained-fixup generation now uses actual dynamic GOT addresses, handles local gaps and multiple
+  16 KiB pages, and validates its chain encoding. The minimal stable Cargo binary links and runs
+  with Wild after its first dynamic bind at `__got + 0x68`.
 
 ## Deferred / deliberately unsupported today
 
@@ -133,8 +160,8 @@ relaxation APIs; none removes the known correctness gaps listed above.
 
 ## Next work items
 
-1. Implement end-to-end Mach-O TLS/TLVP (the first hard blocker for a current stable Rust binary),
-   including descriptor layout, chained fixups, and runtime tests.
-2. Generalize chained fixups and add branch islands; both need deterministic large-input fixtures.
+1. Generalize chained fixups to local rebases in every relevant segment, beginning with the Rust
+   test-harness `__DATA` pointer; then add branch islands with deterministic large-input fixtures.
+2. Complete dynamic TLS, subtractor relocations, and full dylib/proc-macro qualification.
 3. Complete the Apple-differential corpus, framework/SDK validation, compact unwind, DWARF, and
    Rust crate-type qualification before beginning the x86_64 port.

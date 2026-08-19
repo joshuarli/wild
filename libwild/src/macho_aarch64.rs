@@ -214,22 +214,49 @@ impl crate::platform::Arch for MachOAArch64 {
                 )
             }
             // Apple specifies these as adjacent relocation pairs. The current Mach-O loader and
-            // writer visit relocations independently, so applying either member would discard
-            // information from the other member and produce an incorrect result.
+            // writer normalize ADDEND with its following primary relocation before reaching this
+            // architecture-specific conversion. Seeing it here means that normalization was
+            // bypassed, so it cannot be interpreted independently.
             object::macho::ARM64_RELOC_ADDEND => bail!(
-                "ARM64_RELOC_ADDEND is a paired relocation, but the Mach-O relocation pipeline does not preserve relocation pairs"
+                "ARM64_RELOC_ADDEND must be normalized with its following relocation before architecture-specific processing"
             ),
             object::macho::ARM64_RELOC_SUBTRACTOR => bail!(
                 "ARM64_RELOC_SUBTRACTOR is a paired relocation, but the Mach-O relocation pipeline does not preserve relocation pairs"
             ),
-            // TLVP requires allocating and initialising thread-local-variable-pointer slots.
-            // Authenticated pointers additionally need the arm64e signing metadata to be kept in
-            // the output pointer. Neither representation exists in the generic Mach-O pipeline.
-            object::macho::ARM64_RELOC_TLVP_LOAD_PAGE21
-            | object::macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12 => bail!(
-                "{} requires Mach-O TLVP support, which the relocation writer does not implement",
-                Self::rel_type_to_string(rel)
-            ),
+            // On Mach-O, a local TLS symbol names its 24-byte `__thread_vars` descriptor rather
+            // than a TLS offset. The TLVP instruction pair computes that descriptor's address;
+            // the generated code then calls its bootstrap entry. Treat the pair as ordinary
+            // page-relative addressing so the writer uses the local descriptor resolution.
+            //
+            // A descriptor imported from a dylib needs a runtime-bound TLVP slot, which is
+            // rejected while processing relocations in `macho::process_relocation`.
+            object::macho::ARM64_RELOC_TLVP_LOAD_PAGE21 => {
+                validate_standalone_relocation(rel, "ARM64_RELOC_TLVP_LOAD_PAGE21", true, 2)?;
+                (
+                    RelocationKind::Relative,
+                    RelocationSize::bit_mask_aarch64(12, 33, AArch64Instruction::Adr),
+                    Some(PageMask::SymbolPlusAddendAndPosition(PAGE_MASK_4KB)),
+                    AllowedRange::from_bit_size(33, Sign::Signed),
+                    1,
+                )
+            }
+            object::macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12 => {
+                validate_standalone_relocation(
+                    rel,
+                    "ARM64_RELOC_TLVP_LOAD_PAGEOFF12",
+                    false,
+                    2,
+                )?;
+                (
+                    RelocationKind::AbsoluteLowPart,
+                    RelocationSize::bit_mask_aarch64(0, 12, AArch64Instruction::Add),
+                    None,
+                    AllowedRange::no_check(),
+                    1,
+                )
+            }
+            // Authenticated pointers need arm64e signing metadata to be kept in the output
+            // pointer. That representation does not exist in the generic Mach-O pipeline.
             object::macho::ARM64_RELOC_AUTHENTICATED_POINTER => bail!(
                 "ARM64_RELOC_AUTHENTICATED_POINTER requires arm64e pointer-authentication support, which the relocation writer does not implement"
             ),
@@ -354,7 +381,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_paired_addends_until_the_macho_pipeline_preserves_the_pair() {
+    fn rejects_an_unpaired_addend_after_macho_normalization() {
         let error = MachOAArch64::relocation_from_raw(relocation(
             object::macho::ARM64_RELOC_ADDEND,
             false,
@@ -362,6 +389,29 @@ mod tests {
         ))
         .unwrap_err();
 
-        assert!(error.to_string().contains("paired relocation"));
+        assert!(error.to_string().contains("must be normalized"));
+    }
+
+    #[test]
+    fn local_tlvp_loads_resolve_the_thread_variable_descriptor_directly() {
+        let page = MachOAArch64::relocation_from_raw(relocation(
+            object::macho::ARM64_RELOC_TLVP_LOAD_PAGE21,
+            true,
+            2,
+        ))
+        .unwrap();
+        assert_eq!(page.kind, RelocationKind::Relative);
+        assert!(matches!(
+            page.mask,
+            Some(PageMask::SymbolPlusAddendAndPosition(PAGE_MASK_4KB))
+        ));
+
+        let pageoff = MachOAArch64::relocation_from_raw(relocation(
+            object::macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12,
+            false,
+            2,
+        ))
+        .unwrap();
+        assert_eq!(pageoff.kind, RelocationKind::AbsoluteLowPart);
     }
 }

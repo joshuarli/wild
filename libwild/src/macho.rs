@@ -4,6 +4,7 @@ use crate::alignment;
 use crate::alignment::Alignment;
 use crate::alignment::MACHO_PAGE_ALIGNMENT;
 use crate::args::macho::MachOArgs;
+use crate::bail;
 use crate::ensure;
 use crate::error;
 use crate::error::Result;
@@ -67,6 +68,7 @@ use object::macho::S_ATTR_SOME_INSTRUCTIONS;
 use object::macho::S_CSTRING_LITERALS;
 use object::macho::S_GB_ZEROFILL;
 use object::macho::S_THREAD_LOCAL_REGULAR;
+use object::macho::S_THREAD_LOCAL_VARIABLES;
 use object::macho::S_THREAD_LOCAL_ZEROFILL;
 use object::macho::S_ZEROFILL;
 use object::macho::SECTION_ATTRIBUTES;
@@ -166,9 +168,17 @@ pub(crate) const DYLINKER_PATH: &[u8] = b"/usr/lib/dyld";
 // TODO: Getting the number of active segments in epilogue depends on determine_header_size
 // which is called later for the prologue. We potentially over-allocate a couple of bytes.
 pub(crate) const MAX_SEGMENT_COUNT: usize = 6;
-pub(crate) const CHAINED_FIXUP_TABLE_BASE_SIZE: u64 = (size_of::<ChainedFixupsHeader>()
+/// `dyld_chained_starts_in_image` is 8-byte aligned after the 28-byte header. The object crate's
+/// packed `ChainedStartsInSegment` omits C's flexible `page_start[1]`, so its 22-byte fixed
+/// prefix must be followed explicitly by the first two-byte page entry on the wire.
+pub(crate) const CHAINED_STARTS_IN_IMAGE_OFFSET: usize =
+    size_of::<ChainedFixupsHeader>().next_multiple_of(size_of::<u64>());
+pub(crate) const CHAINED_STARTS_IN_SEGMENT_FIXED_SIZE: usize =
+    size_of::<ChainedStartsInSegment>();
+pub(crate) const CHAINED_FIXUP_TABLE_BASE_SIZE: u64 = (CHAINED_STARTS_IN_IMAGE_OFFSET
     + size_of::<u32>() * (MAX_SEGMENT_COUNT + /* leading segment count */ 1)
-    + size_of::<ChainedStartsInSegment>())
+    + CHAINED_STARTS_IN_SEGMENT_FIXED_SIZE
+    + size_of::<u16>())
     as u64;
 pub(crate) const CHAINED_FIXUP_IMPORT_SIZE: u64 = size_of::<u32>() as u64;
 pub(crate) const CHAINED_FIXUP_PAGE_START_SIZE: u64 = size_of::<u16>() as u64;
@@ -180,6 +190,79 @@ type SectionTable<'data> = &'data [Section64<crate::macho::Endianness>];
 type SymbolTable<'data> = object::read::macho::SymbolTable<'data, macho::MachHeader64<Endianness>>;
 type SymtabEntry = object::macho::Nlist64<Endianness>;
 type Relocation = object::macho::Relocation<Endianness>;
+
+/// A relocation after folding the Mach-O arm64 explicit-addend record into the relocation it
+/// modifies.
+///
+/// Mach-O stores an addend in a separate record immediately before its `BRANCH26`, `PAGE21`, or
+/// `PAGEOFF12` relocation. The generic linker stages deliberately receive only one relocation at
+/// a time, so keep this format-specific pairing at the Mach-O boundary rather than letting either
+/// stage accidentally treat the addend as an independent relocation.
+#[derive(Debug, Copy, Clone)]
+pub(crate) struct RelocationWithAddend {
+    pub(crate) info: object::macho::RelocationInfo,
+    pub(crate) addend: i64,
+}
+
+pub(crate) struct PairedRelocations<'data> {
+    relocations: Iter<'data, Relocation>,
+}
+
+pub(crate) fn paired_relocations(relocations: &[Relocation]) -> PairedRelocations<'_> {
+    PairedRelocations {
+        relocations: relocations.iter(),
+    }
+}
+
+impl<'data> Iterator for PairedRelocations<'data> {
+    type Item = Result<RelocationWithAddend>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let first = self.relocations.next()?;
+        let first_info = first.info(LE);
+        if first_info.r_type != macho::ARM64_RELOC_ADDEND {
+            return Some(Ok(RelocationWithAddend {
+                info: first_info,
+                addend: 0,
+            }));
+        }
+
+        Some((|| {
+            ensure!(
+                !first_info.r_extern && !first_info.r_pcrel && first_info.r_length == 2,
+                "ARM64_RELOC_ADDEND requires r_extern=0, r_pcrel=0, and r_length=2"
+            );
+
+            let Some(primary) = self.relocations.next() else {
+                bail!("ARM64_RELOC_ADDEND must be immediately followed by ARM64_RELOC_BRANCH26, ARM64_RELOC_PAGE21, or ARM64_RELOC_PAGEOFF12");
+            };
+            let primary_info = primary.info(LE);
+            ensure!(
+                first_info.r_address == primary_info.r_address,
+                "ARM64_RELOC_ADDEND at offset 0x{:x} must be paired with a relocation at the same offset, got 0x{:x}",
+                first_info.r_address,
+                primary_info.r_address
+            );
+            ensure!(
+                matches!(
+                    primary_info.r_type,
+                    macho::ARM64_RELOC_BRANCH26
+                        | macho::ARM64_RELOC_PAGE21
+                        | macho::ARM64_RELOC_PAGEOFF12
+                ),
+                "ARM64_RELOC_ADDEND must be immediately followed by ARM64_RELOC_BRANCH26, ARM64_RELOC_PAGE21, or ARM64_RELOC_PAGEOFF12, got {}",
+                primary_info.r_type
+            );
+
+            // `r_symbolnum` occupies a signed 24-bit field in the relocation record.
+            let addend = i64::from(((first_info.r_symbolnum << 8) as i32) >> 8);
+            Ok(RelocationWithAddend {
+                info: primary_info,
+                addend,
+            })
+        })())
+    }
+}
 
 pub(crate) type FileHeader = object::macho::MachHeader64<Endianness>;
 pub(crate) type SegmentCommand = object::macho::SegmentCommand64<Endianness>;
@@ -514,7 +597,10 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
     }
 
     fn section_alignment(&self, section: &SectionHeader) -> Result<u64> {
-        Ok(2u64.pow(section.align(LE)))
+        Ok(minimum_section_alignment(
+            section.flags.get(LE).typ(),
+            2u64.pow(section.align(LE)),
+        ))
     }
 
     fn relocations(
@@ -608,6 +694,18 @@ fn is_non_alloc_section(flags: SectionFlags, segment_name: &[u8]) -> bool {
 
 fn is_tls_section_type(section_type: macho::SectionType) -> bool {
     matches!(section_type, S_THREAD_LOCAL_REGULAR | S_THREAD_LOCAL_ZEROFILL)
+}
+
+/// `S_THREAD_LOCAL_VARIABLES` holds three pointer-sized fields (`__tlv_bootstrap`, a key, and
+/// the initial-data address). Assemblers commonly report alignment 1 for the section, but the
+/// runtime treats the descriptor as a word-aligned structure. Preserve a stronger producer
+/// alignment and enforce the ABI's minimum when assigning the output section address.
+fn minimum_section_alignment(section_type: macho::SectionType, input_alignment: u64) -> u64 {
+    if section_type == S_THREAD_LOCAL_VARIABLES {
+        input_alignment.max(8)
+    } else {
+        input_alignment
+    }
 }
 
 impl platform::SectionHeader for SectionHeader {
@@ -1297,9 +1395,15 @@ impl platform::Platform for MachO {
         section_index: object::SectionIndex,
         scope: &rayon::Scope<'scope>,
     ) -> Result {
-        // TODO
-        for rel in state.relocations(section_index)?.relocations {
-            process_relocation::<A>(state, rel, section_index, resources, queue, scope)?;
+        for relocation in paired_relocations(state.relocations(section_index)?.relocations) {
+            process_relocation::<A>(
+                state,
+                relocation?.info,
+                section_index,
+                resources,
+                queue,
+                scope,
+            )?;
         }
         Ok(())
     }
@@ -1381,7 +1485,7 @@ impl platform::Platform for MachO {
     fn create_finalise_sizes_ext<'data, 'states, 'files, A: platform::Arch<Platform = Self>>(
         _args: &Self::Args,
         groups: &'files mut [layout::GroupState<'data, Self>],
-        _symbol_db: &crate::symbol_db::SymbolDb<'data, Self>,
+        symbol_db: &crate::symbol_db::SymbolDb<'data, Self>,
     ) -> Result<Self::FinaliseSizesExt<'data>>
     where
         'data: 'files,
@@ -1390,19 +1494,32 @@ impl platform::Platform for MachO {
         let mut imported_libraries = Vec::new();
         let mut imported_symbols = Vec::new();
 
+        // Mach-O bind ordinals name load commands, whose identity is their install name rather
+        // than the input pathname. For example, the macOS SDK's `libSystem`, `libc`, and `libm`
+        // stubs all identify as `/usr/lib/libSystem.B.dylib`. Emitting one command per input file
+        // makes dyld reject the output; keep the first command and map every same-name input to
+        // its ordinal during final layout.
+        let mut add_imported_library = |file_id| {
+            if !imported_libraries.iter().any(|&existing| {
+                install_name(existing, symbol_db) == install_name(file_id, symbol_db)
+            }) {
+                imported_libraries.push(file_id);
+            }
+        };
+
         for group in groups {
             for file in &group.files {
                 match file {
                     layout::FileLayoutState::StubLibrary(state) => {
                         if state.format_specific.loaded {
-                            imported_libraries.push(state.file_id());
+                            add_imported_library(state.file_id());
                         }
                         imported_symbols
                             .extend_from_slice(state.format_specific.imported_symbols.as_slice());
                     }
                     layout::FileLayoutState::Dynamic(state) => {
                         if state.format_specific.loaded {
-                            imported_libraries.push(state.file_id());
+                            add_imported_library(state.file_id());
                         }
                         imported_symbols
                             .extend_from_slice(state.format_specific.imported_symbols.as_slice());
@@ -1536,10 +1653,14 @@ impl platform::Platform for MachO {
             })
             .sum::<u64>();
 
-        // Chained fixups record start information per page. At this point the final GOT size is
-        // known, so reserve the fixup table entries needed to describe the GOT pages.
-        fixup_table_size += CHAINED_FIXUP_PAGE_START_SIZE
-            * (state.imported_symbols.len() as u64).div_ceil(MACHO_PAGE_ALIGNMENT.value());
+        // `__got` is the first section in __DATA_CONST. Chained fixups record a start for every
+        // page through the last dynamic slot. The final GOT size is known here, whereas
+        // individual addresses are not assigned until later, so it gives an exact upper bound for
+        // the page-start array.
+        let got_page_count = mem_sizes
+            .get(part_id::GOT)
+            .div_ceil(MACHO_PAGE_ALIGNMENT.value());
+        fixup_table_size += CHAINED_FIXUP_PAGE_START_SIZE * got_page_count;
 
         mem_sizes.increment(
             part_id::CHAINED_FIXUP_TABLE,
@@ -1706,10 +1827,13 @@ impl platform::Platform for MachO {
         _output_kind: crate::output_kind::OutputKind,
         _args: &Self::Args,
     ) {
-        if flags.is_dynamic() && flags.needs_plt() {
+        // Keep size finalisation in lockstep with `create_resolution`: a local resolution can
+        // still consume a PLT or GOT slot. Restricting this to dynamic flags leaves a zero-sized
+        // provisional `__got` that final layout later advances.
+        if flags.needs_plt() {
             mem_sizes.increment(part_id::PLT_GOT, PLT_ENTRY_SIZE);
         }
-        if flags.is_dynamic() && flags.needs_got() {
+        if flags.needs_got() {
             mem_sizes.increment(part_id::GOT, GOT_ENTRY_SIZE);
         }
     }
@@ -1990,11 +2114,12 @@ fn create_dynamic_layout_ext<'data>(
     target_file_id: FileId,
     resources: &layout::FinaliseLayoutResources<'_, 'data, MachO>,
 ) -> Result<Option<DynamicLayoutExt>> {
+    let target_install_name = install_name(target_file_id, resources.symbol_db);
     let Some(index) = resources
         .format_specific
         .imported_libraries
         .iter()
-        .position(|file_id| *file_id == target_file_id)
+        .position(|&file_id| install_name(file_id, resources.symbol_db) == target_install_name)
     else {
         return Ok(None);
     };
@@ -2200,29 +2325,53 @@ fn add_sections_in_segment<'data>(
 #[inline(always)]
 fn process_relocation<'data, 'scope, A: platform::Arch<Platform = MachO>>(
     object: &layout::ObjectLayoutState<'data, MachO>,
-    rel: &Relocation,
+    rel_info: object::macho::RelocationInfo,
     section_index: object::SectionIndex,
     resources: &'scope layout::GraphResources<'data, '_, MachO>,
     queue: &mut layout::LocalWorkQueue<MachO>,
     scope: &rayon::Scope<'scope>,
 ) -> Result {
-    let rel_info = rel.info(LE);
     // r_extern == true if the reference points to a symbol
     if rel_info.r_extern {
         let local_sym_index = SymbolIndex(rel_info.r_symbolnum as usize);
         let symbol_db = resources.symbol_db;
         let local_symbol_id = object.symbol_id_range.input_to_id(local_sym_index);
         let symbol_id = symbol_db.definition(local_symbol_id);
+        let target_is_dynamic = is_dynamic_library(&symbol_db.file(symbol_db.file_id_for_symbol(symbol_id)));
+
+        // A local TLS symbol names its in-image `__thread_vars` descriptor, so its TLVP pair is
+        // resolved directly by `MachOAArch64`. A dylib TLS definition instead needs a separate
+        // runtime-bound TLVP slot and a chained fixup at that slot. Do not let the direct local
+        // representation produce a subtly incorrect linked binary for that case.
+        if target_is_dynamic
+            && matches!(
+                rel_info.r_type,
+                object::macho::ARM64_RELOC_TLVP_LOAD_PAGE21
+                    | object::macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12
+            )
+        {
+            bail!(
+                "{} against dynamically defined TLS symbol `{}` requires a runtime-bound Mach-O TLVP slot, which the relocation writer does not implement",
+                A::rel_type_to_string(rel_info),
+                String::from_utf8_lossy(symbol_db.symbol_name(symbol_id)?.bytes()),
+            );
+        }
+
         let mut flags = resources.local_flags_for_symbol(symbol_id);
         flags.merge(resources.local_flags_for_symbol(local_symbol_id));
 
         let relocation = A::relocation_from_raw(rel_info)?;
         let mut flags_to_add = layout::resolution_flags(relocation.kind);
-        if is_dynamic_library(&symbol_db.file(symbol_db.file_id_for_symbol(symbol_id))) {
+        if target_is_dynamic {
             flags_to_add |= ValueFlags::GOT;
             // TODO: classify symbols more reliably, likely by checking whether their section is
             // __text.
-            if rel_info.r_type == object::macho::ARM64_RELOC_BRANCH26 {
+            if rel_info.r_type == object::macho::ARM64_RELOC_BRANCH26
+                // A local TLS descriptor stores this libSystem function pointer directly. Make
+                // it point at the normal PLT stub so its chained GOT bind remains callable.
+                || (rel_info.r_type == object::macho::ARM64_RELOC_UNSIGNED
+                    && symbol_db.symbol_name(symbol_id)?.bytes() == b"__tlv_bootstrap")
+            {
                 flags_to_add |= ValueFlags::FUNCTION | ValueFlags::PLT;
             }
         }
@@ -2294,6 +2443,85 @@ impl SinglePartSectionId {
 mod tests {
     use super::*;
 
+    fn raw_relocation(
+        r_address: u32,
+        r_symbolnum: u32,
+        r_pcrel: bool,
+        r_length: u8,
+        r_extern: bool,
+        r_type: object::macho::RelocationType,
+    ) -> Relocation {
+        object::macho::RelocationInfo {
+            r_address,
+            r_symbolnum,
+            r_pcrel,
+            r_length,
+            r_extern,
+            r_type,
+        }
+        .relocation(LE)
+    }
+
+    #[test]
+    fn folds_signed_arm64_addends_into_the_following_relocation() {
+        let relocations = [
+            raw_relocation(8, 0x24, false, 2, false, macho::ARM64_RELOC_ADDEND),
+            raw_relocation(8, 7, true, 2, true, macho::ARM64_RELOC_BRANCH26),
+            raw_relocation(4, 0x00ff_fffc, false, 2, false, macho::ARM64_RELOC_ADDEND),
+            raw_relocation(4, 3, false, 2, true, macho::ARM64_RELOC_PAGEOFF12),
+        ];
+
+        let relocations = paired_relocations(&relocations)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+
+        assert_eq!(relocations.len(), 2);
+        assert_eq!(relocations[0].info.r_type, macho::ARM64_RELOC_BRANCH26);
+        assert_eq!(relocations[0].addend, 0x24);
+        assert_eq!(relocations[1].info.r_type, macho::ARM64_RELOC_PAGEOFF12);
+        assert_eq!(relocations[1].addend, -4);
+    }
+
+    #[test]
+    fn rejects_malformed_arm64_addend_pairs() {
+        let missing_primary = [raw_relocation(
+            0,
+            1,
+            false,
+            2,
+            false,
+            macho::ARM64_RELOC_ADDEND,
+        )];
+        assert!(paired_relocations(&missing_primary)
+            .next()
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("must be immediately followed"));
+
+        let wrong_offset = [
+            raw_relocation(4, 1, false, 2, false, macho::ARM64_RELOC_ADDEND),
+            raw_relocation(0, 3, true, 2, true, macho::ARM64_RELOC_BRANCH26),
+        ];
+        assert!(paired_relocations(&wrong_offset)
+            .next()
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("same offset"));
+
+        let wrong_target = [
+            raw_relocation(0, 1, false, 2, false, macho::ARM64_RELOC_ADDEND),
+            raw_relocation(0, 3, true, 2, true, macho::ARM64_RELOC_GOT_LOAD_PAGE21),
+        ];
+        assert!(paired_relocations(&wrong_target)
+            .next()
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("must be immediately followed"));
+    }
+
     #[test]
     fn classifies_non_loadable_macho_sections_from_format_metadata() {
         assert!(!is_non_alloc_section(
@@ -2323,9 +2551,48 @@ mod tests {
     }
 
     #[test]
+    fn thread_variable_descriptors_are_at_least_word_aligned() {
+        assert_eq!(minimum_section_alignment(S_THREAD_LOCAL_VARIABLES, 1), 8);
+        assert_eq!(minimum_section_alignment(S_THREAD_LOCAL_VARIABLES, 16), 16);
+        assert_eq!(minimum_section_alignment(macho::S_REGULAR, 1), 1);
+    }
+
+    #[test]
     fn preserves_read_only_data_const_segment_semantics() {
         assert!(!SegmentName::DATA_CONST.is_writable());
         assert!(!SegmentName::DWARF.is_writable());
         assert!(SegmentName::DATA.is_writable());
     }
+
+    #[test]
+    fn reserves_got_for_a_non_dynamic_got_resolution() {
+        use crate::args::RelocationModel;
+        use crate::layout::compute_allocations;
+        use crate::output_kind::OutputKind;
+        use crate::platform::Platform;
+
+        let args = MachOArgs::default();
+        let output_kind = OutputKind::DynamicExecutable(RelocationModel::Relocatable);
+        let output_sections =
+            crate::output_section_id::OutputSections::<MachO>::with_base_address(0, output_kind);
+        let mut memory_offsets = output_sections.new_part_map();
+        *memory_offsets.get_mut(part_id::GOT) = 0x10;
+
+        let resolution = MachO::create_resolution(
+            ValueFlags::GOT,
+            0xfeed_face,
+            None,
+            &mut memory_offsets,
+            &args,
+            output_kind,
+        );
+
+        assert_eq!(resolution.raw_value, 0x10);
+        assert_eq!(*memory_offsets.get(part_id::GOT), 0x10 + GOT_ENTRY_SIZE);
+        assert_eq!(
+            *compute_allocations::<MachO>(&resolution, output_kind, &args).get(part_id::GOT),
+            GOT_ENTRY_SIZE
+        );
+    }
+
 }
