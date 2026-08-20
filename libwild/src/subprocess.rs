@@ -41,6 +41,10 @@ fn subprocess_result(mut args: Args) -> Result<i32> {
             // Fork success in child - Run linker in this process.
 
             crate::setup_tracing(&args)?;
+            if crate::try_apply_macho_stable_layout_cache(&args) {
+                inform_parent_done(&fds);
+                return Ok(0);
+            }
             let thread_pool = args.common_mut().build_thread_pool()?;
             thread_pool.pool.install(|| -> Result {
                 let linker = crate::Linker::new();

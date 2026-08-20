@@ -260,6 +260,7 @@ pub(crate) fn write<'data, A: Arch<Platform = MachO>>(
     write_code_signature_metadata(layout, sized_output)?;
     write_uuid(layout, sized_output)?;
     write_code_signature_hashes(layout, sized_output)?;
+    crate::stable_layout_cache::stage_after_link(layout, &sized_output.out);
 
     Ok(())
 }

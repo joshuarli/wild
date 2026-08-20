@@ -119,6 +119,38 @@ class PiAgentBenchmarkTests(unittest.TestCase):
             self.assertEqual(command[0], "/Applications/Xcode.app/usr/bin/ld")
             self.assertEqual(command[command.index("-o") + 1], "/tmp/output with spaces")
 
+    def test_opt_in_cache_flags_and_hit_evidence_are_explicit(self) -> None:
+        environment = BENCHMARK.with_wild_incremental_cache(
+            {"RUSTFLAGS": "-C linker=/tmp/clang"}, Path("/tmp/wild-cache")
+        )
+        self.assertIn("-C link-arg=-Wl,-incremental_cache", environment["RUSTFLAGS"])
+        self.assertIn("-C link-arg=-Wl,/tmp/wild-cache", environment["RUSTFLAGS"])
+        with tempfile.TemporaryDirectory() as temporary:
+            log = Path(temporary) / "link.log"
+            log.write_text(
+                "normal linker output\n"
+                "         wild: Mach-O stable-layout cache hit: /tmp/e\n"
+            )
+            self.assertEqual(
+                BENCHMARK.stable_layout_cache_hit_evidence(log),
+                ["wild: Mach-O stable-layout cache hit: /tmp/e"],
+            )
+
+    def test_cargo_driver_can_be_pinned_independently_of_path(self) -> None:
+        args = BENCHMARK.parse_args(
+            [
+                "--config",
+                "workload.json",
+                "--workspace",
+                "/tmp/repository",
+                "--output",
+                "/tmp/result.json",
+                "--cargo",
+                "/opt/homebrew/opt/rustup/bin/cargo",
+            ]
+        )
+        self.assertEqual(args.cargo, Path("/opt/homebrew/opt/rustup/bin/cargo"))
+
     def test_macho_header_rejects_wrong_architecture(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "not-arm64"

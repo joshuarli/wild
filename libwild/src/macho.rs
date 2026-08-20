@@ -110,7 +110,15 @@ pub(crate) fn link_for_arch<'data, F: FileSystem>(
         );
     }
 
-    linker.link_for_arch::<MachO, crate::macho_aarch64::MachOAArch64>(args)
+    if crate::stable_layout_cache::try_apply(args) {
+        return Ok(crate::LinkerOutput { layout: None });
+    }
+
+    let result = linker.link_for_arch::<MachO, crate::macho_aarch64::MachOAArch64>(args);
+    if result.is_ok() {
+        crate::stable_layout_cache::publish_staged(args);
+    }
+    result
 }
 
 #[repr(u32)]

@@ -5,7 +5,8 @@ This script intentionally uses only Python's standard library. A workload JSON f
 Cargo target, output artifact, controlled source mutation, and comparison thresholds. It compares
 Apple ld64 with Wild while keeping Rust's compiler driver as Xcode Clang in both cases.
 "Incremental" means Cargo rebuilds after one controlled source-file change with the same target
-directory; it does not claim that Wild implements incremental linking.
+directory. By default it does not claim that Wild implements incremental linking; the explicit
+`--wild-incremental-cache` mode instead measures Wild's separately verified stable-layout cache.
 
 The benchmark never mutates the supplied checkout. Each sample copies it to a temporary sibling
 directory, so relative path dependencies outside the source tree retain their relationship. A
@@ -32,12 +33,14 @@ from dataclasses import asdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from typing import Callable
 
 
 SCHEMA_VERSION = "cargo-link-build-benchmark/v1"
 MACHO_64_MAGIC = 0xFEEDFACF
 CPU_TYPE_ARM64 = 0x0100000C
 MH_EXECUTE = 2
+STABLE_LAYOUT_CACHE_HIT_PREFIX = "wild: Mach-O stable-layout cache hit:"
 
 
 @dataclass(frozen=True)
@@ -218,6 +221,25 @@ def sanitized_environment(
     return environment
 
 
+def with_wild_incremental_cache(environment: dict[str, str], cache_dir: Path) -> dict[str, str]:
+    """Enables Wild's opt-in Mach-O stable-layout cache for one disposable sample.
+
+    Rustflags are space-delimited, so reject whitespace in this particular cache root instead of
+    silently passing a different linker argument. The benchmark creates its own per-sample
+    subdirectories underneath the supplied root.
+    """
+    if any(character.isspace() for character in str(cache_dir)):
+        raise ValueError(f"--wild-incremental-cache path must not contain whitespace: {cache_dir}")
+    updated = dict(environment)
+    updated["RUSTFLAGS"] = (
+        updated["RUSTFLAGS"]
+        # Rust invokes Clang, which must forward ld64-style single-dash arguments rather than
+        # interpreting them as compiler options itself.
+        + f" -C link-arg=-Wl,-incremental_cache -C link-arg=-Wl,{cache_dir}"
+    )
+    return updated
+
+
 def cargo_command(cargo: Path, channel: str, workload: Workload, *, offline: bool) -> list[str]:
     command = [
         str(cargo),
@@ -313,15 +335,23 @@ def replay_incremental_link(
     linker: Linker,
     repetitions: int,
     expected_file_type: int,
+    fixed_output: Path | None = None,
+    prepare_replay: Callable[[], None] | None = None,
+    require_stable_layout_cache_hit: bool = False,
 ) -> list[dict[str, Any]]:
     """Reruns the final changed-source linker argv without invoking Cargo or rustc."""
     output_index = command.index("-o") + 1
     output_dir.mkdir(parents=True, exist_ok=True)
     samples: list[dict[str, Any]] = []
     for repetition in range(repetitions):
-        output = output_dir / f"{linker.name}-{repetition}"
+        if prepare_replay is not None:
+            prepare_replay()
+        output = fixed_output if fixed_output is not None else output_dir / f"{linker.name}-{repetition}"
         replay = list(command)
-        replay[output_index] = str(output)
+        if fixed_output is None:
+            replay[output_index] = str(output)
+        elif Path(replay[output_index]) != fixed_output:
+            raise RuntimeError("Cache replay command did not retain its cached output path")
         log_path = output_dir / f"{linker.name}-{repetition}.log"
         start = time.perf_counter_ns()
         with log_path.open("w", encoding="utf-8") as log:
@@ -335,15 +365,52 @@ def replay_incremental_link(
         elapsed = time.perf_counter_ns() - start
         if completed.returncode:
             raise RuntimeError(f"{linker.name} incremental replay failed; see {log_path}")
+        cache_hits = stable_layout_cache_hit_evidence(log_path)
+        if require_stable_layout_cache_hit and not cache_hits:
+            raise RuntimeError(
+                f"Wild stable-layout cache missed during incremental replay; see {log_path}"
+            )
         samples.append(
             {
                 "elapsed_ns": elapsed,
                 "log": str(log_path),
                 "command": replay,
                 "artifact": parse_macho_arm64_executable(output, expected_file_type),
+                "stable_layout_cache_hits": cache_hits,
             }
         )
     return samples
+
+
+def stable_layout_cache_hit_evidence(log_path: Path) -> list[str]:
+    """Returns cache hits, including records Cargo indents in a linker-stderr warning."""
+    return [
+        line.strip()
+        for line in log_path.read_text(errors="replace").splitlines()
+        if line.strip().startswith(STABLE_LAYOUT_CACHE_HIT_PREFIX)
+    ]
+
+
+def restore_cached_direct_baseline(
+    *,
+    baseline_output: Path,
+    baseline_output_snapshot: Path,
+    cache_dir: Path,
+    cache_snapshot: Path,
+    stale_published_output: Path | None = None,
+) -> None:
+    """Restores the exact pre-change output and sidecars before a cache-hit replay.
+
+    Cargo gives a changed crate a new hashed output path. Each sample therefore restores the old
+    output named by the sidecar, then lets Wild atomically publish the changed command's real
+    `-o` path. Rewriting either path to a benchmark-only name would invalidate this contract.
+    """
+    baseline_output.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(baseline_output_snapshot, baseline_output)
+    if stale_published_output is not None and stale_published_output != baseline_output:
+        stale_published_output.unlink(missing_ok=True)
+    shutil.rmtree(cache_dir, ignore_errors=True)
+    shutil.copytree(cache_snapshot, cache_dir)
 
 
 def mutate_incremental_source(path: Path, mutation: SourceMutation) -> tuple[str, str]:
@@ -396,6 +463,7 @@ def run_sample(
     sample_index: int,
     link_repetitions: int,
     keep_workspaces: bool,
+    wild_incremental_cache_root: Path | None,
 ) -> dict[str, Any]:
     workspace = copy_workspace_to_sibling(source)
     target_dir = result_root / "targets" / f"{linker.name}-{sample_index}"
@@ -403,6 +471,20 @@ def run_sample(
     logs_dir.mkdir(parents=True, exist_ok=True)
     target_dir.parent.mkdir(parents=True, exist_ok=True)
     target_dir.mkdir(parents=True, exist_ok=False)
+    cache_enabled = linker.path is not None and wild_incremental_cache_root is not None
+    cache_dir = (
+        wild_incremental_cache_root / f"{linker.name}-{sample_index}"
+        if cache_enabled
+        else None
+    )
+    cache_environment = (
+        with_wild_incremental_cache(environment, cache_dir) if cache_dir is not None else environment
+    )
+    cache_setup_target = (
+        target_dir.parent / f"{linker.name}-{sample_index}-cache-setup"
+        if cache_enabled
+        else None
+    )
     mutation_path = workspace / workload.mutation.path
     before = mutation_path.read_bytes()
     before_hash = hashlib.sha256(before).hexdigest()
@@ -419,42 +501,156 @@ def run_sample(
         cold_artifact = parse_macho_arm64_executable(artifact_path, workload.macho_file_type)
         cold_evidence = linker_selection_evidence(cold_log, linker)
 
+        cache_setup_log: Path | None = None
+        incremental_target_dir = target_dir
+        incremental_environment = environment
+        if cache_setup_target is not None:
+            # Cold wall time deliberately uses normal Wild. Establish the opt-in cache in a
+            # separate, unmeasured Cargo target so its baseline and its changed rebuild share a
+            # real source/object/output lineage without inflating the cold comparison.
+            cache_setup_log = logs_dir / f"{linker.name}-{sample_index}-cache-setup.log"
+            run_cargo_build(
+                command,
+                workspace=workspace,
+                environment=cache_environment,
+                target_dir=cache_setup_target,
+                log_path=cache_setup_log,
+            )
+            incremental_target_dir = cache_setup_target
+            incremental_environment = cache_environment
+
         mutation_before, mutation_after = mutate_incremental_source(mutation_path, workload.mutation)
         assert mutation_before == before_hash
         _, incremental_elapsed = run_cargo_build(
             command,
             workspace=workspace,
-            environment=environment,
-            target_dir=target_dir,
+            environment=incremental_environment,
+            target_dir=incremental_target_dir,
             log_path=incremental_log,
         )
-        incremental_artifact = parse_macho_arm64_executable(artifact_path, workload.macho_file_type)
+        incremental_artifact_path = incremental_target_dir / workload.artifact.format(
+            target=workload.target, profile=workload.profile
+        )
+        incremental_artifact = parse_macho_arm64_executable(
+            incremental_artifact_path, workload.macho_file_type
+        )
         incremental_evidence = linker_selection_evidence(incremental_log, linker)
-        # Rustc removes its temporary final codegen object after a normal Cargo link. Create a
-        # separate, unmeasured changed-source build with `save-temps` solely to preserve that
-        # exact final-link input for the direct incremental-link samples below. It never affects
-        # the cold or Cargo-incremental wall measurements.
-        capture_marker = b"\n// wild benchmark direct-link capture marker\n"
-        capture_before, capture_after = append_capture_marker(mutation_path, capture_marker)
-        capture_target = target_dir / "incremental-link-capture"
-        capture_log = logs_dir / f"{linker.name}-{sample_index}-incremental-link-capture.log"
-        capture_environment = dict(environment)
-        capture_environment["RUSTFLAGS"] = capture_environment["RUSTFLAGS"] + " -C save-temps"
-        run_cargo_build(
-            command,
-            workspace=workspace,
-            environment=capture_environment,
-            target_dir=capture_target,
-            log_path=capture_log,
-        )
-        incremental_link = replay_incremental_link(
-            command=final_link_command(capture_log, linker),
-            environment=capture_environment,
-            output_dir=logs_dir / f"{linker.name}-{sample_index}-incremental-link",
-            linker=linker,
-            repetitions=link_repetitions,
-            expected_file_type=workload.macho_file_type,
-        )
+        incremental_cache_hits = stable_layout_cache_hit_evidence(incremental_log)
+        if cache_enabled and not incremental_cache_hits:
+            raise RuntimeError(
+                f"Wild stable-layout cache missed during Cargo incremental build; see {incremental_log}"
+            )
+
+        if cache_dir is None:
+            # Rustc removes its temporary final codegen object after a normal Cargo link. Create a
+            # separate, unmeasured changed-source build with `save-temps` solely to preserve that
+            # exact final-link input for the direct incremental-link samples below. It never
+            # affects the cold or Cargo-incremental wall measurements.
+            capture_marker = b"\n// wild benchmark direct-link capture marker\n"
+            capture_before, capture_after = append_capture_marker(mutation_path, capture_marker)
+            capture_target = target_dir / "incremental-link-capture"
+            capture_log = logs_dir / f"{linker.name}-{sample_index}-incremental-link-capture.log"
+            capture_environment = dict(environment)
+            capture_environment["RUSTFLAGS"] = capture_environment["RUSTFLAGS"] + " -C save-temps"
+            run_cargo_build(
+                command,
+                workspace=workspace,
+                environment=capture_environment,
+                target_dir=capture_target,
+                log_path=capture_log,
+            )
+            incremental_link = replay_incremental_link(
+                command=final_link_command(capture_log, linker),
+                environment=capture_environment,
+                output_dir=logs_dir / f"{linker.name}-{sample_index}-incremental-link",
+                linker=linker,
+                repetitions=link_repetitions,
+                expected_file_type=workload.macho_file_type,
+            )
+            incremental_link_capture: dict[str, Any] = {
+                "capture_log": str(capture_log),
+                "capture_mutation": {
+                    "before_sha256": capture_before,
+                    "after_sha256": capture_after,
+                    "uses_rustc_save_temps": True,
+                },
+                "samples": incremental_link,
+            }
+        else:
+            # Cargo gives the changed object/output fresh hashes. Build a separate baseline with
+            # save-temps, snapshot its output/sidecars, then rebuild exactly once with the source
+            # mutation. Each direct sample restores that baseline and publishes the changed `-o`.
+            restore_source(mutation_path, before, before_hash)
+            direct_target = target_dir / "incremental-link-cache"
+            direct_cache_dir = cache_dir / "direct"
+            capture_environment = with_wild_incremental_cache(environment, direct_cache_dir)
+            capture_environment["RUSTFLAGS"] += " -C save-temps"
+            baseline_log = logs_dir / f"{linker.name}-{sample_index}-incremental-link-baseline.log"
+            run_cargo_build(
+                command,
+                workspace=workspace,
+                environment=capture_environment,
+                target_dir=direct_target,
+                log_path=baseline_log,
+            )
+            baseline_command = final_link_command(baseline_log, linker)
+            baseline_output = Path(baseline_command[baseline_command.index("-o") + 1])
+            baseline_output_snapshot = logs_dir / f"{linker.name}-{sample_index}-cache-baseline-output"
+            shutil.copy2(baseline_output, baseline_output_snapshot)
+            cache_snapshot = logs_dir / f"{linker.name}-{sample_index}-cache-baseline-sidecars"
+            shutil.copytree(direct_cache_dir, cache_snapshot)
+
+            capture_before, capture_after = mutate_incremental_source(mutation_path, workload.mutation)
+            assert capture_before == before_hash and capture_after == mutation_after
+            capture_log = logs_dir / f"{linker.name}-{sample_index}-incremental-link-capture.log"
+            run_cargo_build(
+                command,
+                workspace=workspace,
+                environment=capture_environment,
+                target_dir=direct_target,
+                log_path=capture_log,
+            )
+            changed_command = final_link_command(capture_log, linker)
+            changed_output = Path(changed_command[changed_command.index("-o") + 1])
+            capture_hits = stable_layout_cache_hit_evidence(capture_log)
+            if not capture_hits:
+                raise RuntimeError(
+                    f"Wild stable-layout cache missed while capturing the changed direct link; see {capture_log}"
+                )
+            incremental_link = replay_incremental_link(
+                command=changed_command,
+                environment=capture_environment,
+                output_dir=logs_dir / f"{linker.name}-{sample_index}-incremental-link",
+                linker=linker,
+                repetitions=link_repetitions,
+                expected_file_type=workload.macho_file_type,
+                fixed_output=changed_output,
+                prepare_replay=lambda: restore_cached_direct_baseline(
+                    baseline_output=baseline_output,
+                    baseline_output_snapshot=baseline_output_snapshot,
+                    cache_dir=direct_cache_dir,
+                    cache_snapshot=cache_snapshot,
+                    stale_published_output=changed_output,
+                ),
+                require_stable_layout_cache_hit=True,
+            )
+            incremental_link_capture = {
+                "baseline_log": str(baseline_log),
+                "capture_log": str(capture_log),
+                "capture_mutation": {
+                    "before_sha256": capture_before,
+                    "after_sha256": capture_after,
+                    "uses_rustc_save_temps": True,
+                },
+                "cache": {
+                    "baseline_output": str(baseline_output),
+                    "changed_output": str(changed_output),
+                    "baseline_sidecars": str(cache_snapshot),
+                    "capture_hits": capture_hits,
+                    "direct_samples_require_hits": True,
+                },
+                "samples": incremental_link,
+            }
         restored_hash = restore_source(mutation_path, before, before_hash)
         return {
             "sample": sample_index,
@@ -470,6 +666,8 @@ def run_sample(
                 "elapsed_ns": incremental_elapsed,
                 "log": str(incremental_log),
                 "selection_evidence": incremental_evidence,
+                "stable_layout_cache_hits": incremental_cache_hits,
+                "cache_setup_log": str(cache_setup_log) if cache_setup_log is not None else None,
                 "mutation": {
                     "path": str(mutation_path.relative_to(workspace)),
                     "before_sha256": mutation_before,
@@ -478,15 +676,7 @@ def run_sample(
                 },
                 "artifact": incremental_artifact,
             },
-            "incremental_link": {
-                "capture_log": str(capture_log),
-                "capture_mutation": {
-                    "before_sha256": capture_before,
-                    "after_sha256": capture_after,
-                    "uses_rustc_save_temps": True,
-                },
-                "samples": incremental_link,
-            },
+            "incremental_link": incremental_link_capture,
         }
     finally:
         # The original supplied checkout never changes. The copy should also be clean before it
@@ -496,6 +686,8 @@ def run_sample(
         if not keep_workspaces:
             shutil.rmtree(workspace, ignore_errors=True)
             shutil.rmtree(target_dir, ignore_errors=True)
+            if cache_setup_target is not None:
+                shutil.rmtree(cache_setup_target, ignore_errors=True)
 
 
 def comparison(runs: list[dict[str, Any]], workload: Workload) -> dict[str, Any]:
@@ -549,6 +741,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--config", type=Path, required=True, help="Checked-in workload JSON profile")
     parser.add_argument("--workspace", type=Path, required=True, help="Clean source checkout to copy and build")
     parser.add_argument("--wild", type=Path, default=default_wild_path())
+    parser.add_argument(
+        "--cargo",
+        type=Path,
+        help="Cargo executable to invoke as +<workload toolchain>; defaults to cargo on PATH",
+    )
     parser.add_argument("--output", type=Path, required=True, help="JSON result path")
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument(
@@ -563,6 +760,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--wild-timing-json",
         action="store_true",
         help="Pass Wild --time=json and retain phase records in Wild Cargo logs",
+    )
+    parser.add_argument(
+        "--wild-incremental-cache",
+        type=Path,
+        help=(
+            "Opt-in root for per-sample Wild stable-layout cache sidecars. The runner requires "
+            "a verified cache hit for changed-source Wild samples."
+        ),
     )
     parser.add_argument("--enforce-goals", action="store_true")
     return parser.parse_args(argv)
@@ -584,27 +789,44 @@ def main(argv: list[str]) -> int:
     revision = clean_git_revision(workspace)
     clang = Path(run_checked(["xcrun", "--find", "clang"]).strip()).resolve()
     sdk = run_checked(["xcrun", "--show-sdk-path"]).strip()
-    cargo_path = Path(shutil.which("cargo") or "")
+    cargo_path = args.cargo if args.cargo is not None else Path(shutil.which("cargo") or "")
     if not cargo_path:
         raise FileNotFoundError("cargo was not found on PATH")
+    if not cargo_path.is_file():
+        raise FileNotFoundError(f"cargo executable does not exist: {cargo_path}")
     command = cargo_command(cargo_path, channel, workload, offline=not args.allow_network)
     result_root = output.with_suffix("").with_name(f"{output.stem}-artifacts")
     if result_root.exists():
         raise FileExistsError(f"Refusing to overwrite benchmark artifacts: {result_root}")
     result_root.mkdir(parents=True)
+    wild_incremental_cache_root: Path | None = None
+    if args.wild_incremental_cache is not None:
+        wild_incremental_cache_root = args.wild_incremental_cache.resolve()
+        if wild_incremental_cache_root.exists():
+            if any(wild_incremental_cache_root.iterdir()):
+                raise FileExistsError(
+                    "Refusing to mix benchmark cache state with an existing directory: "
+                    f"{wild_incremental_cache_root}"
+                )
+        else:
+            wild_incremental_cache_root.mkdir(parents=True)
 
     linkers = [Linker("apple-ld64", None), Linker("wild", wild)]
     runs: list[dict[str, Any]] = []
     try:
-        for linker in linkers:
-            environment = sanitized_environment(
-                clang=clang,
-                sdk=sdk,
-                wild=linker.path,
-                deployment_target=workload.deployment_target,
-                wild_timing_json=args.wild_timing_json and linker.path is not None,
-            )
-            for sample_index in range(args.repetitions):
+        # Interleave and alternate linker order so build-cache warmth, thermal drift, and unrelated
+        # host load do not systematically favour whichever linker happens to run first or last.
+        # Each sample still owns a separate Cargo target directory.
+        for sample_index in range(args.repetitions):
+            sample_linkers = linkers if sample_index % 2 == 0 else list(reversed(linkers))
+            for linker in sample_linkers:
+                environment = sanitized_environment(
+                    clang=clang,
+                    sdk=sdk,
+                    wild=linker.path,
+                    deployment_target=workload.deployment_target,
+                    wild_timing_json=args.wild_timing_json and linker.path is not None,
+                )
                 runs.append(
                     run_sample(
                         source=workspace,
@@ -618,6 +840,9 @@ def main(argv: list[str]) -> int:
                         sample_index=sample_index,
                         link_repetitions=args.link_repetitions,
                         keep_workspaces=args.keep_workspaces,
+                        wild_incremental_cache_root=(
+                            wild_incremental_cache_root if linker.path is not None else None
+                        ),
                     )
                 )
         summary = comparison(runs, workload)
@@ -647,6 +872,11 @@ def main(argv: list[str]) -> int:
                 "link_repetitions": args.link_repetitions,
                 "offline": not args.allow_network,
                 "wild_timing_json": args.wild_timing_json,
+                "wild_incremental_cache_root": (
+                    str(wild_incremental_cache_root)
+                    if wild_incremental_cache_root is not None
+                    else None
+                ),
                 "result_artifacts": str(result_root),
             },
             "runs": runs,

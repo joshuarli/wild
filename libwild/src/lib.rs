@@ -74,6 +74,7 @@ pub(crate) mod save_dir;
 pub(crate) mod sframe;
 pub(crate) mod sharding;
 pub(crate) mod string_merging;
+pub(crate) mod stable_layout_cache;
 #[cfg(all(feature = "fork", unix))]
 pub(crate) mod subprocess;
 #[cfg(not(all(feature = "fork", unix)))]
@@ -136,6 +137,9 @@ use tracing_subscriber::util::SubscriberInitExt;
 /// jobserver tokens, then cleans up associated resources. Only use this function if you've OK with
 /// waiting for cleanup.
 pub fn run(mut args: Args) -> error::Result {
+    if try_apply_macho_stable_layout_cache(&args) {
+        return Ok(());
+    }
     let thread_pool = args.common_mut().build_thread_pool()?;
     thread_pool.pool.install(move || -> error::Result {
         let linker = Linker::new();
@@ -146,6 +150,18 @@ pub fn run(mut args: Args) -> error::Result {
     })?;
 
     Ok(())
+}
+
+/// Runs the opt-in Mach-O cache before creating linker or Rayon state.
+///
+/// A cache hit only patches a verified owned output image, so it has no work that benefits from a
+/// worker pool. Avoiding that fixed setup cost is material for the intentionally small
+/// changed-object links this path targets. All misses proceed through the ordinary linker.
+pub(crate) fn try_apply_macho_stable_layout_cache(args: &Args) -> bool {
+    match args {
+        Args::MachO(macho_args) => stable_layout_cache::try_apply(macho_args),
+        Args::Coff(_) | Args::Elf(_) | Args::Wasm(_) => false,
+    }
 }
 
 /// Sets up whatever tracing, if any, is indicated by the supplied arguments. This can only be

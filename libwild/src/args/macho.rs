@@ -16,6 +16,7 @@ use itertools::repeat_n;
 use object::macho::Version;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 #[derive(Debug)]
@@ -38,6 +39,12 @@ pub struct MachOArgs {
     pub(crate) export_list_path: Option<PathBuf>,
     pub(crate) rpaths: Vec<String>,
     pub(crate) entry: String,
+    /// Opt-in directory for the ARM64 Mach-O stable-layout incremental cache. The cache is an
+    /// optimisation only: unsupported changes and invalid cache state fall back to a normal link.
+    pub(crate) incremental_cache: Option<PathBuf>,
+    /// A pre-pool cache probe records its miss here so the normal Mach-O path does not repeat
+    /// the same sidecar I/O after constructing Rayon workers.
+    pub(crate) incremental_cache_attempted: AtomicBool,
 }
 
 /// The Mach-O output kinds supported by the writer. These must remain distinct from the generic
@@ -128,6 +135,8 @@ impl Default for MachOArgs {
             export_list_path: None,
             rpaths: Vec::new(),
             entry: "_main".to_owned(),
+            incremental_cache: None,
+            incremental_cache_attempted: AtomicBool::new(false),
         }
     }
 }
@@ -528,6 +537,20 @@ fn setup_argument_parser() -> ArgumentParser<MachOArgs> {
             Ok(())
         });
 
+    // This deliberately uses ld64's single-dash spelling so clang can forward it with
+    // `-Wl,-incremental_cache,<dir>`. It is an explicit opt-in because cache validation is
+    // intentionally conservative and a cache miss must remain indistinguishable from a normal
+    // link.
+    parser
+        .declare_with_param()
+        .long("incremental_cache")
+        .help("Enable the ARM64 Mach-O stable-layout incremental cache")
+        .execute(|args, _modifier_stack, value| {
+            ensure!(!value.is_empty(), "-incremental_cache requires a directory");
+            args.incremental_cache = Some(PathBuf::from(value));
+            Ok(())
+        });
+
     parser
         .declare()
         .short("S")
@@ -672,6 +695,18 @@ mod tests {
 
         assert_eq!(args.common.version_mode, VersionMode::Verbose);
         assert_eq!(args.common.inputs.len(), 1);
+    }
+
+    #[test]
+    fn parses_opt_in_incremental_cache_directory() {
+        let mut args = MachOArgs::new().unwrap();
+        args.parse(["-incremental_cache", "/tmp/wild-cache", "main.o"].iter())
+            .unwrap();
+
+        assert_eq!(
+            args.incremental_cache.as_deref(),
+            Some(Path::new("/tmp/wild-cache"))
+        );
     }
 
     #[test]

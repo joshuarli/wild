@@ -37,6 +37,10 @@ struct SaveDirState {
 }
 
 impl SaveDir {
+    pub(crate) fn is_enabled(&self) -> bool {
+        self.0.is_some()
+    }
+
     pub(crate) fn new<S: AsRef<str>, I: Iterator<Item = S>>(mut args: I) -> Result<Self> {
         let Some(dir) = save_dir_from_env()? else {
             return Ok(Self(None));

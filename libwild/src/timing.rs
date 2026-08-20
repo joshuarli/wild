@@ -199,7 +199,15 @@ where
                 TimingOutput::Text => {
                     println!("{indent}{reading} {name}{}", data.attributes_string);
                 }
-                TimingOutput::Json => print_json_phase(&self.output_path, name, &reading),
+                // JSON is designed for repeatable benchmark analysis. Emitting every inner
+                // span is self-defeating for links with many live atoms: formatting thousands
+                // of JSON Lines can dominate the thing being measured. Keep the existing text
+                // tree exhaustive for interactive diagnosis, while JSON emits a fixed set of
+                // link-critical phases that is stable enough for tools to compare.
+                TimingOutput::Json if should_emit_json_phase(name) => {
+                    print_json_phase(&self.output_path, name, &reading);
+                }
+                TimingOutput::Json => {}
             }
         }
     }
@@ -238,8 +246,42 @@ pub(crate) fn init_tracing(
     tracing::subscriber::set_global_default(subscriber).map_err(|_| AlreadyInitialised)
 }
 
-/// Writes one `--time=json` record. The field names and their order are part of the command-line
-/// contract: downstream tools may parse these JSON Lines without scraping the human timing tree.
+/// Whether `--time=json` emits this completed phase.
+///
+/// Keep this deliberately small. The names form a useful, link-format-neutral summary, with a
+/// handful of Mach-O-specific writer and cache phases where our ARM64 benchmark needs more
+/// resolution. The human-readable `--time` output remains the exhaustive phase tree.
+fn should_emit_json_phase(name: &str) -> bool {
+    matches!(
+        name,
+        "Link"
+            | "Parse args"
+            | "Open input files"
+            | "Load inputs into symbol DB"
+            | "Layout"
+            | "Traverse reference graph"
+            | "Write output file"
+            | "Write data to file"
+            | "Copy Mach-O object data"
+            | "Write Mach-O dynamic tables"
+            | "Write Mach-O unwind tables"
+            | "Build Mach-O chained fixups"
+            | "Hash Mach-O UUID"
+            | "Hash Mach-O code signature"
+            | "Try Mach-O stable-layout cache"
+            | "Mach-O stable-layout cache: fingerprint inputs"
+            | "Mach-O stable-layout cache: validate changed object snapshot"
+            | "Mach-O stable-layout cache: read and verify baseline image"
+            | "Mach-O stable-layout cache: patch and sign"
+            | "Mach-O stable-layout cache: recheck input metadata"
+            | "Mach-O stable-layout cache: atomically replace output"
+            | "Mach-O stable-layout cache: atomically update sidecars"
+    )
+}
+
+/// Writes one selected `--time=json` record. The field names and their order are part of the
+/// command-line contract: downstream tools may parse these JSON Lines without scraping the
+/// human timing tree.
 fn print_json_phase(output_path: &str, name: &str, reading: &Reading) {
     println!("{}", json_phase_record(output_path, name, reading));
 }
@@ -382,6 +424,15 @@ mod tests {
             json_phase_record("target/release/pi-agent-headless", "Hash Mach-O UUID", &reading),
             "{\"schema_version\":1,\"event\":\"phase\",\"output\":\"target/release/pi-agent-headless\",\"name\":\"Hash Mach-O UUID\",\"wall_time_ns\":42,\"counters\":[{\"name\":\"cycles\",\"value\":7}]}"
         );
+    }
+
+    #[test]
+    fn json_timing_is_bounded_to_link_critical_phases() {
+        assert!(should_emit_json_phase("Link"));
+        assert!(should_emit_json_phase("Traverse reference graph"));
+        assert!(should_emit_json_phase("Try Mach-O stable-layout cache"));
+        assert!(!should_emit_json_phase("Record Mach-O live atom"));
+        assert!(!should_emit_json_phase("Write object"));
     }
 }
 
