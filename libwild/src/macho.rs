@@ -4304,8 +4304,9 @@ impl<'data> File<'data> {
     /// them during layout could make otherwise dead atoms live.
     ///
     /// ARM64 `macho/rust-debug-dwarf` establishes the Rust half of this contract with the exact
-    /// `nightly-2026-07-24` toolchain. Keep additional language forms out until their map and
-    /// `dsymutil` behavior have comparable controls.
+    /// `nightly-2026-07-24` toolchain. `macho/cxx-debug-dwarf` and `macho/objc-debug-dwarf`
+    /// establish exactly `DW_LANG_C_plus_plus_14` and `DW_LANG_ObjC`, respectively. Keep other
+    /// language forms out until their map and `dsymutil` behavior have comparable controls.
     fn debug_map_source_path(&self) -> Result<Option<Vec<u8>>> {
         let dwarf_sections = gimli::DwarfSections::load(&|id: gimli::SectionId| -> Result<Cow<[u8]>> {
             // Mach-O spells DWARF section names with two leading underscores, while gimli uses
@@ -4347,6 +4348,8 @@ impl<'data> File<'data> {
                 | gimli::DW_LANG_C11
                 | gimli::DW_LANG_C17
                 | gimli::DW_LANG_Rust
+                | gimli::DW_LANG_C_plus_plus_14
+                | gimli::DW_LANG_ObjC
         ) {
             return Ok(None);
         }

@@ -116,8 +116,9 @@ merged `__objc_methname` string and therefore participates in the chained local-
 section, which dyld makes immutable after applying the same rebases.
 
 Only Clang's default ARM64 `_objc_msgSend$selector` form is implemented. Other selector message
-forms, generic Objective-C metadata linking, Objective-C dSYM maps, and range-extension islands
-for selector veneers remain outside this bounded support.
+forms, generic Objective-C metadata linking, Objective-C dSYM maps beyond the separately
+controlled loose-object `DW_LANG_ObjC` path in `macho/objc-debug-dwarf`, and range-extension
+islands for selector veneers remain outside this bounded support.
 
 - generally speaking the mach-O format is pretty close to the ELF container
 

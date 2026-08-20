@@ -232,6 +232,10 @@
 //! TestRelinkAfterRun:{bool} Run Wild's output, relink it at the same path, then run it again.
 //! Verifies that relinking replaces the output file rather than updating its inode in place.
 //!
+//! TestCodeSignatureSamePathStress:{bool} On macOS, repeatedly relink one executable at the same
+//! path while alternately adding and removing `Object:noadd` inputs. Every generation must be
+//! code-signature-valid, executable, and replace the preceding output inode.
+//!
 //! AssertOutputFileMatches:{filename}:{regex} Verifies that a file in the output directory contains
 //! at least one line matching the specified regex. Such output files are generally written by
 //! specifying a flag in LinkArgs that uses $OUT_DIR.
@@ -1947,6 +1951,7 @@ struct Config {
     requires_linker_plugin: bool,
     test_update_in_place: bool,
     test_relink_after_run: bool,
+    test_code_signature_same_path_stress: bool,
     test_config: TestConfig,
     tracked_files: Vec<PathBuf>,
     so_single_linker: Option<Linker>,
@@ -2757,6 +2762,7 @@ impl Config {
             requires_rust_musl: false,
             test_update_in_place: false,
             test_relink_after_run: false,
+            test_code_signature_same_path_stress: false,
             test_config: test_config.clone(),
             tracked_files: Default::default(),
             available_linkers: linker_catalog.available.clone(),
@@ -3412,6 +3418,9 @@ fn process_directive(
         "TestRelinkAfterRun" => {
             config.test_relink_after_run = arg.parse()?;
         }
+        "TestCodeSignatureSamePathStress" => {
+            config.test_code_signature_same_path_stress = arg.parse()?;
+        }
         "DriverMode" => {
             config.driver_mode = Some(DriverMode::from_str(arg).map_err(|_| {
                 error!(
@@ -3504,6 +3513,17 @@ impl ProgramInputs {
         #[cfg(target_os = "macos")]
         if config.test_relink_after_run && config.should_run && linker.is_wild() {
             self.run_relink_after_run_test(linker, &inputs, config, cross_arch, &link_output)?;
+        }
+
+        #[cfg(target_os = "macos")]
+        if config.test_code_signature_same_path_stress && config.should_run && linker.is_wild() {
+            self.run_code_signature_same_path_stress(
+                linker,
+                &inputs,
+                config,
+                cross_arch,
+                &link_output,
+            )?;
         }
 
         let shared_objects = inputs
@@ -3626,6 +3646,99 @@ impl ProgramInputs {
         reference_output
             .run(cross_arch)
             .with_context(|| format!("Failed to run {}", reference_output.binary.display()))?;
+
+        Ok(())
+    }
+
+    /// Exercise the macOS vnode/signature cache boundary with output layouts that span very
+    /// different numbers of signed pages. `Object:noadd` dependencies provide the large payload:
+    /// the ordinary link excludes it, while the grown generations include it at the exact same
+    /// output pathname. Keeping the preceding file open makes accidental in-place replacement
+    /// observable even when each executable process has already exited.
+    #[cfg(target_os = "macos")]
+    fn run_code_signature_same_path_stress(
+        &self,
+        linker: &Linker,
+        inputs: &[LinkerInput],
+        config: &Config,
+        cross_arch: Option<Architecture>,
+        reference_output: &LinkOutput,
+    ) -> Result {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let has_optional_payload = inputs.iter().any(|input| !input.auto_add);
+        ensure!(
+            has_optional_payload,
+            "TestCodeSignatureSamePathStress requires at least one Object:noadd input"
+        );
+
+        let mut grown_inputs = inputs.to_vec();
+        for input in &mut grown_inputs {
+            input.auto_add = true;
+        }
+
+        let baseline_size = std::fs::metadata(&reference_output.binary)?.len();
+        let mut preceding_file = std::fs::File::open(&reference_output.binary).with_context(|| {
+            format!("Failed to open {}", reference_output.binary.display())
+        })?;
+
+        verify_code_signature(&reference_output.binary)?;
+        reference_output.run(cross_arch).with_context(|| {
+            format!(
+                "Failed to run baseline signed output {}",
+                reference_output.binary.display()
+            )
+        })?;
+
+        // Grow, shrink, grow, shrink. This covers both signature-page expansion and truncation
+        // while every generation keeps the same output pathname.
+        for (generation, (label, generation_inputs, expect_growth)) in [
+            ("grown", grown_inputs.as_slice(), true),
+            ("shrunk", inputs, false),
+            ("grown-again", grown_inputs.as_slice(), true),
+            ("shrunk-again", inputs, false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let output = linker.link(self.name(), generation_inputs, config, cross_arch)?;
+            verify_code_signature(&output.binary)?;
+
+            let preceding_metadata = preceding_file.metadata()?;
+            let output_metadata = std::fs::metadata(&output.binary)?;
+            ensure!(
+                (preceding_metadata.dev(), preceding_metadata.ino())
+                    != (output_metadata.dev(), output_metadata.ino()),
+                "Same-path signing generation {generation} ({label}) reused inode for {}",
+                output.binary.display()
+            );
+
+            if expect_growth {
+                ensure!(
+                    output_metadata.len() >= baseline_size + 512 * 1024,
+                    "Same-path signing generation {generation} ({label}) did not substantially grow {}: baseline={baseline_size}, output={}",
+                    output.binary.display(),
+                    output_metadata.len()
+                );
+            } else {
+                ensure!(
+                    output_metadata.len() <= baseline_size + 16 * 1024,
+                    "Same-path signing generation {generation} ({label}) did not shrink {}: baseline={baseline_size}, output={}",
+                    output.binary.display(),
+                    output_metadata.len()
+                );
+            }
+
+            output.run(cross_arch).with_context(|| {
+                format!(
+                    "Failed to run same-path signed generation {generation} ({label}) at {}",
+                    output.binary.display()
+                )
+            })?;
+
+            preceding_file = std::fs::File::open(&output.binary)
+                .with_context(|| format!("Failed to open {}", output.binary.display()))?;
+        }
 
         Ok(())
     }
