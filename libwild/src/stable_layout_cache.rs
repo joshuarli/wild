@@ -1229,10 +1229,21 @@ fn canonical_input_path(args: &MachOArgs, input: &crate::args::Input) -> Option<
 /// snapshot is what later lets an incremental hit stat unchanged inputs instead of hashing them.
 fn read_hashed_input(path: String) -> Option<InputDigest> {
     let metadata_before = input_file_metadata(&path)?;
-    let bytes = fs::read(&path).ok()?;
+    // Rustc's transient rlibs are rehashed on every hit before their moved path can be reused.
+    // Avoid copying those multi-megabyte archives into a short-lived allocation: BLAKE3 can read
+    // the same immutable file mapping directly, and the metadata check below still rejects a
+    // concurrent replacement. An empty or otherwise unmappable input retains the ordinary read
+    // fallback so cache eligibility never depends on mmap support.
+    #[cfg(target_os = "macos")]
+    let digest = fs::File::open(&path)
+        .ok()
+        .and_then(|file| unsafe { memmap2::MmapOptions::new().map(&file) }.ok())
+        .map(|bytes| *blake3::hash(&bytes).as_bytes())
+        .or_else(|| fs::read(&path).ok().map(|bytes| *blake3::hash(&bytes).as_bytes()))?;
+    #[cfg(not(target_os = "macos"))]
+    let digest = *blake3::hash(&fs::read(&path).ok()?).as_bytes();
     let metadata = input_file_metadata(&path)?;
     (metadata_before == metadata).then_some(())?;
-    let digest = *blake3::hash(&bytes).as_bytes();
     Some(InputDigest {
         path,
         digest,
