@@ -235,7 +235,7 @@ impl crate::platform::Arch for MachOAArch64 {
                 "ARM64_RELOC_ADDEND must be normalized with its following relocation before architecture-specific processing"
             ),
             object::macho::ARM64_RELOC_SUBTRACTOR => bail!(
-                "ARM64_RELOC_SUBTRACTOR is a paired relocation, but the Mach-O relocation pipeline does not preserve relocation pairs"
+                "ARM64_RELOC_SUBTRACTOR must be normalized with its following ARM64_RELOC_UNSIGNED before architecture-specific processing"
             ),
             // On Mach-O, a local TLS symbol names its 24-byte `__thread_vars` descriptor rather
             // than a TLS offset. The TLVP instruction pair computes that descriptor's address;
@@ -444,6 +444,18 @@ mod tests {
             object::macho::ARM64_RELOC_ADDEND,
             false,
             2,
+        ))
+        .unwrap_err();
+
+        assert!(error.to_string().contains("must be normalized"));
+    }
+
+    #[test]
+    fn rejects_an_unpaired_subtractor_after_macho_normalization() {
+        let error = MachOAArch64::relocation_from_raw(relocation(
+            object::macho::ARM64_RELOC_SUBTRACTOR,
+            false,
+            3,
         ))
         .unwrap_err();
 

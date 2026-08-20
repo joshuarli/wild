@@ -1904,6 +1904,13 @@ fn local_rebase_fixups(
                 ) {
                     let relocation = relocation?;
                     let info = relocation.info;
+                    // A subtractor pair writes an integer difference, not an in-image pointer.
+                    // Its unsigned companion happens to use the same raw relocation type as a
+                    // pointer, so it must never become a dyld rebase merely because its final
+                    // integer bit pattern falls in a mapped segment.
+                    if relocation.subtractor.is_some() {
+                        continue;
+                    }
                     // A 64-bit unsigned relocation writes a data pointer. Other absolute forms
                     // are instruction immediates or smaller scalar constants and must stay raw.
                     if info.r_type != object::macho::ARM64_RELOC_UNSIGNED
@@ -2515,6 +2522,7 @@ fn write_object_section<'data, A: Arch<Platform = MachO>>(
             output_offset,
             relocation.info,
             relocation.addend,
+            relocation.subtractor,
             layout,
             out,
         )?;
@@ -2549,6 +2557,7 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
     output_offset: u64,
     rel: RelocationInfo,
     addend: i64,
+    subtractor: Option<RelocationInfo>,
     layout: &MachOLayout<'data>,
     out: &mut [u8],
 ) -> Result {
@@ -2560,6 +2569,23 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
         address_hex = %HexU64::new(place)
     )
     .entered();
+
+    let output_offset = usize::try_from(output_offset)
+        .context("Mach-O relocation output offset does not fit usize")?;
+    let relocation_width = 1usize
+        .checked_shl(u32::from(rel.r_length))
+        .context("Mach-O relocation width is invalid")?;
+    ensure!(
+        output_offset
+            .checked_add(relocation_width)
+            .is_some_and(|end| end <= out.len()),
+        "live Mach-O subsection ends inside relocation storage in {}: input offset 0x{:x} maps to output offset 0x{:x}, but {} bytes are required and this object's compacted section has {} bytes",
+        object_layout.object.section_display_name(source_section_index),
+        rel.r_address,
+        output_offset,
+        relocation_width,
+        out.len(),
+    );
 
     let rel_info = A::relocation_from_raw(rel)?;
     let (resolution, symbol_index, local_symbol_id) = get_resolution(rel, object_layout, layout)?;
@@ -2581,27 +2607,53 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
     } else {
         resolution.raw_value.wrapping_add(addend as u64)
     };
-    let mut value = match rel_info.kind {
-        RelocationKind::Absolute => symbol_plus_addend.bitand(mask.symbol_plus_addend),
-        RelocationKind::AbsoluteLowPart => symbol_plus_addend.bitand(mask.symbol_plus_addend),
-        RelocationKind::Relative => symbol_plus_addend
-            .bitand(mask.symbol_plus_addend)
-            .wrapping_sub(place.bitand(mask.place)),
-        RelocationKind::GotRelative => symbol_plus_addend
-            .bitand(mask.symbol_plus_addend)
-            .wrapping_sub(place.bitand(mask.place)),
-        RelocationKind::Got => symbol_plus_addend.bitand(mask.symbol_plus_addend),
-        _ => todo!(),
+    let mut value = if let Some(subtractor) = subtractor {
+        // ARM64_RELOC_SUBTRACTOR is paired with its following unsigned relocation record by
+        // `paired_relocations`. The linker applies the expression only once, using the raw
+        // in-place word as its two's-complement addend: `minuend - subtrahend + addend`.
+        let (subtrahend, _, subtrahend_symbol_id) =
+            get_resolution(subtractor, object_layout, layout)?;
+        let in_place_addend =
+            u64::from_le_bytes(out[output_offset..][..size_of::<u64>()].try_into().unwrap());
+        let value = resolution
+            .raw_value
+            .wrapping_sub(subtrahend.raw_value)
+            .wrapping_add(in_place_addend);
+        tracing::trace!(
+            minuend = resolution.raw_value,
+            subtrahend = subtrahend.raw_value,
+            in_place_addend,
+            subtrahend_symbol_name = %layout.symbol_db.symbol_name_for_display(subtrahend_symbol_id),
+            value,
+            value_hex = %HexU64::new(value),
+            "Mach-O ARM64 subtractor relocation applied"
+        );
+        value
+    } else {
+        match rel_info.kind {
+            RelocationKind::Absolute => symbol_plus_addend.bitand(mask.symbol_plus_addend),
+            RelocationKind::AbsoluteLowPart => symbol_plus_addend.bitand(mask.symbol_plus_addend),
+            RelocationKind::Relative => symbol_plus_addend
+                .bitand(mask.symbol_plus_addend)
+                .wrapping_sub(place.bitand(mask.place)),
+            RelocationKind::GotRelative => symbol_plus_addend
+                .bitand(mask.symbol_plus_addend)
+                .wrapping_sub(place.bitand(mask.place)),
+            RelocationKind::Got => symbol_plus_addend.bitand(mask.symbol_plus_addend),
+            _ => todo!(),
+        }
     };
 
-    if let Some(tls_data_start) = tlv_descriptor_tls_data_start(
-        rel,
-        source_section_index,
-        symbol_index,
-        object_layout,
-        layout,
-    )? {
-        value = tls_storage_offset(resolution.raw_value, tls_data_start)?;
+    if subtractor.is_none() {
+        if let Some(tls_data_start) = tlv_descriptor_tls_data_start(
+            rel,
+            source_section_index,
+            symbol_index,
+            object_layout,
+            layout,
+        )? {
+            value = tls_storage_offset(resolution.raw_value, tls_data_start)?;
+        }
     }
 
     if let Some(thunked_value) = maybe_get_thunk_for_relocation::<A>(
@@ -2625,23 +2677,6 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
             addend,
             symbol_name = %layout.symbol_db.symbol_name_for_display(local_symbol_id),
             "relocation applied");
-
-    let output_offset = usize::try_from(output_offset)
-        .context("Mach-O relocation output offset does not fit usize")?;
-    let relocation_width = 1usize
-        .checked_shl(u32::from(rel.r_length))
-        .context("Mach-O relocation width is invalid")?;
-    ensure!(
-        output_offset
-            .checked_add(relocation_width)
-            .is_some_and(|end| end <= out.len()),
-        "live Mach-O subsection ends inside relocation storage in {}: input offset 0x{:x} maps to output offset 0x{:x}, but {} bytes are required and this object's compacted section has {} bytes",
-        object_layout.object.section_display_name(source_section_index),
-        rel.r_address,
-        output_offset,
-        relocation_width,
-        out.len(),
-    );
 
     if rel.r_type == object::macho::ARM64_RELOC_TLVP_LOAD_PAGEOFF12
         && !flags.needs_got_tls_descriptor()

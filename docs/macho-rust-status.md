@@ -47,7 +47,7 @@ than supported facilities:
 | Mach-O argument semantics | Models ARM64, dylib/executable, install names, rpaths, export lists, framework paths, strip options, and input-local `-force_load`. | partial |
 | Section/symbol classification | Handles data access, debug/non-alloc, `__DATA_CONST`, TLV storage, no-dead-strip, C strings, and Mach-O-specific no-op hooks. | partial |
 | ABI-level symbols | Bounded ARM64 fixtures cover tentative/common `N_UNDF` definitions (size and `n_desc` alignment in `__DATA,__common`), direct `N_INDR` aliases, `N_PEXT` visibility, hidden synthetic `___dso_handle`, C++ initialization/`atexit`/destruction, and Rust calling a native C function. Weak dylib imports retain `N_WEAK_REF` separately from weak definitions: all-weak dependencies use `LC_LOAD_WEAK_DYLIB` and the chained-import weak bit, while an unprovided weak import remains an undefined-symbol error. Absolute symbols, alias chains, and broad mixed-language qualification remain outside this bounded result. | partial; focused Apple controls and Wild runtime/structural fixtures green |
-| ARM64 relocations / thunks | Validates supported standalone forms, `POINTER_TO_GOT`, local and dylib-imported TLVP descriptors, paired `ADDEND`, and out-of-range `BRANCH26` via nearby text islands. `SUBTRACTOR` and authenticated paths remain explicitly diagnosed or absent. | partial; unqualified |
+| ARM64 relocations / thunks | Validates supported standalone forms, `POINTER_TO_GOT`, local and dylib-imported TLVP descriptors, paired `ADDEND`, bounded ordinary-data `SUBTRACTOR`/`UNSIGNED` expressions, and out-of-range `BRANCH26` via nearby text islands. Authenticated paths remain explicitly diagnosed or absent. | partial; unqualified |
 | Chained fixups | Plans address-ordered imported binds and local rebases per segment; gaps, leading local slots, 16 KiB pages, and malformed encodings are handled. Wider pointer-format/arm64e qualification remains. | partial; unqualified |
 | Dylib output / rpaths / exports | Emits `MH_DYLIB`, `LC_ID_DYLIB`, requested `LC_RPATH`, and omits executable-only commands; C runtime smoke passes. Dependency ordinals, weak/reexport behavior, and Rust dylib qualification remain. | partial; unqualified |
 | Dead strip / atoms | `MH_SUBSECTIONS_VIA_SYMBOLS` inputs are split into live symbol-delimited spans under `-dead_strip`; whole-section behavior is retained otherwise. | partial; differential smoke green |
@@ -99,6 +99,17 @@ passed wherever Wild is listed as failing.
   --test integration_tests --features macho -- 'macho/aarch64/debug-dwarf/default'`. Its output
   can be checked with `dsymutil --dump-debug-map <binary>`, `dsymutil <binary>`, and
   `dwarfdump --verify <binary>.dSYM/Contents/Resources/DWARF/<binary-name>`.
+* Focused ARM64 subtractor fixture: `WILD_TEST_IGNORE_FORMAT=1 cargo test --profile ci -p
+  wild-linker --features macho --test integration_tests -- 'macho/aarch64/subtractor-reloc/default'`.
+  Apple clang emits an adjacent, same-offset `ARM64_RELOC_SUBTRACTOR` then
+  `ARM64_RELOC_UNSIGNED` pair, both external-symbol, non-PC-relative, 64-bit records. The
+  unsigned half names the minuend, the subtractor names the subtrahend, and the in-place word is
+  the two's-complement addend. Wild preserves that expression through graph loading and writing:
+  same-object local `ltmp` targets, a target defined by another object, an absolute minuend,
+  `-dead_strip` atom retention, and an in-image-looking arithmetic result that must not become a
+  dyld rebase all execute against Apple controls. This bounded support rejects malformed
+  ordering/fields and dylib or weak-import operands; `__eh_frame` keeps its separately validated
+  reconstruction path.
 * Rust-to-Darwin command capture: [`darwin-linker-recorder.md`](darwin-linker-recorder.md)
   documents the new `darwin-linker-recorder` wrapper and its exact NUL-delimited replay records.
 * A fresh stable `aarch64-apple-darwin` Cargo binary was captured through that recorder. Its final
@@ -255,5 +266,6 @@ relaxation APIs; none removes the known correctness gaps listed above.
 
 1. Broaden final `__TEXT,__eh_frame` CIE/FDE grammar and qualify C++/Objective-C/Rust/archive
    debug-map inputs before designing any generic ordinary-DWARF relocation path.
-2. Complete subtractor relocations and full dylib/proc-macro and Rust TLS qualification.
+2. Broaden subtractor coverage beyond the validated ordinary 64-bit static data form, and complete
+   full dylib/proc-macro and Rust TLS qualification.
 3. Expand the Apple-differential corpus and ARM64 Rust crate-type/stress qualification.

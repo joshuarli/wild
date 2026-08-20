@@ -270,17 +270,20 @@ type SymbolTable<'data> = object::read::macho::SymbolTable<'data, macho::MachHea
 type SymtabEntry = object::macho::Nlist64<Endianness>;
 type Relocation = object::macho::Relocation<Endianness>;
 
-/// A relocation after folding the Mach-O arm64 explicit-addend record into the relocation it
-/// modifies.
+/// A relocation after preserving its Mach-O ARM64 companion records at the format boundary.
 ///
 /// Mach-O stores an addend in a separate record immediately before its `BRANCH26`, `PAGE21`, or
-/// `PAGEOFF12` relocation. The generic linker stages deliberately receive only one relocation at
-/// a time, so keep this format-specific pairing at the Mach-O boundary rather than letting either
-/// stage accidentally treat the addend as an independent relocation.
+/// `PAGEOFF12` relocation. It represents an address difference with adjacent `SUBTRACTOR` and
+/// `UNSIGNED` records, with the latter naming the minuend. Generic linker stages deliberately
+/// receive only one relocation at a time, so preserve these format-specific relationships at the
+/// Mach-O boundary rather than allowing either companion to look independent.
 #[derive(Debug, Copy, Clone)]
-pub(crate) struct RelocationWithAddend {
+pub(crate) struct NormalizedRelocation {
     pub(crate) info: object::macho::RelocationInfo,
     pub(crate) addend: i64,
+    /// The subtrahend of an `ARM64_RELOC_SUBTRACTOR`/`ARM64_RELOC_UNSIGNED` pair. `info` is its
+    /// paired unsigned relocation and therefore names the minuend.
+    pub(crate) subtractor: Option<object::macho::RelocationInfo>,
 }
 
 pub(crate) struct PairedRelocations<'data> {
@@ -294,52 +297,84 @@ pub(crate) fn paired_relocations(relocations: &[Relocation]) -> PairedRelocation
 }
 
 impl<'data> Iterator for PairedRelocations<'data> {
-    type Item = Result<RelocationWithAddend>;
+    type Item = Result<NormalizedRelocation>;
 
     fn next(&mut self) -> Option<Self::Item> {
         let first = self.relocations.next()?;
         let first_info = first.info(LE);
-        if first_info.r_type != macho::ARM64_RELOC_ADDEND {
-            return Some(Ok(RelocationWithAddend {
+        match first_info.r_type {
+            macho::ARM64_RELOC_ADDEND => Some((|| {
+                ensure!(
+                    !first_info.r_extern && !first_info.r_pcrel && first_info.r_length == 2,
+                    "ARM64_RELOC_ADDEND requires r_extern=0, r_pcrel=0, and r_length=2"
+                );
+
+                let Some(primary) = self.relocations.next() else {
+                    bail!("ARM64_RELOC_ADDEND must be immediately followed by ARM64_RELOC_BRANCH26, ARM64_RELOC_PAGE21, or ARM64_RELOC_PAGEOFF12");
+                };
+                let primary_info = primary.info(LE);
+                ensure!(
+                    first_info.r_address == primary_info.r_address,
+                    "ARM64_RELOC_ADDEND at offset 0x{:x} must be paired with a relocation at the same offset, got 0x{:x}",
+                    first_info.r_address,
+                    primary_info.r_address
+                );
+                ensure!(
+                    matches!(
+                        primary_info.r_type,
+                        macho::ARM64_RELOC_BRANCH26
+                            | macho::ARM64_RELOC_PAGE21
+                            | macho::ARM64_RELOC_PAGEOFF12
+                    ),
+                    "ARM64_RELOC_ADDEND must be immediately followed by ARM64_RELOC_BRANCH26, ARM64_RELOC_PAGE21, or ARM64_RELOC_PAGEOFF12, got {}",
+                    primary_info.r_type
+                );
+
+                // `r_symbolnum` occupies a signed 24-bit field in the relocation record.
+                let addend = i64::from(((first_info.r_symbolnum << 8) as i32) >> 8);
+                Ok(NormalizedRelocation {
+                    info: primary_info,
+                    addend,
+                    subtractor: None,
+                })
+            })()),
+            macho::ARM64_RELOC_SUBTRACTOR => Some((|| {
+                let Some(unsigned) = self.relocations.next() else {
+                    bail!("ARM64_RELOC_SUBTRACTOR must be immediately followed by ARM64_RELOC_UNSIGNED");
+                };
+                let unsigned_info = unsigned.info(LE);
+                ensure!(
+                    first_info.r_address == unsigned_info.r_address,
+                    "ARM64_RELOC_SUBTRACTOR at offset 0x{:x} must be paired with ARM64_RELOC_UNSIGNED at the same offset, got 0x{:x}",
+                    first_info.r_address,
+                    unsigned_info.r_address
+                );
+                ensure!(
+                    unsigned_info.r_type == macho::ARM64_RELOC_UNSIGNED,
+                    "ARM64_RELOC_SUBTRACTOR must be immediately followed by ARM64_RELOC_UNSIGNED, got {}",
+                    unsigned_info.r_type
+                );
+                ensure!(
+                    first_info.r_extern
+                        && unsigned_info.r_extern
+                        && !first_info.r_pcrel
+                        && !unsigned_info.r_pcrel
+                        && first_info.r_length == 3
+                        && unsigned_info.r_length == 3,
+                    "ARM64_RELOC_SUBTRACTOR/ARM64_RELOC_UNSIGNED requires external non-pcrel 64-bit relocation records"
+                );
+                Ok(NormalizedRelocation {
+                    info: unsigned_info,
+                    addend: 0,
+                    subtractor: Some(first_info),
+                })
+            })()),
+            _ => Some(Ok(NormalizedRelocation {
                 info: first_info,
                 addend: 0,
-            }));
+                subtractor: None,
+            })),
         }
-
-        Some((|| {
-            ensure!(
-                !first_info.r_extern && !first_info.r_pcrel && first_info.r_length == 2,
-                "ARM64_RELOC_ADDEND requires r_extern=0, r_pcrel=0, and r_length=2"
-            );
-
-            let Some(primary) = self.relocations.next() else {
-                bail!("ARM64_RELOC_ADDEND must be immediately followed by ARM64_RELOC_BRANCH26, ARM64_RELOC_PAGE21, or ARM64_RELOC_PAGEOFF12");
-            };
-            let primary_info = primary.info(LE);
-            ensure!(
-                first_info.r_address == primary_info.r_address,
-                "ARM64_RELOC_ADDEND at offset 0x{:x} must be paired with a relocation at the same offset, got 0x{:x}",
-                first_info.r_address,
-                primary_info.r_address
-            );
-            ensure!(
-                matches!(
-                    primary_info.r_type,
-                    macho::ARM64_RELOC_BRANCH26
-                        | macho::ARM64_RELOC_PAGE21
-                        | macho::ARM64_RELOC_PAGEOFF12
-                ),
-                "ARM64_RELOC_ADDEND must be immediately followed by ARM64_RELOC_BRANCH26, ARM64_RELOC_PAGE21, or ARM64_RELOC_PAGEOFF12, got {}",
-                primary_info.r_type
-            );
-
-            // `r_symbolnum` occupies a signed 24-bit field in the relocation record.
-            let addend = i64::from(((first_info.r_symbolnum << 8) as i32) >> 8);
-            Ok(RelocationWithAddend {
-                info: primary_info,
-                addend,
-            })
-        })())
     }
 }
 
@@ -2058,9 +2093,9 @@ impl platform::Platform for MachO {
                     if !range.contains(&u64::from(relocation.info.r_address)) {
                         continue;
                     }
-                    process_relocation::<A>(
+                    process_normalized_relocation::<A>(
                         object,
-                        relocation.info,
+                        relocation,
                         section_index,
                         resources,
                         queue,
@@ -2082,9 +2117,9 @@ impl platform::Platform for MachO {
         scope: &rayon::Scope<'scope>,
     ) -> Result {
         for relocation in paired_relocations(state.relocations(section_index)?.relocations) {
-            process_relocation::<A>(
+            process_normalized_relocation::<A>(
                 state,
-                relocation?.info,
+                relocation?,
                 section_index,
                 resources,
                 queue,
@@ -3491,6 +3526,93 @@ fn process_relocation<'data, 'scope, A: platform::Arch<Platform = MachO>>(
     Ok(())
 }
 
+/// Records the graph edges implied by a normalized ARM64 relocation. The unsigned half of a
+/// subtractor pair is still an ordinary direct-address dependency, but its companion names a
+/// second atom which must survive dead stripping even though it has no independent relocation
+/// storage. Keep that second edge here, before addresses are assigned, rather than trying to
+/// reconstruct it in the writer after GC has already made its decision.
+#[inline(always)]
+fn process_normalized_relocation<'data, 'scope, A: platform::Arch<Platform = MachO>>(
+    object: &layout::ObjectLayoutState<'data, MachO>,
+    relocation: NormalizedRelocation,
+    section_index: object::SectionIndex,
+    resources: &'scope layout::GraphResources<'data, '_, MachO>,
+    queue: &mut layout::LocalWorkQueue<MachO>,
+    scope: &rayon::Scope<'scope>,
+) -> Result {
+    if let Some(subtractor) = relocation.subtractor {
+        validate_subtractor_pair_targets(object, relocation.info, subtractor, resources)?;
+    }
+    process_relocation::<A>(object, relocation.info, section_index, resources, queue, scope)?;
+    if let Some(subtractor) = relocation.subtractor {
+        process_subtractor_target::<A>(object, subtractor, section_index, resources, queue, scope)?;
+    }
+    Ok(())
+}
+
+/// An ARM64 subtractor expression is fixed at static-link time. In particular, neither operand
+/// can be a dyld import or a weak import whose final address would be selected by dyld.
+fn validate_subtractor_pair_targets(
+    object: &layout::ObjectLayoutState<'_, MachO>,
+    minuend: object::macho::RelocationInfo,
+    subtrahend: object::macho::RelocationInfo,
+    resources: &layout::GraphResources<'_, '_, MachO>,
+) -> Result {
+    for (role, rel) in [("minuend", minuend), ("subtrahend", subtrahend)] {
+        let local_symbol_index = SymbolIndex(rel.r_symbolnum as usize);
+        let local_symbol = object.object.symbol(local_symbol_index)?;
+        let symbol_id = resources
+            .symbol_db
+            .definition(object.symbol_id_range.input_to_id(local_symbol_index));
+        ensure!(
+            !local_symbol.is_weak_reference(),
+            "ARM64_RELOC_SUBTRACTOR {role} cannot be a weak import"
+        );
+        ensure!(
+            !is_dynamic_library(
+                &resources
+                    .symbol_db
+                    .file(resources.symbol_db.file_id_for_symbol(symbol_id))
+            ),
+            "ARM64_RELOC_SUBTRACTOR {role} cannot be supplied by a dylib"
+        );
+    }
+    Ok(())
+}
+
+/// Records the subtractor half of a validated pair as a direct graph dependency without ever
+/// presenting its standalone relocation opcode to the architecture converter or writer.
+fn process_subtractor_target<'data, 'scope, A: platform::Arch<Platform = MachO>>(
+    object: &layout::ObjectLayoutState<'data, MachO>,
+    rel_info: object::macho::RelocationInfo,
+    section_index: object::SectionIndex,
+    resources: &'scope layout::GraphResources<'data, '_, MachO>,
+    queue: &mut layout::LocalWorkQueue<MachO>,
+    scope: &rayon::Scope<'scope>,
+) -> Result {
+    let local_symbol_index = SymbolIndex(rel_info.r_symbolnum as usize);
+    let local_symbol_id = object.symbol_id_range.input_to_id(local_symbol_index);
+    let symbol_id = resources.symbol_db.definition(local_symbol_id);
+    let mut flags = resources.local_flags_for_symbol(symbol_id);
+    flags.merge(resources.local_flags_for_symbol(local_symbol_id));
+
+    let atomic_flags = &resources.per_symbol_flags.get_atomic(symbol_id);
+    let previous_flags = atomic_flags.fetch_or(ValueFlags::DIRECT);
+    layout::check_for_undefined::<A>(
+        object,
+        object.object.section(section_index)?,
+        rel_info.r_address.into(),
+        local_symbol_index,
+        flags,
+        symbol_id,
+        resources,
+    )?;
+    if !previous_flags.has_resolution() {
+        queue.send_symbol_request::<A>(symbol_id, resources, scope);
+    }
+    Ok(())
+}
+
 /// During ordinary executable linking Mach-O exports public object definitions. Under
 /// `-dead_strip`, that policy must run *after* atom liveness is known: making every external
 /// definition a root first would retain the very atoms dead stripping is meant to discard.
@@ -3942,6 +4064,27 @@ mod tests {
     }
 
     #[test]
+    fn preserves_arm64_subtractor_pairs_as_one_relocation_expression() {
+        let relocations = [
+            raw_relocation(16, 5, false, 3, true, macho::ARM64_RELOC_SUBTRACTOR),
+            raw_relocation(16, 9, false, 3, true, macho::ARM64_RELOC_UNSIGNED),
+        ];
+
+        let relocations = paired_relocations(&relocations)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+
+        assert_eq!(relocations.len(), 1);
+        assert_eq!(relocations[0].info.r_type, macho::ARM64_RELOC_UNSIGNED);
+        assert_eq!(relocations[0].info.r_symbolnum, 9);
+        assert_eq!(
+            relocations[0].subtractor.unwrap().r_symbolnum,
+            5,
+            "the subtractor remains associated with the unsigned minuend"
+        );
+    }
+
+    #[test]
     fn rejects_malformed_arm64_addend_pairs() {
         let missing_primary = [raw_relocation(
             0,
@@ -3979,6 +4122,46 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("must be immediately followed"));
+    }
+
+    #[test]
+    fn rejects_malformed_arm64_subtractor_pairs() {
+        let missing_unsigned = [raw_relocation(
+            0,
+            1,
+            false,
+            3,
+            true,
+            macho::ARM64_RELOC_SUBTRACTOR,
+        )];
+        assert!(paired_relocations(&missing_unsigned)
+            .next()
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("must be immediately followed by ARM64_RELOC_UNSIGNED"));
+
+        let wrong_offset = [
+            raw_relocation(4, 1, false, 3, true, macho::ARM64_RELOC_SUBTRACTOR),
+            raw_relocation(0, 3, false, 3, true, macho::ARM64_RELOC_UNSIGNED),
+        ];
+        assert!(paired_relocations(&wrong_offset)
+            .next()
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("same offset"));
+
+        let unsupported_fields = [
+            raw_relocation(0, 1, false, 2, true, macho::ARM64_RELOC_SUBTRACTOR),
+            raw_relocation(0, 3, false, 2, true, macho::ARM64_RELOC_UNSIGNED),
+        ];
+        assert!(paired_relocations(&unsupported_fields)
+            .next()
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("external non-pcrel 64-bit"));
     }
 
     #[test]
