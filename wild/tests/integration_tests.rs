@@ -438,6 +438,8 @@ fn main() -> Result<std::process::ExitCode> {
     collect_cargo_macho_qualification(&mut tests, &filter)?;
     #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
     collect_cargo_macho_staticlib_qualification(&mut tests, &filter)?;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+    collect_macho_dylib_dependency_qualification(&mut tests, &filter)?;
     Ok(libtest_mimic::run(&args, tests).exit_code())
 }
 
@@ -1077,6 +1079,178 @@ fn run_native_staticlib_consumer(binary: &Path, expected_exit: i32) -> Result {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
+    Ok(())
+}
+
+/// A dylib's own dependency list is a separate dyld contract from an executable loading one
+/// dylib. Build all three images with the selected linker: the executable finds the middle image
+/// through its rpath, then the middle image finds the leaf through its own rpath.
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+fn collect_macho_dylib_dependency_qualification(
+    tests: &mut Vec<Trial>,
+    filter: &Filter,
+) -> Result {
+    const NAME: &str = "macho/aarch64/dylib-dependency-chain/default";
+    if filter.excludes(NAME) {
+        return Ok(());
+    }
+
+    tests.push(Trial::test(NAME, || {
+        run_macho_dylib_dependency_qualification()
+            .map_err(|error| libtest_mimic::Failed::from(error.to_string()))
+    }));
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+fn run_macho_dylib_dependency_qualification() -> Result {
+    let fixture_dir = base_dir().join("tests").join("macho_dylib_dependency");
+    let leaf_source = fixture_dir.join("leaf.c");
+    let middle_source = fixture_dir.join("middle.c");
+    let consumer_source = fixture_dir.join("consumer.c");
+    for source in [&leaf_source, &middle_source, &consumer_source] {
+        ensure!(
+            source.is_file(),
+            "missing ARM64 dylib dependency fixture source {}",
+            source.display()
+        );
+    }
+
+    let wild = wild_path()
+        .canonicalize()
+        .with_context(|| format!("failed to resolve Wild linker {}", wild_path().display()))?;
+    for (name, linker) in [("Apple ld", None), ("Wild", Some(wild.as_path()))] {
+        let output_dir_guard = tempfile::Builder::new()
+            .prefix("wild-macho-dylib-dependency-")
+            .tempdir_in("/tmp")
+            .context("failed to create ARM64 dylib dependency output directory")?;
+        let output_dir = output_dir_guard.path();
+        let leaf = output_dir.join("libwild-dylib-leaf.dylib");
+        let middle = output_dir.join("libwild-dylib-middle.dylib");
+        let consumer = output_dir.join("dylib-dependency-consumer");
+
+        link_arm64_dylib_dependency_artifact(
+            name,
+            linker,
+            "leaf dylib",
+            &[
+                OsString::from("-dynamiclib"),
+                leaf_source.as_os_str().to_owned(),
+                OsString::from("-Wl,-install_name,@rpath/libwild-dylib-leaf.dylib"),
+                OsString::from("-o"),
+                leaf.as_os_str().to_owned(),
+            ],
+        )?;
+        link_arm64_dylib_dependency_artifact(
+            name,
+            linker,
+            "middle dylib",
+            &[
+                OsString::from("-dynamiclib"),
+                middle_source.as_os_str().to_owned(),
+                OsString::from(format!("-L{}", output_dir.display())),
+                OsString::from("-lwild-dylib-leaf"),
+                OsString::from("-Wl,-install_name,@rpath/libwild-dylib-middle.dylib"),
+                OsString::from("-Wl,-rpath,@loader_path"),
+                OsString::from("-o"),
+                middle.as_os_str().to_owned(),
+            ],
+        )?;
+        link_arm64_dylib_dependency_artifact(
+            name,
+            linker,
+            "consumer executable",
+            &[
+                consumer_source.as_os_str().to_owned(),
+                OsString::from(format!("-L{}", output_dir.display())),
+                OsString::from("-lwild-dylib-middle"),
+                OsString::from("-Wl,-rpath,@loader_path"),
+                OsString::from("-o"),
+                consumer.as_os_str().to_owned(),
+            ],
+        )?;
+
+        for (image, required_dependency) in [
+            (&middle, "@rpath/libwild-dylib-leaf.dylib"),
+            (&consumer, "@rpath/libwild-dylib-middle.dylib"),
+        ] {
+            let output = Command::new("otool")
+                .arg("-L")
+                .arg(image)
+                .output()
+                .with_context(|| format!("failed to inspect ARM64 dylib dependencies in {}", image.display()))?;
+            ensure!(
+                output.status.success(),
+                "otool -L failed for {} with {}:\n{}",
+                image.display(),
+                output.status,
+                String::from_utf8_lossy(&output.stderr),
+            );
+            ensure!(
+                String::from_utf8_lossy(&output.stdout).contains(required_dependency),
+                "{} does not record its required dependency {required_dependency}:\n{}",
+                image.display(),
+                String::from_utf8_lossy(&output.stdout),
+            );
+        }
+
+        let output = Command::new(&consumer)
+            .env_remove("DYLD_LIBRARY_PATH")
+            .env_remove("DYLD_FALLBACK_LIBRARY_PATH")
+            .output()
+            .with_context(|| format!("failed to run ARM64 dylib dependency consumer {}", consumer.display()))?;
+        ensure!(
+            output.status.code() == Some(42),
+            "ARM64 dylib dependency consumer built with {name} exited with {}:\n{}{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+fn link_arm64_dylib_dependency_artifact(
+    linker_name: &str,
+    wild: Option<&Path>,
+    artifact_name: &str,
+    arguments: &[OsString],
+) -> Result {
+    let mut command = Command::new("clang");
+    if let Some(wild) = wild {
+        command.arg(format!("--ld-path={}", wild.display()));
+    }
+    command
+        .arg("-v")
+        .arg("-arch")
+        .arg("arm64")
+        .arg("-mmacosx-version-min=11.0")
+        .args(arguments);
+    let output = command
+        .output()
+        .with_context(|| format!("failed to link ARM64 {artifact_name} with {command:?}"))?;
+    let transcript = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    ensure!(
+        output.status.success(),
+        "{linker_name} failed to link ARM64 {artifact_name} with {}:\n{transcript}",
+        output.status,
+    );
+    if let Some(wild) = wild {
+        ensure!(
+            transcript.contains(wild.to_string_lossy().as_ref()),
+            "Wild did not link ARM64 {artifact_name}:\n{transcript}",
+        );
+        ensure!(
+            transcript.contains("-arch arm64"),
+            "Wild selected a non-ARM64 link for {artifact_name}:\n{transcript}",
+        );
+    }
     Ok(())
 }
 
