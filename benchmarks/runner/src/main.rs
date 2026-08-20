@@ -105,6 +105,10 @@ struct BenchArgs {
     #[clap(long)]
     output: Option<PathBuf>,
 
+    /// Print link-only wall, CPU, RSS, and output-size statistics after collecting results.
+    #[clap(long)]
+    print_stats: bool,
+
     /// The linker binaries to benchmark.
     binaries: Vec<PathBuf>,
 }
@@ -181,6 +185,7 @@ struct Run {
     pub(crate) max_rss: u64,
     pub(crate) stime: Duration,
     pub(crate) utime: Duration,
+    pub(crate) output_size: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -205,6 +210,7 @@ struct LinkerIdentifier {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum LinkerKind {
+    AppleLd,
     Wild,
     Lld,
     Mold,
@@ -221,6 +227,7 @@ struct Benchmark {
 impl LinkerKind {
     fn as_str(self) -> &'static str {
         match self {
+            LinkerKind::AppleLd => "Apple ld64",
             LinkerKind::Wild => "Wild",
             LinkerKind::Lld => "LLD",
             LinkerKind::Mold => "Mold",
@@ -243,9 +250,20 @@ impl Bin {
             .output()
             .with_context(|| format!("Failed to run `{}`", bin_path.display()))?;
 
+        // Apple's ld64 intentionally has no `--version` spelling. Its documented `-v`
+        // invocation is a query, not a link, so use it only when the portable spelling fails.
+        let output = if output.status.success() {
+            output
+        } else {
+            Command::new(bin_path)
+                .arg("-v")
+                .output()
+                .with_context(|| format!("Failed to query `{}` with -v", bin_path.display()))?
+        };
+
         if !output.status.success() {
             bail!(
-                "{} --version failed: {}",
+                "{} version query failed: {}",
                 bin_path.display(),
                 String::from_utf8_lossy(&output.stderr)
             );
@@ -255,8 +273,16 @@ impl Bin {
             .to_string()
             .lines()
             .next()
-            .unwrap_or_default()
-            .to_owned();
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .or_else(|| {
+                String::from_utf8_lossy(&output.stderr)
+                    .lines()
+                    .next()
+                    .filter(|line| !line.is_empty())
+                    .map(str::to_owned)
+            })
+            .unwrap_or_default();
 
         let identifier = LinkerIdentifier::parse(&version_line, bin_path)
             .with_context(|| format!("Failed to parse linker version `{version_line}`"))?;
@@ -321,7 +347,11 @@ impl LinkerIdentifier {
         let mut hash = None;
         let mut variant = None;
 
-        if let Some(mut rest) = version_line.strip_prefix("Wild ") {
+        if let Some(rest) = version_line.strip_prefix("@(#)PROGRAM:ld PROJECT:ld-") {
+            kind = LinkerKind::AppleLd;
+            let mut rest = rest.trim();
+            version = take_word(&mut rest)?.to_owned();
+        } else if let Some(mut rest) = version_line.strip_prefix("Wild ") {
             if let Some(r) = rest.strip_prefix("version ") {
                 rest = r;
             }
@@ -344,6 +374,10 @@ impl LinkerIdentifier {
             kind = LinkerKind::Lld;
             version = take_word(&mut rest)?.to_owned();
             variant = Some("Debian".to_owned());
+        } else if let Some(mut rest) = version_line.strip_prefix("Homebrew LLD ") {
+            kind = LinkerKind::Lld;
+            version = take_word(&mut rest)?.to_owned();
+            variant = Some("Homebrew".to_owned());
         } else if let Some(mut rest) = version_line.strip_prefix("mold ") {
             kind = LinkerKind::Mold;
             version = take_word(&mut rest)?.to_owned();
@@ -430,6 +464,49 @@ impl Display for Benchmark {
     }
 }
 
+fn print_bench_stats(results: &Benchmarks) {
+    for benchmark in &results.benchmarks {
+        println!("{}:", benchmark.config.name);
+        for batch in &benchmark.batches {
+            let runs = &batch.runs;
+            if runs.is_empty() {
+                continue;
+            }
+            println!(
+                "  {}: runs={}, wall_ms={}, user_ms={}, system_ms={}, peak_rss_mib={}, output_bytes={}",
+                batch.bin,
+                runs.len(),
+                format_duration_stat(runs.iter().map(|run| run.elapsed)),
+                format_duration_stat(runs.iter().map(|run| run.utime)),
+                format_duration_stat(runs.iter().map(|run| run.stime)),
+                format_u64_stat(runs.iter().map(|run| run.max_rss), 1024 * 1024),
+                format_u64_stat(runs.iter().map(|run| run.output_size), 1),
+            );
+        }
+    }
+}
+
+fn format_duration_stat(values: impl Iterator<Item = Duration>) -> String {
+    let values = values
+        .map(|value| value.as_secs_f64() * 1000.0)
+        .collect::<Vec<_>>();
+    format_f64_stat(values)
+}
+
+fn format_u64_stat(values: impl Iterator<Item = u64>, divisor: u64) -> String {
+    let values = values
+        .map(|value| value as f64 / divisor as f64)
+        .collect::<Vec<_>>();
+    format_f64_stat(values)
+}
+
+fn format_f64_stat(mut values: Vec<f64>) -> String {
+    values.sort_by(f64::total_cmp);
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    let median = values[values.len() / 2];
+    format!("mean={mean:.3},median={median:.3}")
+}
+
 fn parse_version_number(v: &str) -> Result<Vec<u32>> {
     v.split(".")
         .map(|p| {
@@ -479,5 +556,27 @@ mod tests {
         assert!(!version_less_than("0.5.0", "0.5.0"));
         assert!(!version_less_than("0.6.0", "0.5.0"));
         assert!(version_less_than("0.5.0", "0.10.0"));
+    }
+
+    #[test]
+    fn parses_apple_ld64_version() {
+        let identifier = LinkerIdentifier::parse(
+            "@(#)PROGRAM:ld PROJECT:ld-1267",
+            Path::new("/usr/bin/ld"),
+        )
+        .unwrap();
+        assert_eq!(identifier.kind, LinkerKind::AppleLd);
+        assert_eq!(identifier.version, "1267");
+    }
+
+    #[test]
+    fn parses_homebrew_lld_version() {
+        let identifier = LinkerIdentifier::parse(
+            "Homebrew LLD 22.1.8",
+            Path::new("/opt/homebrew/bin/ld64.lld"),
+        )
+        .unwrap();
+        assert_eq!(identifier.kind, LinkerKind::Lld);
+        assert_eq!(identifier.variant.as_deref(), Some("Homebrew"));
     }
 }

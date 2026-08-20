@@ -374,6 +374,7 @@ fn compute_step(max: u32) -> u32 {
 fn colour_for(linker: LinkerKind) -> &'static str {
     match linker {
         LinkerKind::Wild => "#00FF00",
+        LinkerKind::AppleLd => "#FF8800",
         LinkerKind::Lld => "#0000FF",
         LinkerKind::Mold => "#FF00FF",
         LinkerKind::Bfd => "#009999",

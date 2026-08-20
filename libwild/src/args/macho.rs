@@ -4,6 +4,7 @@ use crate::args::CommonArgs;
 use crate::args::Input;
 use crate::args::InputSpec;
 use crate::args::Modifiers;
+use crate::args::VersionMode;
 use crate::bail;
 use crate::ensure;
 use crate::error::Context;
@@ -259,6 +260,18 @@ fn setup_argument_parser() -> ArgumentParser<MachOArgs> {
         .help("Set the entry point symbol")
         .execute(|args, _modifier_stack, value| {
             args.entry = value.to_owned();
+            Ok(())
+        });
+
+    // ld64 prints its identity for `-v` and, when inputs are present, still links. Keeping that
+    // behavior lets the recorder benchmark a Darwin invocation without treating the version
+    // query as a separate linker flavor.
+    parser
+        .declare()
+        .short("v")
+        .help("Print version information and continue linking")
+        .execute(|args, _modifier_stack| {
+            args.common_mut().version_mode = VersionMode::Verbose;
             Ok(())
         });
 
@@ -573,6 +586,7 @@ mod tests {
     use super::PlatformVersion;
     use crate::args::Input;
     use crate::args::InputSpec;
+    use crate::args::VersionMode;
     use crate::args::macho::SemanticVersion;
     use crate::platform::Args as _;
     use object::macho::Version;
@@ -649,6 +663,15 @@ mod tests {
         args.parse(INPUT1.iter()).unwrap();
         input1_assertions(&args);
         assert!(warnings.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn version_flag_prints_and_continues_like_ld64() {
+        let mut args = MachOArgs::new().unwrap();
+        super::parse(&mut args, ["-v", "main.o"].into_iter()).unwrap();
+
+        assert_eq!(args.common.version_mode, VersionMode::Verbose);
+        assert_eq!(args.common.inputs.len(), 1);
     }
 
     #[test]

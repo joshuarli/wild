@@ -50,6 +50,10 @@ pub(crate) fn run_bench(args: &BenchArgs, config: &Config) -> Result {
 
     let results = run(&bins, &benchmarks, args)?;
 
+    if args.print_stats {
+        crate::print_bench_stats(&results);
+    }
+
     let output_path = crate::default_result_path(config, &args.output);
 
     std::fs::write(&output_path, postcard::to_stdvec(&results)?)
@@ -62,10 +66,12 @@ fn check_tmpfs(args: &BenchArgs) -> Result {
     let tmpfile = std::path::absolute(&args.tmp)?;
     let tmpdir = tmpfile.parent().unwrap();
 
-    let output = Command::new("stat")
-        .arg("-f")
-        .arg("-c")
-        .arg("%T")
+    let mut command = Command::new("stat");
+    #[cfg(target_os = "macos")]
+    command.args(["-f", "%T"]);
+    #[cfg(not(target_os = "macos"))]
+    command.args(["-f", "-c", "%T"]);
+    let output = command
         .arg(tmpdir)
         .output()
         .context("Failed to run `stat`")?;
@@ -225,6 +231,16 @@ fn run_once(
         bail!("Command produced warnings: {command:?}\n{text_out}");
     }
 
+    let output_size = std::fs::metadata(&args.tmp)
+        .with_context(|| {
+            format!(
+                "Linker {} did not write expected output {}",
+                bin.path.display(),
+                args.tmp.display()
+            )
+        })?
+        .len();
+
     // However long we took to run, sleep for half of that. If the linker forked on startup, then
     // this gives the subprocess a chance to shutdown in the background before we run the next
     // command.
@@ -237,6 +253,7 @@ fn run_once(
         max_rss: res_use.rusage.maxrss,
         stime: res_use.rusage.stime,
         utime: res_use.rusage.utime,
+        output_size,
     }))
 }
 
