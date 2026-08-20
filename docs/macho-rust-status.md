@@ -72,7 +72,7 @@ than supported facilities:
 | Objective-C selector dispatch | `macho/objc-runtime`, `objc-multi-selector`, `objc-const-selrefs`, and `objc-dead-selector` compile normal ARC calls without compiler workarounds | Apple ld establishes one 32-byte `__objc_stubs` veneer and one chained-rebase `__objc_selrefs` slot per live selector; `-const_selrefs` instead uses regular `__DATA_CONST` storage | n/a | repeated selectors deduplicate lexically; a dead selector atom emits neither synthetic section | bounded ARM64 Objective-C runtime green |
 | dead strip | `macho/dead-strip` | code/data/export parity pass | C runtime pass | `macho/dead-strip-10000` strips 9,999 of 10,000 symbol-delimited text atoms | ARM64 atom GC green |
 | ABI-level symbols | `macho/common-symbols`, `symbol-aliases`, `weak-symbols`, `weak-undefined`, `cxx-init-teardown` | Apple controls establish common/alias/weak behavior | `macho/rust-native-ffi` calls C through Wild | pending | bounded C/C++/Rust smoke green |
-| TLS | `macho/tls-local`, `tls-dynamic`, `cxx-thread-local`, `rust-thread-local` | Apple ld binds the imported descriptor through `__got`; ld64.lld uses `__thread_ptrs` | C, C++, and Rust two-thread runtime passes under Wild; Rust static/dylib TLS qualification remains external | pending | bounded C/C++/Rust local/dylib smoke green |
+| TLS | `macho/tls-local`, `tls-dynamic`, `cxx-thread-local`, `rust-thread-local`, and Cargo's Rust-dylib producer/consumer | Apple ld binds the imported descriptor through `__got`; ld64.lld uses `__thread_ptrs` | C, C++, a Rust executable, and a dynamically loaded Rust `dylib` prove two-thread isolation under Wild | pending | bounded C/C++/Rust local/dylib smoke green |
 | compact unwind | `macho/exception`, `cxx-exception-cleanup` C++ throw/catch and RAII cleanup; `rust-panic-unwind`, `rust-cxx-unwind-bridge` | structural section/header check; C++ and Rust runtime pass | ARM64 Rust `panic=unwind` / `catch_unwind`, including Rust → C++ RAII → Rust under the dated nightly | pending | bounded ARM64 support |
 | DWARF / dSYM / LLDB | `macho/debug-dwarf`, `cxx-debug-dwarf`, `objc-debug-dwarf`, `strip-symbols`, and Rust `rust-debug-dwarf` / `rust-debuginfo-line-tables` / `rust-split-debug-dwarf` / `rust-split-debug-packed` | Apple ld and ld64.lld establish the same `N_SO`/`N_OSO`/paired-`N_FUN` control shape; `-S` / `-s` links run, and Wild `dsymutil --dump-debug-map` passes | generated dSYMs verify; LLDB stops at C, C++14, Objective-C, normal Rust, Rust `debuginfo=1`, and Rust `split-debuginfo=unpacked` / `packed` source locations (Rust uses `nightly-2026-07-24`) | pending | bounded loose-object ARM64 C/C++/Objective-C/Rust support |
 | chained fixups | `macho/chained-fixups-tlvp`, `chained-fixups-multipage`, `chained-fixups-10000` | Apple controls and Wild runtime pass | pending | 10,000 imported `__got` binds cross five 16 KiB pages; two imported `__thread_ptrs` binds exercise a non-zero TLVP page offset | bounded ARM64 runtime green |
@@ -124,9 +124,9 @@ passed wherever Wild is listed as failing.
 | C/C++ local and C dylib TLS | `macho/tls-local`, `cxx-thread-local`, and `tls-dynamic` cover initialized and zero-fill native TLS, two-thread isolation, `-dead_strip`, and PIE/ASLR | broaden TLS/dylib coverage |
 | Rust `cdylib` consumed from C | permanent `macho/rust-cdylib-consumer` replays rustc's `cdylib` link through Wild, exports a C ABI function, and runs from a C consumer | broaden Rust dylib/export and mixed-language coverage |
 | Rust `staticlib` consumed from C++ | ARM64-only `macho/aarch64/cargo-staticlib-native/default` builds with `nightly-2026-07-24`, checks C ABI exports, and links/runs native C++ consumers through Apple and explicitly through Wild; one control throws in C++, crosses Rust `extern "C-unwind"`, and catches in C++ | broaden the ABI and exception-stress matrix; x86_64 remains out of scope |
-| Rust `dylib` consumed from Rust | `macho/aarch64/cargo-workspace-qualification/default` links the producer and consumer through Wild and runs the consumer via its Mach-O rpath | broaden dependency and TLS matrix |
+| Rust `dylib` consumed from Rust | `macho/aarch64/cargo-workspace-qualification/default` links the producer and consumer through Wild, runs the consumer via its Mach-O rpath, and verifies state in the producer's `thread_local!` is initialized independently in a child thread | broaden dependency and TLS matrix |
 | Proc macro crate | `macho/aarch64/cargo-workspace-qualification/default` links the proc-macro producer and consumer through Wild, loads the macro during compilation, and executes its non-identity expansion | broaden macro/crate stress coverage |
-| Rust `thread_local!` / `cargo test` | permanent `macho/rust-thread-local` two-thread fixture and default `cargo test` pass through Wild | exercise static/dylib TLS matrix |
+| Rust `thread_local!` / `cargo test` | permanent `macho/rust-thread-local` and the Cargo Rust-`dylib` two-thread control pass through Wild; the latter is also invoked by `cargo test` | exercise staticlib and broader dylib TLS matrix |
 | Rust optimized executable | exact-nightly `macho/rust-release` links and runs with `-O -C codegen-units=16`, while `macho/rust-lto` separately runs ThinLTO and fat LTO | broaden crate-scale and profile coverage |
 | C++ throw/catch and cleanup | `macho/exception` catches, while `cxx-exception-cleanup` verifies a destructor runs through its LSDA landing pad; both emit `__TEXT,__unwind_info` and run | broaden compact-unwind differential coverage |
 | Rust `panic=unwind` | `macho/rust-panic-unwind` selects live CIE/FDE records, rewrites DWARF compact-unwind FDE offsets, and catches a panic at runtime under `-dead_strip` | broaden CIE/FDE grammar and crate/stress coverage |
@@ -250,10 +250,13 @@ transcript, requires that each expected producer and consumer artifact selected 
 `TokenStream::from_str("40 + 2")`, so the consumer proves that a loaded macro performed a
 non-identity expansion. The Rust-dylib consumer is then executed after clearing the `DYLD_*`
 library search overrides; `otool` additionally checks both its `@loader_path` rpath and its
-`@rpath/libcargo_macho_dylib_producer.dylib` dependency. It also invokes `cargo test -vv` for
-that consumer: Cargo executes its dylib-dependent unit-test harness, and the trial separately
-audits both the harness and test-mode producer final ARM64 links through Wild. The trial then
-copies the retained workspace into its temporary directory, changes only the copied dylib producer
+`@rpath/libcargo_macho_dylib_producer.dylib` dependency. The producer also owns a
+`thread_local!` cell: the consumer mutates it on the main thread, calls into the same dylib from a
+child Rust thread, and proves that the child starts at 40 without changing the main thread's 41.
+It also invokes `cargo test -vv` for that consumer: Cargo executes its dylib-dependent
+unit-test harness, including the same two-thread TLS contract, and the trial separately audits
+both the harness and test-mode producer final ARM64 links through Wild. The trial then copies the
+retained workspace into its temporary directory, changes only the copied dylib producer
 implementation body while preserving its API and result, and rebuilds/runs the dylib consumer.
 Its second transcript again requires both producer and consumer final ARM64 links through Wild; a
 snapshot asserts that every retained fixture Rust source is unchanged. This coverage deliberately
