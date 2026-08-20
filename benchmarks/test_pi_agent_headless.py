@@ -174,6 +174,15 @@ class PiAgentBenchmarkTests(unittest.TestCase):
             self.assertEqual(command[0], "/Applications/Xcode.app/usr/bin/ld")
             self.assertEqual(command[command.index("-o") + 1], "/tmp/output with spaces")
 
+    def test_cargo_final_output_matches_hyphenated_binary_dep_output(self) -> None:
+        cargo_artifact = Path("/tmp/target/aarch64-apple-darwin/release/cargo-macho-native-cpp")
+        linker_output = Path(
+            "/tmp/target/aarch64-apple-darwin/release/deps/"
+            "cargo_macho_native_cpp-0123456789abcdef"
+        )
+
+        self.assertTrue(BENCHMARK.cargo_final_output_matches(linker_output, cargo_artifact))
+
     def test_opt_in_cache_flags_and_hit_evidence_are_explicit(self) -> None:
         environment = BENCHMARK.with_wild_incremental_cache(
             {"RUSTFLAGS": "-C linker=/tmp/clang"}, Path("/tmp/wild-cache")

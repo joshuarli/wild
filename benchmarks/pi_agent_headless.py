@@ -553,15 +553,20 @@ def final_link_command(
 
 
 def cargo_output_identity(path: Path) -> str:
-    """Normalizes only Cargo/rustc's hexadecimal final-artifact disambiguator."""
+    """Normalizes Cargo/rustc's final-artifact spelling and hexadecimal disambiguator.
+
+    Cargo's top-level executable keeps a package's hyphens, while rustc normalizes the matching
+    hashed `deps` output to a crate identifier with underscores. The two names describe the same
+    final artifact; only this spelling distinction and the generated hash are ignored.
+    """
     suffix = path.suffix
     stem = path.name[: -len(suffix)] if suffix else path.name
     prefix, separator, disambiguator = stem.rpartition("-")
     if separator and len(disambiguator) >= 8 and all(
         character in "0123456789abcdefABCDEF" for character in disambiguator
     ):
-        return f"{prefix}{suffix}"
-    return path.name
+        stem = prefix
+    return f"{stem.replace('_', '-')}{suffix}"
 
 
 def cargo_final_output_matches(command_output: Path, cargo_artifact: Path) -> bool:
