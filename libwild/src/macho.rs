@@ -3075,17 +3075,22 @@ impl platform::Platform for MachO {
     }
 
     fn new_stub_library_layout_state_ext<'data>(
-        _stub: &resolution::ResolvedStubLibrary<'data>,
+        stub: &resolution::ResolvedStubLibrary<'data>,
         args: &Self::Args,
     ) -> Self::StubLibraryLayoutStateExt {
-        DynamicLayoutStateExt::new(args)
+        DynamicLayoutStateExt::new(args, stub.defined_symbols.dylib)
     }
 
     fn new_dynamic_layout_state_ext<'data>(
-        _file: &resolution::ResolvedDynamic<'data, Self>,
+        file: &resolution::ResolvedDynamic<'data, Self>,
         args: &Self::Args,
     ) -> Self::DynamicLayoutStateExt<'data> {
-        DynamicLayoutStateExt::new(args)
+        let metadata = file
+            .common
+            .object
+            .dylib_metadata()
+            .expect("Resolved Mach-O dynamic input must carry LC_ID_DYLIB metadata");
+        DynamicLayoutStateExt::new(args, metadata)
     }
 
     fn load_stub_library_symbol<'data>(
@@ -4551,10 +4556,15 @@ impl<'data> ObjectKind<'data> {
 }
 
 impl DynamicLayoutStateExt {
-    fn new(args: &MachOArgs) -> Self {
+    fn new(args: &MachOArgs, metadata: DylibMetadata<'_>) -> Self {
         Self {
             imported_symbols: Default::default(),
-            loaded: !args.dead_strip_dylibs,
+            // Even an otherwise unreferenced executable must retain libSystem. dyld requires an
+            // LC_LOAD_DYLIB for it before launching the main image; `-dead_strip_dylibs` may
+            // remove ordinary unused dependencies but cannot turn a valid executable into one
+            // dyld rejects before its entry point.
+            loaded: !args.dead_strip_dylibs
+                || metadata.install_name == b"/usr/lib/libSystem.B.dylib",
         }
     }
 }
