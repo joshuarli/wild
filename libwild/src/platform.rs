@@ -1278,6 +1278,13 @@ pub(crate) trait Symbol: std::fmt::Debug + Copy + Send + Sync + 'static {
 
     fn is_weak(&self) -> bool;
 
+    /// Returns whether an undefined reference has weak-import semantics. By default, platforms
+    /// whose weak binding applies equally to definitions and references can derive this from
+    /// `is_weak`; Mach-O keeps the reference bit separately in `n_desc`.
+    fn is_weak_reference(&self) -> bool {
+        self.is_undefined() && self.is_weak()
+    }
+
     fn visibility(&self) -> crate::symbol_db::Visibility;
 
     fn value(&self) -> u64;

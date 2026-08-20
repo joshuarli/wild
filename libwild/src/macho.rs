@@ -57,9 +57,12 @@ use object::SymbolIndex;
 use object::macho;
 use object::macho::N_ABS;
 use object::macho::N_EXT;
+use object::macho::N_INDR;
 use object::macho::N_PEXT;
 use object::macho::N_SECT;
+use object::macho::N_UNDF;
 use object::macho::N_WEAK_DEF;
+use object::macho::N_WEAK_REF;
 use object::macho::S_ATTR_DEBUG;
 use object::macho::S_ATTR_EXT_RELOC;
 use object::macho::S_ATTR_LIVE_SUPPORT;
@@ -185,6 +188,9 @@ pub(crate) mod output_section_id {
     /// symbol stubs and can be more than a branch range away from ordinary input code.
     pub(crate) const TEXT: OutputSectionId =
         crate::output_section_id::regular_section_base::<MachO>();
+    /// Tentative C/C++ definitions have no input section. ld64 materializes their selected
+    /// definition in this zero-fill section instead of treating N_UNDF as an unresolved reference.
+    pub(crate) const COMMON: OutputSectionId = TEXT.offset(1);
 }
 
 const LE: Endianness = Endianness::Little;
@@ -792,6 +798,9 @@ pub(crate) struct PreludeLayoutExt {
 pub(crate) struct ImportedSymbolWithResolution {
     pub(crate) symbol_id: SymbolId,
     pub(crate) binding: ImportedSymbolBinding,
+    /// dyld's `weak_import` bit is a property of every relocation that names this import. A
+    /// single strong use upgrades a mixed import to ordinary binding semantics.
+    pub(crate) weak_import: bool,
 }
 
 /// Storage which dyld binds for an imported symbol.
@@ -829,6 +838,20 @@ pub(crate) struct File<'data> {
     #[allow(unused)]
     pub(crate) flags: object::macho::FileFlags,
     kind: ObjectKind<'data>,
+}
+
+impl<'data> File<'data> {
+    /// Returns the target name encoded by an `N_INDR` alias. Unlike an ordinary nlist name,
+    /// `n_value` is a string-table offset for this one record type.
+    pub(crate) fn indirect_symbol_target(&self, symbol: &SymtabEntry) -> Result<&'data [u8]> {
+        debug_assert_eq!(symbol.n_type.typ(), N_INDR);
+        let offset = u32::try_from(symbol.n_value.get(LE))
+            .map_err(|_| error!("Mach-O indirect symbol target offset exceeds u32"))?;
+        self.symbols
+            .strings()
+            .get(offset)
+            .map_err(|_| error!("Mach-O indirect symbol target is outside the string table"))
+    }
 }
 
 /// A source-level function entry that `dsymutil` can relocate from an input C object to the
@@ -1291,12 +1314,43 @@ impl platform::SectionFlags for SectionFlags {
 // Documentation link for Nlist64 type: https://leopard-adc.pepas.com/documentation/DeveloperTools/Conceptual/MachORuntime/Reference/reference.html
 impl platform::Symbol for SymtabEntry {
     fn as_common(&self) -> Option<platform::CommonSymbol> {
-        // TODO
-        None
+        // Mach-O stores tentative definitions as `N_UNDF | N_EXT` symbols whose nonzero value is
+        // their size. `n_desc[11:8]` optionally carries the requested alignment exponent. This is
+        // a definition to generic resolution, despite its raw N_UNDF object representation.
+        if self.n_type.typ() != N_UNDF
+            || !self.n_type.contains(N_EXT)
+            || self.n_sect != 0
+            || self.n_value.get(LE) == 0
+        {
+            return None;
+        }
+
+        let requested_exponent = (self.n_desc.get(LE).0 >> 8) & 0x0f;
+        let natural_exponent = 64 - (self.n_value.get(LE) - 1).leading_zeros();
+        // ld64 accepts the on-disk four-bit exponent but caps __common at the default 16 KiB
+        // segment alignment. Keep the allocated part and its emitted section header consistent.
+        let alignment_exponent = if requested_exponent == 0 {
+            natural_exponent
+        } else {
+            u32::from(requested_exponent)
+        }
+        .min(15)
+        .min(u32::from(MACHO_PAGE_ALIGNMENT.exponent));
+        let alignment = Alignment::from_exponent(alignment_exponent).ok()?;
+        let size = self
+            .n_value
+            .get(LE)
+            .checked_add(alignment.mask())?
+            & !alignment.mask();
+
+        Some(platform::CommonSymbol {
+            size,
+            part_id: output_section_id::COMMON.part_id_with_alignment::<MachO>(alignment),
+        })
     }
 
     fn is_undefined(&self) -> bool {
-        Nlist::is_undefined(self)
+        Nlist::is_undefined(self) && self.as_common().is_none()
     }
 
     fn is_local(&self) -> bool {
@@ -1309,6 +1363,10 @@ impl platform::Symbol for SymtabEntry {
 
     fn is_weak(&self) -> bool {
         self.n_desc.get(LE).contains(N_WEAK_DEF)
+    }
+
+    fn is_weak_reference(&self) -> bool {
+        self.n_type.typ() == N_UNDF && self.n_desc.get(LE).contains(N_WEAK_REF)
     }
 
     fn visibility(&self) -> crate::symbol_db::Visibility {
@@ -1324,8 +1382,10 @@ impl platform::Symbol for SymtabEntry {
     }
 
     fn size(&self) -> u64 {
-        // TODO
-        0
+        // `N_UNDF` commons carry their allocation size in `n_value`; ordinary Mach-O nlists do
+        // not encode a size, but returning the value is the only information generic common
+        // selection needs and makes the largest tentative definition win.
+        self.n_value.get(LE)
     }
 
     fn has_name(&self) -> bool {
@@ -1621,7 +1681,9 @@ impl<'data> platform::VerneedTable<'data> for VerneedTable<'data> {
 
 impl platform::Platform for MachO {
     const NUM_SINGLE_PART_SECTIONS: u32 = SinglePartSectionId::Count as u32;
-    const NUM_BUILT_IN_REGULAR_SECTIONS: usize = 1;
+    const NUM_BUILT_IN_REGULAR_SECTIONS: usize = 2;
+
+    const BSS_SECTION_ID: Option<OutputSectionId> = Some(output_section_id::COMMON);
 
     // The macOS kernel caches code signature state by vnode. Reusing a previously executed output's
     // inode after changing its contents can therefore cause the new executable to SIGKILL, even
@@ -1724,7 +1786,9 @@ impl platform::Platform for MachO {
     fn is_zero_sized_section_content(
         _section_id: crate::output_section_id::OutputSectionId,
     ) -> bool {
-        todo!()
+        // Mach-O section headers, especially zero-fill sections, remain semantically useful even
+        // when their contributing input subsection has no file bytes. Preserve them like ld64.
+        true
     }
 
     fn built_in_section_details() -> &'static [Self::BuiltInSectionDetails] {
@@ -2075,10 +2139,27 @@ impl platform::Platform for MachO {
     }
 
     fn create_linker_defined_symbols(
-        _symbols: &mut crate::parsing::InternalSymbolsBuilder<Self>,
+        symbols: &mut crate::parsing::InternalSymbolsBuilder<Self>,
         _output_kind: crate::output_kind::OutputKind,
         _args: &Self::Args,
     ) {
+        // SymbolId 0 is the generic unresolved-symbol sentinel. Mach-O objects do not carry an
+        // ELF-style null entry, so reserve it before assigning IDs to real input symbols.
+        symbols
+            .add_symbol(crate::parsing::InternalSymDefInfo::new(
+                crate::parsing::SymbolPlacement::Undefined,
+                b"",
+            ))
+            .hide();
+
+        // C++ passes this hidden image identity to __cxa_atexit. Apple ld resolves it to the
+        // first loadable address (the Mach-O header), never as a dyld import or nullable symbol.
+        symbols
+            .add_symbol(crate::parsing::InternalSymDefInfo::new(
+                crate::parsing::SymbolPlacement::LoadBaseAddress,
+                b"___dso_handle",
+            ))
+            .hide();
     }
 
     fn built_in_section_infos<'data>()
@@ -2246,6 +2327,7 @@ impl platform::Platform for MachO {
                 Ok(ImportedSymbolWithResolution {
                     symbol_id,
                     binding,
+                    weak_import: resolution.flags().is_weak_reference(),
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -2673,11 +2755,15 @@ impl platform::Platform for MachO {
 
     fn allocate_internal_symbol(
         _symbol_id: crate::symbol_db::SymbolId,
-        _def_info: &crate::parsing::InternalSymDefInfo<Self>,
+        def_info: &crate::parsing::InternalSymDefInfo<Self>,
         _sizes: &mut crate::output_section_part_map::OutputSectionPartMap<u64>,
         _symbol_db: &crate::symbol_db::SymbolDb<Self>,
     ) -> Result {
-        todo!()
+        // Mach-O's internal ABI symbols (currently `___dso_handle`) are linker-private. Their
+        // resolutions are used by relocations but they intentionally have no nlist entry, so no
+        // symtab or string-table allocation is required.
+        debug_assert!(def_info.symbol.is_hidden());
+        Ok(())
     }
 
     fn allocate_prelude(
@@ -2712,6 +2798,10 @@ impl platform::Platform for MachO {
             raw_value,
             dynamic_symbol_index,
             format_specific: ResolutionExt {
+                // `raw_value` below becomes a GOT/PLT/TLVP address when a relocation requires
+                // an indirection. Keep the symbol's own address for metadata and local GOT
+                // rebases (notably sectionless common definitions).
+                symbol_address: raw_value,
                 got_address: None,
                 tlvp_address: None,
                 plt_address: None,
@@ -2844,6 +2934,7 @@ impl platform::Platform for MachO {
             add_sections_in_segment(&mut builder, output_sections, &custom.data, segment);
             add_sections_in_segment(&mut builder, output_sections, &custom.bss, segment);
         }
+        builder.add_section(output_section_id::COMMON);
 
         // Arbitrary segment sections are added in first-seen order.
         for segment in arbitrary_segments {
@@ -3170,6 +3261,14 @@ const SECTION_DEFINITIONS: [BuiltInSectionDetails; NUM_BUILT_IN_SECTIONS] = {
         min_alignment: Alignment { exponent: 2 },
         ..DEFAULT_DEFS
     };
+    defs[output_section_id::COMMON.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionIdentity::new(
+            SectionName(b"__common"),
+            Some(SegmentName::DATA),
+        )),
+        section_flags: S_ZEROFILL.to_flags(),
+        ..DEFAULT_DEFS
+    };
 
     defs
 };
@@ -3192,6 +3291,8 @@ pub(crate) struct DynamicLayoutExt {
 
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct ResolutionExt {
+    /// The definition address before relocation-specific indirection rewrites `raw_value`.
+    pub(crate) symbol_address: u64,
     pub(crate) got_address: Option<NonZeroU64>,
     /// Runtime-bound pointer to an imported dylib's TLV descriptor in `__thread_ptrs`.
     pub(crate) tlvp_address: Option<NonZeroU64>,
@@ -3319,6 +3420,7 @@ fn process_relocation<'data, 'scope, A: platform::Arch<Platform = MachO>>(
         let local_sym_index = SymbolIndex(rel_info.r_symbolnum as usize);
         let symbol_db = resources.symbol_db;
         let local_symbol_id = object.symbol_id_range.input_to_id(local_sym_index);
+        let local_symbol = object.object.symbol(local_sym_index)?;
         let symbol_id = symbol_db.definition(local_symbol_id);
         let target_is_dynamic = is_dynamic_library(&symbol_db.file(symbol_db.file_id_for_symbol(symbol_id)));
 
@@ -3338,6 +3440,11 @@ fn process_relocation<'data, 'scope, A: platform::Arch<Platform = MachO>>(
         );
         let mut flags_to_add = layout::resolution_flags(relocation.kind);
         if target_is_dynamic {
+            flags_to_add |= if local_symbol.is_weak_reference() {
+                ValueFlags::WEAK_REFERENCE
+            } else {
+                ValueFlags::STRONG_REFERENCE
+            };
             if matches!(
                 rel_info.r_type,
                 object::macho::ARM64_RELOC_TLVP_LOAD_PAGE21

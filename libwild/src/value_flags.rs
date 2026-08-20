@@ -107,6 +107,14 @@ bitflags! {
 
         /// Whether the symbol has a reference from non-IR code.
         const HAS_NON_IR_REF = 1 << 16;
+
+        /// At least one loaded relocation refers to this dynamic symbol through a Mach-O weak
+        /// reference. This is reference provenance, not a property of the selected definition.
+        const WEAK_REFERENCE = 1 << 17;
+
+        /// At least one loaded relocation refers to this dynamic symbol strongly. A mixed set of
+        /// references must be encoded as a normal (non-weak) dyld import.
+        const STRONG_REFERENCE = 1 << 18;
     }
 }
 
@@ -234,6 +242,12 @@ impl ValueFlags {
     #[must_use]
     pub(crate) fn needs_ifunc_got_for_address(self) -> bool {
         self.contains(ValueFlags::IFUNC_GOT_FOR_ADDRESS)
+    }
+
+    #[must_use]
+    pub(crate) fn is_weak_reference(self) -> bool {
+        self.contains(ValueFlags::WEAK_REFERENCE)
+            && !self.contains(ValueFlags::STRONG_REFERENCE)
     }
 
     #[must_use]

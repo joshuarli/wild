@@ -57,6 +57,9 @@
 //! symbol or numeric address. Symbols are supported for ELF and Mach-O. Numeric addresses are
 //! supported for ELF.
 //!
+//! ExpectMachOLoadCommand:weak-dylib Checks that a Mach-O output has an
+//! `LC_LOAD_WEAK_DYLIB` command. This assertion is only supported for Mach-O tests.
+//!
 //! ExpectDynamic:tag-name Checks that the specified dynamic entry (e.g. DT_RUNPATH, DT_FLAGS) is
 //! present in the .dynamic section.
 //!
@@ -361,6 +364,7 @@ use object::ObjectSymbol as _;
 use object::macho::LC_CODE_SIGNATURE;
 use object::macho::LC_DYLD_CHAINED_FIXUPS;
 use object::macho::LC_DYLD_EXPORTS_TRIE;
+use object::macho::LC_LOAD_WEAK_DYLIB;
 use object::macho::SEG_LINKEDIT;
 use object::macho::SEG_TEXT;
 use object::read::elf::ProgramHeader;
@@ -1869,6 +1873,7 @@ struct Assertions {
     expected_symtab_entries: Vec<ExpectedSymtabEntry>,
     expected_dynsym_entries: Vec<ExpectedSymtabEntry>,
     expected_entry: Option<String>,
+    expected_macho_load_commands: Vec<String>,
     expected_comments: Vec<String>,
     no_sym: HashSet<String>,
     no_dynsym: HashSet<String>,
@@ -2406,6 +2411,10 @@ fn process_directive(
             ExpectedSymtabEntry::parse(arg).context("Failed to parse ExpectDynSym arguments")?,
         ),
         "ExpectEntry" => config.assertions.expected_entry = Some(arg.to_owned()),
+        "ExpectMachOLoadCommand" => config
+            .assertions
+            .expected_macho_load_commands
+            .push(arg.to_owned()),
         "ExpectComment" => config.assertions.expected_comments.push(arg.to_owned()),
         "NoSym" => {
             config.assertions.no_sym.insert(arg.to_owned());
@@ -4982,6 +4991,7 @@ impl Assertions {
             expected_symtab_entries: self.expected_symtab_entries.clone(),
             expected_dynsym_entries: self.expected_dynsym_entries.clone(),
             expected_entry: self.expected_entry.clone(),
+            expected_macho_load_commands: self.expected_macho_load_commands.clone(),
             no_sym: self.no_sym.clone(),
             no_dynsym: self.no_dynsym.clone(),
             does_not_contain: self.does_not_contain.clone(),
@@ -5020,6 +5030,7 @@ impl Assertions {
         }
 
         self.verify_macho_entry(obj)?;
+        self.verify_macho_load_commands(obj)?;
         self.verify_symbols_absent(&self.no_sym, obj.symbols(), "symtab")?;
         self.verify_expected_sections(obj)?;
         self.verify_absent_sections(obj)?;
@@ -5173,6 +5184,29 @@ impl Assertions {
             self.expected_entry.as_deref().unwrap()
         );
 
+        Ok(())
+    }
+
+    fn verify_macho_load_commands(&self, obj: &object::File) -> Result {
+        if self.expected_macho_load_commands.is_empty() {
+            return Ok(());
+        }
+        let object::File::MachO64(file) = obj else {
+            bail!("ExpectMachOLoadCommand is only supported for Mach-O");
+        };
+        let mut commands = file.macho_load_commands()?;
+        let mut has_weak_dylib = false;
+        while let Some(command) = commands.next()? {
+            has_weak_dylib |= command.cmd() == LC_LOAD_WEAK_DYLIB;
+        }
+        for expected in &self.expected_macho_load_commands {
+            match expected.as_str() {
+                "weak-dylib" => {
+                    ensure!(has_weak_dylib, "Expected Mach-O LC_LOAD_WEAK_DYLIB load command");
+                }
+                _ => bail!("Unknown Mach-O load-command expectation `{expected}`"),
+            }
+        }
         Ok(())
     }
 

@@ -77,6 +77,7 @@ use crate::platform::ObjectFile;
 use crate::platform::Symbol;
 use crate::resolution::SectionSlot;
 use crate::symbol_db::SymbolId;
+use crate::symbol::UnversionedSymbolName;
 use crate::thunks::ThunkBlockId;
 use crate::timing_phase;
 use crate::value_flags::ValueFlags;
@@ -112,6 +113,7 @@ use object::macho::LC_DYLD_EXPORTS_TRIE;
 use object::macho::LC_ID_DYLIB;
 use object::macho::LC_LOAD_DYLIB;
 use object::macho::LC_LOAD_DYLINKER;
+use object::macho::LC_LOAD_WEAK_DYLIB;
 use object::macho::LC_MAIN;
 use object::macho::LC_RPATH;
 use object::macho::LC_SEGMENT_64;
@@ -123,6 +125,7 @@ use object::macho::MH_DYLIB;
 use object::macho::MH_EXECUTE;
 use object::macho::MH_HAS_TLV_DESCRIPTORS;
 use object::macho::N_ABS;
+use object::macho::N_INDR;
 use object::macho::N_SECT;
 use object::macho::PLATFORM_MACOS;
 use object::macho::RelocationInfo;
@@ -1542,7 +1545,12 @@ fn write_prelude<'data>(
         let dylib_command = take_mut(&mut command_buffer)?;
         let path = crate::macho::install_name(file_id, &layout.symbol_db);
 
-        write_dylib_command(dylib_command, command_buffer, path, LC_LOAD_DYLIB);
+        let command_type = if imported_library_is_weak(layout, file_id) {
+            LC_LOAD_WEAK_DYLIB
+        } else {
+            LC_LOAD_DYLIB
+        };
+        write_dylib_command(dylib_command, command_buffer, path, command_type);
     }
 
     write_dyld_chained_fixups_command(layout, take_mut(&mut load_command_buffer)?);
@@ -1564,6 +1572,27 @@ fn write_prelude<'data>(
     buffers.get_mut(part_id::STRTAB).fill(0);
 
     Ok(())
+}
+
+/// A Mach-O load command is weak only if it contributes at least one imported symbol and every
+/// such symbol was referenced weakly. Library identity follows the install name, matching ordinal
+/// de-duplication in `MachO::create_finalise_sizes_ext`.
+fn imported_library_is_weak(layout: &MachOLayout<'_>, file_id: FileId) -> bool {
+    let install_name = crate::macho::install_name(file_id, &layout.symbol_db);
+    let mut has_import = false;
+    let all_imports_weak = layout
+        .format_specific
+        .imported_symbols
+        .iter()
+        .filter(|symbol| {
+            let symbol_file_id = layout.symbol_db.file_id_for_symbol(symbol.symbol_id);
+            crate::macho::install_name(symbol_file_id, &layout.symbol_db) == install_name
+        })
+        .all(|symbol| {
+            has_import = true;
+            symbol.weak_import
+        });
+    has_import && all_imports_weak
 }
 
 fn write_epilogue(
@@ -1952,25 +1981,36 @@ fn local_got_rebase_for_symbol(
 
     let symbol_index = definition.symbol_id_range.id_to_input(symbol_id);
     let symbol = definition.object.symbol(symbol_index)?;
-    let section_index = definition
-        .object
-        .symbol_section(symbol, symbol_index)?
-        .context("local Mach-O GOT target is not section-defined")?;
-    let section_address = definition.section_resolutions[section_index.0]
-        .address()
-        .context("local Mach-O GOT target section has no output address")?;
-    let target = section_address
-        .checked_add(
-            definition
-                .output_offset_for_input(
-                    section_index,
-                    definition
-                        .object
-                        .symbol_offset_in_section(symbol, section_index)?,
-                )
-                .context("local Mach-O GOT target is in a dead atom")?,
-        )
-        .context("local Mach-O GOT target address overflows")?;
+    let target = if symbol.as_common().is_some() {
+        // Tentative definitions are assigned an address by the generic common allocator rather
+        // than an input section. A GOT_LOAD still needs the ordinary image-local dyld rebase.
+        layout
+            .symbol_resolutions
+            .get(symbol_id)
+            .context("local Mach-O common GOT target has no resolution")?
+            .format_specific
+            .symbol_address
+    } else {
+        let section_index = definition
+            .object
+            .symbol_section(symbol, symbol_index)?
+            .context("local Mach-O GOT target is not section-defined")?;
+        let section_address = definition.section_resolutions[section_index.0]
+            .address()
+            .context("local Mach-O GOT target section has no output address")?;
+        section_address
+            .checked_add(
+                definition
+                    .output_offset_for_input(
+                        section_index,
+                        definition
+                            .object
+                            .symbol_offset_in_section(symbol, section_index)?,
+                    )
+                    .context("local Mach-O GOT target is in a dead atom")?,
+            )
+            .context("local Mach-O GOT target address overflows")?
+    };
     let got_address = layout
         .symbol_resolutions
         .get(symbol_id)
@@ -3235,7 +3275,9 @@ fn write_chained_fixup_table(
 
         imports[i].set(
             Endianness::Little,
-            u32::from(lib_ordinal) | ((symbol_offsets[i] as u32) << 9),
+            u32::from(lib_ordinal)
+                | (u32::from(imported_symbol.weak_import) << 8)
+                | ((symbol_offsets[i] as u32) << 9),
         );
     }
 
@@ -3504,9 +3546,85 @@ fn write_symbols<'data>(
             continue;
         };
 
-        let mut value = 0;
-        let (section, symbol_type, desc) =
-            if let Some(section_index) = object.object.symbol_section(sym, sym_index)? {
+        let (section, symbol_type, desc, value) = if sym.n_type.typ() == N_INDR {
+            // ld64 writes an N_INDR input alias as a second section-defined nlist with the
+            // resolved target's address. Keep the alias's visibility/binding bits, but never
+            // leak its input string-table offset as an output address.
+            let target_name = object.object.indirect_symbol_target(sym)?;
+            let target_id = layout
+                .symbol_db
+                .get_unversioned(&UnversionedSymbolName::prehashed(target_name))
+                .with_context(|| {
+                    format!(
+                        "Mach-O indirect symbol {} targets missing symbol {}",
+                        layout.symbol_debug(symbol_id),
+                        String::from_utf8_lossy(target_name)
+                    )
+                })?;
+            let target_id = layout.symbol_db.definition(target_id);
+            let FileLayout::Object(target_object) = layout
+                .file_layout(layout.symbol_db.file_id_for_symbol(target_id))
+            else {
+                bail!(
+                    "Mach-O indirect symbol {} targets a non-object symbol",
+                    layout.symbol_debug(symbol_id)
+                );
+            };
+            let target_index = target_object.symbol_id_range.id_to_input(target_id);
+            let target = target_object.object.symbol(target_index)?;
+            let section = if let Some(section_index) = target_object
+                .object
+                .symbol_section(target, target_index)?
+            {
+                let section_id = match &target_object.sections[section_index.0] {
+                    SectionSlot::Loaded(_) | SectionSlot::MergeStrings(_) => target_object
+                        .section_part_id(section_index, &layout.symbol_db.section_part_ids)
+                        .output_section_id::<MachO>(),
+                    _ => bail!(
+                        "Mach-O indirect symbol {} targets a discarded section",
+                        layout.symbol_debug(symbol_id)
+                    ),
+                };
+                let primary_id = layout.output_sections.primary_output_section(section_id);
+                macho_section_index(layout, primary_id).with_context(|| {
+                    format!(
+                        "No Mach-O section index for indirect symbol {} target",
+                        layout.symbol_debug(symbol_id)
+                    )
+                })?
+            } else if target.as_common().is_some() {
+                let section_id = layout
+                    .output_sections
+                    .primary_output_section(crate::macho::output_section_id::COMMON);
+                macho_section_index(layout, section_id).with_context(|| {
+                    format!(
+                        "No Mach-O section index for indirect common symbol {} target",
+                        layout.symbol_debug(symbol_id)
+                    )
+                })?
+            } else {
+                bail!(
+                    "Mach-O indirect symbol {} targets a non-section symbol",
+                    layout.symbol_debug(symbol_id)
+                );
+            };
+            let value = layout
+                .local_symbol_resolution(target_id)
+                .with_context(|| {
+                    format!(
+                        "Mach-O indirect symbol {} target has no resolution",
+                        layout.symbol_debug(symbol_id)
+                    )
+                })?
+                .format_specific
+                .symbol_address;
+            (
+                section,
+                sym.n_type.with_type(N_SECT),
+                sym.n_desc.get(LE),
+                value,
+            )
+        } else if let Some(section_index) = object.object.symbol_section(sym, sym_index)? {
                 let section_id = match &object.sections[section_index.0] {
                     // String merging computes the symbol resolution through its explicit
                     // input-offset-to-output-offset map. The resulting symbol still belongs to
@@ -3529,17 +3647,44 @@ fn write_symbols<'data>(
                     )
                 })?;
                 let n_desc = sym.n_desc.get(LE);
-                (n_sect, n_type, n_desc)
+                (n_sect, n_type, n_desc, 0)
             } else if sym.is_absolute() {
                 let n_desc = sym.n_desc.get(LE);
-                (0, sym.n_type.with_type(N_ABS), n_desc)
+                (0, sym.n_type.with_type(N_ABS), n_desc, 0)
+            } else if sym.as_common().is_some() {
+                // A common is N_UNDF only in an input object. Once selected and allocated, ld64
+                // emits it as a definition in __DATA,__common and clears input-only alignment
+                // bits from n_desc.
+                let section_id = layout
+                    .output_sections
+                    .primary_output_section(crate::macho::output_section_id::COMMON);
+                let n_sect = macho_section_index(layout, section_id).with_context(|| {
+                    format!(
+                        "No Mach-O section index for __DATA,__common while writing {}",
+                        layout.symbol_debug(symbol_id)
+                    )
+                })?;
+                (
+                    n_sect,
+                    sym.n_type.with_type(N_SECT),
+                    object::macho::SymbolDesc::default(),
+                    0,
+                )
             } else {
                 bail!("Attempted to output a Mach-O symtab entry with an unexpected section type")
             };
 
-        if let Some(res) = layout.local_symbol_resolution(symbol_id) {
-            value = res.value_for_symbol_table();
-        }
+        let value = if sym.n_type.typ() == N_INDR {
+            value
+        } else if let Some(res) = layout.local_symbol_resolution(symbol_id) {
+            if sym.as_common().is_some() {
+                res.format_specific.symbol_address
+            } else {
+                res.value_for_symbol_table()
+            }
+        } else {
+            value
+        };
 
         symbol_writer.define_symbol(buffers, info.name, section, symbol_type, desc, value)?;
     }
