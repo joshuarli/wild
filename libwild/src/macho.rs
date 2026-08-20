@@ -875,7 +875,85 @@ pub(crate) struct File<'data> {
     kind: ObjectKind<'data>,
 }
 
+/// The identity and ABI versions that a dynamic input contributes to its consumer.
+///
+/// Mach-O resolves dynamic libraries by the `LC_ID_DYLIB` path rather than the path by which the
+/// linker happened to open the file. The current and compatibility versions belong to that same
+/// identity and must therefore stay with it until `LC_LOAD_DYLIB` is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DylibMetadata<'data> {
+    pub(crate) install_name: &'data [u8],
+    pub(crate) versions: DylibVersions,
+}
+
+/// The two version fields preserved from a dynamic library or represented by a TBD document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DylibVersions {
+    pub(crate) current: macho::Version,
+    pub(crate) compatibility: macho::Version,
+}
+
+impl DylibVersions {
+    /// `ld64` uses 1.0.0 for both fields when a TBD omits a version field.
+    pub(crate) fn tbd(current: &str, compatibility: &str) -> Result<Self> {
+        Ok(Self {
+            current: if current.is_empty() {
+                macho::Version::new(1, 0, 0)
+            } else {
+                parse_dylib_version(current)?
+            },
+            compatibility: if compatibility.is_empty() {
+                macho::Version::new(1, 0, 0)
+            } else {
+                parse_dylib_version(compatibility)?
+            },
+        })
+    }
+
+    /// A newly linked dylib has the producer defaults that `ld64` writes in its LC_ID_DYLIB.
+    pub(crate) fn output_default() -> Self {
+        Self {
+            current: macho::Version::new(1, 0, 0),
+            compatibility: macho::Version::new(1, 0, 0),
+        }
+    }
+}
+
+fn parse_dylib_version(value: &str) -> Result<macho::Version> {
+    let mut components = value.split('.');
+    let major = components
+        .next()
+        .ok_or_else(|| error!("dylib version must not be empty"))?
+        .parse()
+        .with_context(|| format!("invalid dylib major version `{value}`"))?;
+    let minor = components
+        .next()
+        .map(str::parse)
+        .transpose()
+        .with_context(|| format!("invalid dylib minor version `{value}`"))?
+        .unwrap_or(0);
+    let update = components
+        .next()
+        .map(str::parse)
+        .transpose()
+        .with_context(|| format!("invalid dylib update version `{value}`"))?
+        .unwrap_or(0);
+    ensure!(
+        components.next().is_none(),
+        "dylib version `{value}` has more than three components"
+    );
+
+    Ok(macho::Version::new(major, minor, update))
+}
+
 impl<'data> File<'data> {
+    fn dylib_metadata(&self) -> Option<DylibMetadata<'data>> {
+        match self.kind {
+            ObjectKind::Regular(_) => None,
+            ObjectKind::Dylib(metadata) => Some(metadata),
+        }
+    }
+
     /// Returns the target name encoded by an `N_INDR` alias. Unlike an ordinary nlist name,
     /// `n_value` is a string-table offset for this one record type.
     pub(crate) fn indirect_symbol_target(&self, symbol: &SymtabEntry) -> Result<&'data [u8]> {
@@ -927,7 +1005,7 @@ pub(crate) enum MachOGcUnit {
 #[derive(Debug)]
 enum ObjectKind<'data> {
     Regular(RegularObject<'data>),
-    Dylib,
+    Dylib(DylibMetadata<'data>),
 }
 
 #[derive(derive_more::Debug)]
@@ -945,11 +1023,25 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
 
         let mut symbols = None;
         let mut sections = None;
+        let mut dylib_metadata = None;
 
         while let Some(command) = commands.next()? {
             if let Some(symtab_command) = command.symtab()? {
                 ensure!(symbols.is_none(), "At most one symtab command expected");
                 symbols = Some(symtab_command.symbols::<macho::MachHeader64<_>, _>(LE, input)?);
+            } else if is_dynamic && command.cmd() == macho::LC_ID_DYLIB {
+                ensure!(
+                    dylib_metadata.is_none(),
+                    "At most one LC_ID_DYLIB command expected"
+                );
+                let dylib_command: &DylibCommand = command.data()?;
+                dylib_metadata = Some(DylibMetadata {
+                    install_name: command.string(LE, dylib_command.dylib.name)?,
+                    versions: DylibVersions {
+                        current: dylib_command.dylib.current_version.get(LE),
+                        compatibility: dylib_command.dylib.compatibility_version.get(LE),
+                    },
+                });
             } else if !is_dynamic
                 && let Some((segment_command, segment_data)) = command.segment_64()?
             {
@@ -960,7 +1052,7 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
         }
 
         let kind = if is_dynamic {
-            ObjectKind::Dylib
+            ObjectKind::Dylib(dylib_metadata.ok_or("Missing LC_ID_DYLIB command")?)
         } else {
             ObjectKind::Regular(RegularObject {
                 sections: sections.ok_or("Missing segment command")?,
@@ -981,7 +1073,7 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
     }
 
     fn is_dynamic(&self) -> bool {
-        matches!(self.kind, ObjectKind::Dylib)
+        matches!(self.kind, ObjectKind::Dylib(_))
     }
 
     fn num_symbols(&self) -> usize {
@@ -1170,7 +1262,7 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
     fn dynamic_tag_values(&self) -> Option<DynamicTagValues<'data>> {
         match self.kind {
             ObjectKind::Regular(_) => None,
-            ObjectKind::Dylib => Some(DynamicTagValues::default()),
+            ObjectKind::Dylib(metadata) => Some(DynamicTagValues { metadata }),
         }
     }
 
@@ -1649,10 +1741,9 @@ const DEFAULT_DEFS: BuiltInSectionDetails = BuiltInSectionDetails {
     min_alignment: alignment::MIN,
 };
 
-#[allow(unused)]
-#[derive(Default, Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct DynamicTagValues<'data> {
-    phantom: &'data [u8],
+    metadata: DylibMetadata<'data>,
 }
 
 #[derive(Debug)]
@@ -1668,7 +1759,7 @@ impl<'data> platform::RelocationList<'data> for RelocationList<'data> {
 
 impl<'data> platform::DynamicTagValues<'data> for DynamicTagValues<'data> {
     fn lib_name(&self, _input: &crate::input_data::InputRef<'data>) -> &'data [u8] {
-        &[]
+        self.metadata.install_name
     }
 }
 
@@ -3158,9 +3249,22 @@ pub(crate) fn install_name<'data>(
     file_id: FileId,
     symbol_db: &crate::symbol_db::SymbolDb<'data, MachO>,
 ) -> &'data [u8] {
+    dylib_metadata(file_id, symbol_db).install_name
+}
+
+/// Returns the one dynamic-library identity used consistently for duplicate suppression,
+/// ordinals, and the emitted `LC_LOAD_DYLIB` command.
+pub(crate) fn dylib_metadata<'data>(
+    file_id: FileId,
+    symbol_db: &crate::symbol_db::SymbolDb<'data, MachO>,
+) -> DylibMetadata<'data> {
     match symbol_db.file(file_id) {
-        SequencedInput::StubLibrary(stub) => stub.defined_symbols.install_name.as_bytes(),
-        SequencedInput::Object(obj) => obj.parsed.input.lib_name(),
+        SequencedInput::StubLibrary(stub) => stub.defined_symbols.dylib,
+        SequencedInput::Object(obj) => obj
+            .parsed
+            .object
+            .dylib_metadata()
+            .expect("Expected a dynamic Mach-O input"),
         _ => {
             panic!("Internal error: Expected StubLibrary or Dynamic");
         }
@@ -3896,7 +4000,7 @@ impl<'data> ObjectKind<'data> {
     fn sections(&self) -> &'data [SectionHeader] {
         match self {
             ObjectKind::Regular(regular_object) => regular_object.sections,
-            ObjectKind::Dylib => &[],
+            ObjectKind::Dylib(_) => &[],
         }
     }
 }

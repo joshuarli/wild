@@ -58,7 +58,9 @@
 //! supported for ELF.
 //!
 //! ExpectMachOLoadCommand:weak-dylib Checks that a Mach-O output has an
-//! `LC_LOAD_WEAK_DYLIB` command. This assertion is only supported for Mach-O tests.
+//! `LC_LOAD_WEAK_DYLIB` command. `dylib:path={path},current={version},compatibility={version}`
+//! checks one dynamic-library load command's install name and version pair. These assertions are
+//! only supported for Mach-O tests.
 //!
 //! ExpectDynamic:tag-name Checks that the specified dynamic entry (e.g. DT_RUNPATH, DT_FLAGS) is
 //! present in the .dynamic section.
@@ -5196,13 +5198,48 @@ impl Assertions {
         };
         let mut commands = file.macho_load_commands()?;
         let mut has_weak_dylib = false;
+        let mut dylib_load_commands = Vec::new();
         while let Some(command) = commands.next()? {
             has_weak_dylib |= command.cmd() == LC_LOAD_WEAK_DYLIB;
+            if let Some(dylib) = command.dylib()? {
+                dylib_load_commands.push((
+                    command.string(file.endianness(), dylib.dylib.name)?,
+                    dylib.dylib.current_version.get(file.endianness()),
+                    dylib.dylib.compatibility_version.get(file.endianness()),
+                ));
+            }
         }
         for expected in &self.expected_macho_load_commands {
             match expected.as_str() {
                 "weak-dylib" => {
                     ensure!(has_weak_dylib, "Expected Mach-O LC_LOAD_WEAK_DYLIB load command");
+                }
+                expected if expected.starts_with("dylib:") => {
+                    let mut fields = expected["dylib:".len()..].split(',');
+                    let path = fields
+                        .next()
+                        .and_then(|field| field.strip_prefix("path="))
+                        .context("dylib load command expectation requires path=")?;
+                    let current = fields
+                        .next()
+                        .and_then(|field| field.strip_prefix("current="))
+                        .context("dylib load command expectation requires current=")?;
+                    let compatibility = fields
+                        .next()
+                        .and_then(|field| field.strip_prefix("compatibility="))
+                        .context("dylib load command expectation requires compatibility=")?;
+                    ensure!(
+                        fields.next().is_none(),
+                        "unexpected dylib load command expectation field in `{expected}`"
+                    );
+                    ensure!(
+                        dylib_load_commands.iter().any(|(actual_path, actual_current, actual_compatibility)| {
+                            *actual_path == path.as_bytes()
+                                && actual_current.to_string() == current
+                                && actual_compatibility.to_string() == compatibility
+                        }),
+                        "Expected Mach-O dynamic library `{path}` with current version {current} and compatibility version {compatibility}"
+                    );
                 }
                 _ => bail!("Unknown Mach-O load-command expectation `{expected}`"),
             }

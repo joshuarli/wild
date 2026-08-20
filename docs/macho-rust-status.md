@@ -58,8 +58,8 @@ than supported facilities:
 | Facility | Minimal fixture | Apple differential | Rust integration | Stress test | Status |
 | --- | --- | --- | --- | --- | --- |
 | ARM64 executable | existing `wild/tests/sources/macho/trivial` | pending | fresh stable Cargo bin and default `cargo test` link and run | n/a | smoke green |
-| SDK `.tbd` / libSystem | existing `trivial-libsystem` | pending | pending | n/a | baseline only |
-| dylib | `trivial-dynamic` now links its `foo.c` dylib with Wild and consumes it at runtime | pass | C runtime pass | n/a | smoke green |
+| SDK `.tbd` / libSystem | `macho/sdk-libcompression` links a versionless SDK TBD and runs; `macho/sdk-accelerate-nested-reexport` resolves an Accelerate → vecLib → BLAS export | Apple controls and Wild runtime pass | pending | n/a | bounded ARM64 SDK-stub support |
+| dylib | `trivial-dynamic` now links its `foo.c` dylib with Wild and consumes it at runtime; `macho/dylib-install-name-consumer` consumes an Apple-built physical-name mismatch through its `LC_ID_DYLIB` | Apple control, Wild load-command assertion, and C runtime pass | C runtime pass | n/a | bounded C dylib-input support |
 | framework | none | pending | pending | n/a | unqualified |
 | dead strip | `macho/dead-strip` | code/data/export parity pass | C runtime pass | pending | atom smoke green |
 | ABI-level symbols | `macho/common-symbols`, `symbol-aliases`, `weak-symbols`, `weak-undefined`, `cxx-init-teardown` | Apple controls establish common/alias/weak behavior | `macho/rust-native-ffi` calls C through Wild | pending | bounded C/C++/Rust smoke green |
@@ -70,6 +70,34 @@ than supported facilities:
 | branch islands | `macho/branch-island`, `macho/branch-islands` | Apple links forced overflows | C runtime pass | multiple islands pass | ARM64 smoke green |
 
 ## Expanded ARM64 qualification observations
+
+### SDK TBD and dylib identity metadata
+
+`macho_stub_library::parse_defined_library` accepts ARM64 TBD v4 roots that omit
+`current-version`, as the current SDK `libcompression.tbd` does. Missing `current-version` and
+`compatibility-version` each produce Apple's observed `1.0.0` consumer value. The parser walks
+only ARM64e-compatible `reexported-libraries` reachable from the root, so an umbrella may reexport
+another umbrella: the permanent Accelerate fixture imports `cblas_sdot` through
+Accelerate → vecLib → libBLAS. It retains a present root current/compatibility pair for the
+consumer load command. Unsupported TBD versions, duplicate install-name documents, and a reachable
+reexport lacking its child document remain diagnosed.
+
+`macho::DylibMetadata` carries one dynamic input's `LC_ID_DYLIB` install name plus its current and
+compatibility versions from parsing through library deduplication, ordinal assignment, and
+`macho_writer::write_dylib_command`. A consumer therefore names a Mach-O dylib by `LC_ID_DYLIB`,
+not by its input filename. Apple control output for a physical `physical-name.dylib` with ID
+`@rpath/contract-id.dylib`, current `7.8.9`, and compatibility `3.2.1` uses that ID and version
+pair in its `LC_LOAD_DYLIB`; Wild now does likewise. Apple uses fixed timestamp `2` for an emitted
+consumer load command, while a newly produced `LC_ID_DYLIB` uses timestamp `1` and the existing
+`1.0.0` defaults. Weak dependencies still select `LC_LOAD_WEAK_DYLIB`; only their identity/version
+payload is shared with ordinary dependencies.
+
+The bounded permanent controls are `macho/sdk-libcompression`,
+`macho/sdk-accelerate-nested-reexport`, `macho/dylib-install-name-consumer`, and
+`macho/dylib-install-name-alias`. The custom consumer checks the exact load-command path and
+`7.8.9` / `3.2.1` pair; the alias fixture proves the clang/ld64 spelling
+`-dylib_install_name` produces a runnable dylib. This does not qualify platform variants beyond
+macOS ARM64, non-v4 TBD formats, or broad framework/reexport semantics.
 
 These controlled runs distinguish a working smoke from a production gate. Apple-linked controls
 passed wherever Wild is listed as failing.

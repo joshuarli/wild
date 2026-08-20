@@ -6,16 +6,19 @@
 //! `&'data str` slices directly from the input.
 //!
 //! The parser accepts multi-document YAML TBD files. The first document is
-//! treated as the main library. Additional documents are treated as child
-//! libraries reexported by the main library. This covers a practical subset of
-//! the full TBD v4 format, including the shape used by most system libraries.
+//! treated as the main library. Additional documents are followed through their
+//! `reexported-libraries` edges, so an umbrella can reexport another umbrella
+//! without flattening every leaf into its root document.
 
 use crate::ensure;
 use crate::error;
 use crate::error::Result;
-use itertools::Itertools;
+use crate::macho::DylibMetadata;
+use crate::macho::DylibVersions;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 
 const ARM64_LIB_ARCH: &str = "arm64e-macos";
 
@@ -29,6 +32,8 @@ struct TextBasedDefinition<'a> {
     install_name: &'a str,
     #[serde(default)]
     current_version: &'a str,
+    #[serde(default)]
+    compatibility_version: &'a str,
     #[serde(default)]
     parent_umbrella: Vec<ParentUmbrella<'a>>,
     #[serde(default)]
@@ -79,10 +84,8 @@ struct Exports<'a> {
 #[allow(unused)]
 #[derive(Debug, Clone)]
 pub(crate) struct DefinedStubLibrary<'a> {
-    /// Install name of the dynamic library, including its `.dylib` suffix.    
-    pub(crate) install_name: &'a str,
-    /// Current version recorded for the library, if present.
-    pub(crate) current_version: &'a str,
+    /// Identity and ABI versions the linker must retain in the consumer load command.
+    pub(crate) dylib: DylibMetadata<'a>,
     /// Global symbols defined by the library or by any reexported child library.
     pub(crate) symbols: Vec<&'a str>,
     /// Weak symbols defined by the library or by any reexported child library.
@@ -109,13 +112,14 @@ pub fn parse_defined_library<'data>(input: &'data str) -> Result<DefinedStubLibr
         targets = main_library.targets,
     );
 
-    ensure!(
-        !main_library.current_version.is_empty(),
-        "Missing library version of the main library"
-    );
     let mut defined_library = DefinedStubLibrary {
-        install_name: main_library.install_name,
-        current_version: main_library.current_version,
+        dylib: DylibMetadata {
+            install_name: main_library.install_name.as_bytes(),
+            versions: DylibVersions::tbd(
+                main_library.current_version,
+                main_library.compatibility_version,
+            )?,
+        },
         symbols: Vec::with_capacity(
             library_definitions
                 .iter()
@@ -132,38 +136,29 @@ pub fn parse_defined_library<'data>(input: &'data str) -> Result<DefinedStubLibr
         ),
     };
 
-    // Main libraries commonly reexport symbols from child libraries. This parser
-    // currently supports only a flat tree: one main library with leaf children.
-    let exported_libraries = if let Some(exported_libraries) = main_library
-        .reexported_libraries
+    let libraries_by_install_name: HashMap<_, _> = library_definitions
         .iter()
-        .at_most_one()
-        .map_err(|_| error!("expected just a single exported library"))?
-    {
-        ensure!(
-            exported_libraries.targets.contains(&ARM64_LIB_ARCH),
-            "Exported library only supports {:?}, but we need {ARM64_LIB_ARCH}",
-            exported_libraries.targets
-        );
-        let exported_libraries: HashSet<_> = exported_libraries.libraries.iter().copied().collect();
-        exported_libraries
-    } else {
-        HashSet::new()
-    };
+        .map(|library| (library.install_name, library))
+        .collect();
+    ensure!(
+        libraries_by_install_name.len() == library_definitions.len(),
+        "duplicate TBD install-name documents are unsupported"
+    );
 
-    for lib in &library_definitions {
+    // A framework can reexport a nested umbrella, which then describes its own children. Walk
+    // only the arm64e-compatible graph reachable from the root: unrelated multi-document entries
+    // do not become visible and nested leaves do not need a redundant root-level edge.
+    let mut pending = VecDeque::from([main_library]);
+    let mut visited = HashSet::new();
+    while let Some(lib) = pending.pop_front() {
+        if !visited.insert(lib.install_name) {
+            continue;
+        }
         ensure!(
             lib.tbd_version == 4,
             "TBD version 4 expected, got {}",
             lib.tbd_version
         );
-        if lib != main_library {
-            ensure!(
-                exported_libraries.contains(lib.install_name),
-                "child library '{}' not listed as reexported by the main library",
-                lib.install_name
-            );
-        }
 
         for export in lib.all_exports() {
             if export.targets.contains(&ARM64_LIB_ARCH) {
@@ -171,6 +166,20 @@ pub fn parse_defined_library<'data>(input: &'data str) -> Result<DefinedStubLibr
                 defined_library
                     .weak_symbols
                     .extend(export.weak_symbols.iter());
+            }
+        }
+
+        for reexport in &lib.reexported_libraries {
+            if !reexport.targets.contains(&ARM64_LIB_ARCH) {
+                continue;
+            }
+            for &install_name in &reexport.libraries {
+                let child = libraries_by_install_name.get(install_name).ok_or_else(|| {
+                    error!(
+                        "reexported library '{install_name}' is not defined by this TBD document"
+                    )
+                })?;
+                pending.push_back(*child);
             }
         }
     }
@@ -190,6 +199,7 @@ tbd-version:     4
 targets:         [ x86_64-macos, arm64e-macos ]
 install-name:    '/usr/lib/libMain.dylib'
 current-version: 1.2.3
+compatibility-version: 1.1
 reexported-libraries:
   - targets:         [ x86_64-macos, arm64e-macos ]
     libraries:       [ '/usr/lib/libA.dylib', '/usr/lib/libB.dylib' ]
@@ -233,8 +243,11 @@ reexports:
         )
         .expect("definition should parse");
 
-        assert_eq!(stub_library.install_name, "/usr/lib/libMain.dylib");
-        assert_eq!(stub_library.current_version, "1.2.3");
+        assert_eq!(stub_library.dylib.install_name, b"/usr/lib/libMain.dylib");
+        assert_eq!(
+            stub_library.dylib.versions,
+            DylibVersions::tbd("1.2.3", "1.1").unwrap()
+        );
         assert_eq!(
             stub_library.symbols,
             ["_main_arm64", "_a_arm64", "_b_arm64", "_b_exported_arm64"]
@@ -247,5 +260,38 @@ reexports:
                 "_b_weak_exported_arm64"
             ]
         );
+    }
+
+    #[test]
+    fn parses_versionless_root_and_nested_reexports() {
+        let stub_library = parse_defined_library(
+            r"--- !tapi-tbd
+tbd-version: 4
+targets: [ arm64e-macos ]
+install-name: '/usr/lib/libRoot.dylib'
+reexported-libraries:
+  - targets: [ arm64e-macos ]
+    libraries: [ '/usr/lib/libIntermediate.dylib' ]
+--- !tapi-tbd
+tbd-version: 4
+targets: [ arm64e-macos ]
+install-name: '/usr/lib/libIntermediate.dylib'
+reexported-libraries:
+  - targets: [ arm64e-macos ]
+    libraries: [ '/usr/lib/libLeaf.dylib' ]
+--- !tapi-tbd
+tbd-version: 4
+targets: [ arm64e-macos ]
+install-name: '/usr/lib/libLeaf.dylib'
+exports:
+  - targets: [ arm64e-macos ]
+    symbols: [ _nested_leaf ]
+",
+        )
+        .expect("versionless nested definition should parse");
+
+        assert_eq!(stub_library.dylib.install_name, b"/usr/lib/libRoot.dylib");
+        assert_eq!(stub_library.dylib.versions, DylibVersions::tbd("", "").unwrap());
+        assert_eq!(stub_library.symbols, ["_nested_leaf"]);
     }
 }

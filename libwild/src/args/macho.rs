@@ -453,6 +453,7 @@ fn setup_argument_parser() -> ArgumentParser<MachOArgs> {
     parser
         .declare_with_param()
         .long("install_name")
+        .long("dylib_install_name")
         .help("Set the install name for a dynamically linked shared library")
         .execute(|args, _modifier_stack, value| {
             ensure!(!value.is_empty(), "-install_name requires a name");
@@ -726,6 +727,22 @@ mod tests {
         assert!(err
             .to_string()
             .contains("-install_name may only be used with -dylib"));
+    }
+
+    #[test]
+    fn dylib_install_name_alias_matches_install_name() {
+        let mut args = MachOArgs::new().unwrap();
+        args.parse(
+            [
+                "-dylib",
+                "-dylib_install_name",
+                "@rpath/libexample.dylib",
+            ]
+            .iter(),
+        )
+        .unwrap();
+
+        assert_eq!(args.install_name.as_deref(), Some("@rpath/libexample.dylib"));
     }
 
     #[test]

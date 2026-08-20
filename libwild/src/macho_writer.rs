@@ -37,6 +37,7 @@ use crate::macho::COMPACT_UNWIND_REGULAR_PAGE_MAX_ENTRIES;
 use crate::macho::DYLINKER_PATH;
 use crate::macho::DyldChainedFixupsCommand;
 use crate::macho::DylibCommand;
+use crate::macho::DylibVersions;
 use crate::macho::DylinkerCommand;
 use crate::macho::EntryPointCommand;
 use crate::macho::FileHeader;
@@ -1525,7 +1526,14 @@ fn write_prelude<'data>(
         let command_size = load_dylib_command_size(install_name);
         let mut command_buffer = load_command_buffer.split_off_mut(..command_size).unwrap();
         let dylib_command = take_mut(&mut command_buffer)?;
-        write_dylib_command(dylib_command, command_buffer, install_name, LC_ID_DYLIB);
+        write_dylib_command(
+            dylib_command,
+            command_buffer,
+            install_name,
+            LC_ID_DYLIB,
+            1,
+            DylibVersions::output_default(),
+        );
     }
 
     for rpath in &layout.args().rpaths {
@@ -1544,13 +1552,16 @@ fn write_prelude<'data>(
         let mut command_buffer = load_command_buffer.split_off_mut(..command_size).unwrap();
         let dylib_command = take_mut(&mut command_buffer)?;
         let path = crate::macho::install_name(file_id, &layout.symbol_db);
+        let versions = crate::macho::dylib_metadata(file_id, &layout.symbol_db).versions;
 
         let command_type = if imported_library_is_weak(layout, file_id) {
             LC_LOAD_WEAK_DYLIB
         } else {
             LC_LOAD_DYLIB
         };
-        write_dylib_command(dylib_command, command_buffer, path, command_type);
+        // `ld64` records its fixed consumer timestamp (2) but preserves the producer's version
+        // pair from either LC_ID_DYLIB or the resolved TBD document.
+        write_dylib_command(dylib_command, command_buffer, path, command_type, 2, versions);
     }
 
     write_dyld_chained_fixups_command(layout, take_mut(&mut load_command_buffer)?);
@@ -3045,6 +3056,8 @@ fn write_dylib_command(
     path_buffer: &mut [u8],
     path: &[u8],
     command_type: macho::LoadCommandType,
+    timestamp: u32,
+    versions: DylibVersions,
 ) {
     command.cmd.set(LE, command_type);
     command
@@ -3055,17 +3068,15 @@ fn write_dylib_command(
         .name
         .offset
         .set(LE, size_of::<DylibCommand>() as u32);
-    // TODO
-    command.dylib.timestamp.set(LE, 2);
-    // TODO
+    command.dylib.timestamp.set(LE, timestamp);
     command
         .dylib
         .current_version
-        .set(LE, macho::Version(1356 << 16));
+        .set(LE, versions.current);
     command
         .dylib
         .compatibility_version
-        .set(LE, macho::Version(1 << 16));
+        .set(LE, versions.compatibility);
 
     path_buffer[0..path.len()].copy_from_slice(path);
     path_buffer[path.len()..].zero();
@@ -3872,13 +3883,49 @@ mod tests {
         let mut path_buffer =
             vec![0xff; load_dylib_command_size(path) - size_of::<DylibCommand>()];
 
-        write_dylib_command(command, &mut path_buffer, path, LC_ID_DYLIB);
+        write_dylib_command(
+            command,
+            &mut path_buffer,
+            path,
+            LC_ID_DYLIB,
+            1,
+            DylibVersions::output_default(),
+        );
 
         assert_eq!(command.cmd.get(LE), LC_ID_DYLIB);
         assert_eq!(command.cmdsize.get(LE) as usize, load_dylib_command_size(path));
         assert_eq!(command.dylib.name.offset.get(LE) as usize, size_of::<DylibCommand>());
+        assert_eq!(command.dylib.timestamp.get(LE), 1);
+        assert_eq!(
+            command.dylib.current_version.get(LE),
+            macho::Version::new(1, 0, 0)
+        );
+        assert_eq!(
+            command.dylib.compatibility_version.get(LE),
+            macho::Version::new(1, 0, 0)
+        );
         assert_eq!(&path_buffer[..path.len()], path);
         assert!(path_buffer[path.len()..].iter().all(|&byte| byte == 0));
+    }
+
+    #[test]
+    fn dependency_load_command_preserves_input_versions() {
+        let path = b"@rpath/libcontract.dylib";
+        let mut command_bytes = AlignedBytes([0; size_of::<DylibCommand>()]);
+        let command = from_bytes_mut::<DylibCommand>(&mut command_bytes.0).unwrap().0;
+        let mut path_buffer =
+            vec![0xff; load_dylib_command_size(path) - size_of::<DylibCommand>()];
+        let versions = DylibVersions {
+            current: macho::Version::new(7, 8, 9),
+            compatibility: macho::Version::new(3, 2, 1),
+        };
+
+        write_dylib_command(command, &mut path_buffer, path, LC_LOAD_DYLIB, 2, versions);
+
+        assert_eq!(command.cmd.get(LE), LC_LOAD_DYLIB);
+        assert_eq!(command.dylib.timestamp.get(LE), 2);
+        assert_eq!(command.dylib.current_version.get(LE), versions.current);
+        assert_eq!(command.dylib.compatibility_version.get(LE), versions.compatibility);
     }
 
     #[test]
