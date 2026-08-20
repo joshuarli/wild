@@ -3,9 +3,11 @@
 //! This is deliberately narrower than a general incremental linker. A cache hit requires one
 //! changed direct `MH_OBJECT` input, unchanged link-visible files and arguments, unchanged object
 //! structure, unchanged relocation source fields, and a cache-owned output image that exactly
-//! matches the cached baseline. The fast path only changes ranges whose old layout is therefore still valid,
-//! then rebuilds the UUID and ad-hoc signature. Every mismatch is a cache miss and performs the
-//! ordinary link; the cache is never an exact-input output-reuse shortcut.
+//! matches the cached baseline. Rustc's equal-content temporary `.rlib` copies are the sole path
+//! exception: their directory spelling may change only after every old-path byte is proved to be
+//! a rewritable `N_OSO` debug-map entry. The fast path only changes ranges whose old layout is
+//! therefore still valid, then rebuilds the UUID and ad-hoc signature. Every mismatch is a cache
+//! miss and performs the ordinary link; the cache is never an exact-input output-reuse shortcut.
 
 use crate::args::InputSpec;
 use crate::args::macho::MachOArgs;
@@ -38,7 +40,7 @@ use std::time::SystemTime;
 
 const MAGIC: &[u8; 16] = b"WILD-MACHO-INC\0\0";
 const STATE_MAGIC: &[u8; 16] = b"WILD-MACHO-STATE";
-const VERSION: u32 = 6;
+const VERSION: u32 = 7;
 const STATE_VERSION: u32 = 2;
 const HASH_SIZE: usize = 32;
 const MAX_RECORDS: usize = 100_000;
@@ -47,7 +49,7 @@ const DIAGNOSTICS_ENV: &str = "WILD_MACHO_INCREMENTAL_CACHE_DIAGNOSTICS";
 const STRUCTURE_DIGEST_DOMAIN: &[u8] = b"wild-macho-stable-layout-structure-v4\0";
 /// The sidecar is not an authenticated input, but random or torn sidecar corruption must become
 /// a conservative cache miss before any persisted patch mapping is used.
-const MANIFEST_CHECKSUM_DOMAIN: &[u8] = b"wild-macho-stable-layout-manifest-v6\0";
+const MANIFEST_CHECKSUM_DOMAIN: &[u8] = b"wild-macho-stable-layout-manifest-v7\0";
 const STATE_CHECKSUM_DOMAIN: &[u8] = b"wild-macho-stable-layout-state-v2\0";
 
 #[derive(Clone, Debug)]
@@ -108,6 +110,26 @@ struct PatchRange {
     input_offset: u64,
     output_offset: u64,
     len: u64,
+}
+
+/// A byte range in the cache-owned output whose meaning is independently checked before a cache
+/// hit changes it. This is intentionally distinct from [`PatchRange`], which maps bytes from a
+/// changed direct object into the old output layout.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OutputPathPatch {
+    output_offset: u64,
+    expected: Vec<u8>,
+    replacement: Vec<u8>,
+}
+
+impl OutputPathPatch {
+    fn signature_range(&self) -> PatchRange {
+        PatchRange {
+            input_offset: 0,
+            output_offset: self.output_offset,
+            len: self.replacement.len() as u64,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -505,14 +527,31 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
         }
         output
     };
+    let archive_path_patches = {
+        timing_phase!("Mach-O stable-layout cache: prepare rustc archive debug paths");
+        let Some(patches) = rustc_temporary_archive_path_patches(
+            output.bytes(),
+            args,
+            &current_inputs,
+            &state.inputs,
+            &manifest.cache_approved_rustc_temporary_archives,
+        ) else {
+            output.discard();
+            return cache_miss("rustc archive path is not safely rewritable in the debug map");
+        };
+        patches
+    };
     {
         timing_phase!("Mach-O stable-layout cache: patch and sign");
-        if !apply_patches_from_iter(output.bytes_mut(), current_object, object.patches())
+        if !apply_output_path_patches(output.bytes_mut(), &archive_path_patches)
+            || !apply_patches_from_iter(output.bytes_mut(), current_object, object.patches())
             || !refresh_uuid_and_signature(
                 output.bytes_mut(),
                 &manifest.signature,
                 args,
-                object.patches(),
+                object
+                    .patches()
+                    .chain(archive_path_patches.iter().map(OutputPathPatch::signature_range)),
             )
         {
             output.discard();
@@ -960,10 +999,10 @@ fn input_digests_for_cache_hit(
         .collect()
 }
 
-/// Finds precisely the Rustc-owned archive paths that do not appear in the completed executable.
-/// A cache hit only retains an old image and patches one direct object, so the absence of these
-/// full path bytes proves that swapping the temporary-directory spelling cannot leave a stale
-/// path in the output. This is stronger than Cargo's `strip=symbols`: that profile flag does not
+/// Finds precisely the Rustc-owned archive paths whose temporary-directory spelling is not
+/// link-visible. An absent path is always safe. A present path is safe only when every occurrence
+/// is the archive portion of a checked `N_OSO` debug-map entry, which a cache hit rewrites before
+/// re-signing. This is stronger than Cargo's `strip=symbols`: that profile flag does not
 /// necessarily request Mach-O debug stripping.
 fn cache_approved_rustc_temporary_archives(
     args: &MachOArgs,
@@ -984,11 +1023,155 @@ fn cache_approved_rustc_temporary_archives(
             // distinct path string.
             (argument_path.to_str().is_some_and(|path| path == input.path)
                 && is_rustc_temporary_archive_path(Path::new(&input.path))
-                && memchr::memmem::find(output, input.path.as_bytes()).is_none())
+                && n_oso_archive_path_patches(output, &input.path, &input.path).is_some())
             .then(|| u32::try_from(index).ok())
             .flatten()
         })
         .collect()
+}
+
+/// Produces equal-width output patches for Rustc archive paths that moved between compiler-owned
+/// temporary directories. The parser is deliberately small and fail-closed: it accepts exactly
+/// one 64-bit Mach-O symbol table, matches only `N_OSO` strings of the form
+/// `archive.rlib(member.o)`, and proves that the old path occurs nowhere else in the image.
+///
+/// A path can appear once per selected archive member. Rewriting every such symbol string keeps
+/// `dsymutil` pointed at the current archive without claiming that an arbitrary output string is
+/// non-semantic.
+fn n_oso_archive_path_patches(
+    output: &[u8],
+    expected_path: &str,
+    replacement_path: &str,
+) -> Option<Vec<OutputPathPatch>> {
+    let expected = expected_path.as_bytes();
+    let replacement = replacement_path.as_bytes();
+    if expected.is_empty() || expected.len() != replacement.len() {
+        return None;
+    }
+    if memchr::memmem::find(output, expected).is_none() {
+        return Some(Vec::new());
+    }
+
+    let ncmds = usize::try_from(read_u32(output, 16)?).ok()?;
+    let mut command_offset = 32usize;
+    let mut symtab = None;
+    for _ in 0..ncmds {
+        let command = read_u32(output, command_offset)?;
+        let command_size = usize::try_from(read_u32(output, command_offset.checked_add(4)?)?).ok()?;
+        let command_end = command_offset.checked_add(command_size)?;
+        if command_size < 8 || command_end > output.len() {
+            return None;
+        }
+        if command == object::macho::LC_SYMTAB.0 {
+            if command_size < 24 || symtab.is_some() {
+                return None;
+            }
+            symtab = Some((
+                usize::try_from(read_u32(output, command_offset.checked_add(8)?)?).ok()?,
+                usize::try_from(read_u32(output, command_offset.checked_add(12)?)?).ok()?,
+                usize::try_from(read_u32(output, command_offset.checked_add(16)?)?).ok()?,
+                usize::try_from(read_u32(output, command_offset.checked_add(20)?)?).ok()?,
+            ));
+        }
+        command_offset = command_end;
+    }
+    let (symbol_offset, symbol_count, string_offset, string_size) = symtab?;
+    let symbol_table_size = symbol_count.checked_mul(16)?;
+    let symbol_table_end = symbol_offset.checked_add(symbol_table_size)?;
+    let string_end = string_offset.checked_add(string_size)?;
+    if symbol_table_end > output.len() || string_end > output.len() {
+        return None;
+    }
+
+    let mut n_oso_offsets = Vec::new();
+    for index in 0..symbol_count {
+        let entry_offset = symbol_offset.checked_add(index.checked_mul(16)?)?;
+        if output.get(entry_offset.checked_add(4)?) != Some(&object::macho::N_OSO.0) {
+            continue;
+        }
+        let string_index = usize::try_from(read_u32(output, entry_offset)?).ok()?;
+        if string_index >= string_size {
+            return None;
+        }
+        let name_offset = string_offset.checked_add(string_index)?;
+        let name = output.get(name_offset..string_end)?;
+        let name_end = name.iter().position(|byte| *byte == 0)?;
+        let name = &name[..name_end];
+        if name
+            .strip_prefix(expected)
+            .is_some_and(|suffix| suffix.starts_with(b"("))
+        {
+            n_oso_offsets.push(name_offset);
+        }
+    }
+    n_oso_offsets.sort_unstable();
+    n_oso_offsets.dedup();
+
+    let mut raw_offsets = Vec::new();
+    let mut search_start = 0usize;
+    while let Some(found) = memchr::memmem::find(&output[search_start..], expected) {
+        let offset = search_start.checked_add(found)?;
+        raw_offsets.push(offset);
+        search_start = offset.checked_add(1)?;
+    }
+    (raw_offsets == n_oso_offsets).then(|| {
+        n_oso_offsets
+            .into_iter()
+            .map(|output_offset| OutputPathPatch {
+                output_offset: output_offset as u64,
+                expected: expected.to_vec(),
+                replacement: replacement.to_vec(),
+            })
+            .collect()
+    })
+}
+
+/// Rewrites a moved compiler temporary archive only when its current command-line spelling is
+/// the same resolved path used for the cache input identity. That matches the `N_OSO` producer:
+/// it records the link argument's spelling rather than a filesystem canonicalisation.
+fn rustc_temporary_archive_path_patches(
+    output: &[u8],
+    args: &MachOArgs,
+    current_inputs: &[InputDigest],
+    cached_inputs: &[InputDigest],
+    cache_approved_rustc_temporary_archives: &[u32],
+) -> Option<Vec<OutputPathPatch>> {
+    let mut patches = Vec::new();
+    for input_index in cache_approved_rustc_temporary_archives {
+        let index = usize::try_from(*input_index).ok()?;
+        let current = current_inputs.get(index)?;
+        let cached = cached_inputs.get(index)?;
+        if current.path == cached.path {
+            continue;
+        }
+        if !reusable_rustc_temporary_archive(&current.path, &cached.path, true) {
+            return None;
+        }
+        let InputSpec::File(argument_path) = &args.common().inputs.get(index)?.spec else {
+            return None;
+        };
+        if argument_path.to_str()? != current.path {
+            return None;
+        }
+        patches.extend(n_oso_archive_path_patches(
+            output,
+            &cached.path,
+            &current.path,
+        )?);
+    }
+    patches.sort_unstable_by_key(|patch| patch.output_offset);
+    patches
+        .windows(2)
+        .all(|pair| {
+            let Some(end) = usize::try_from(pair[0].output_offset)
+                .ok()
+                .and_then(|start| start.checked_add(pair[0].replacement.len()))
+            else {
+                return false;
+            };
+            usize::try_from(pair[1].output_offset).is_ok_and(|next| end <= next)
+        })
+        .then_some(patches)
 }
 
 /// Rustc writes final-link archive copies under `rustc` plus six random alphanumeric bytes. The
@@ -1568,6 +1751,27 @@ fn apply_patches_from_iter(
             return false;
         };
         destination.copy_from_slice(source);
+        true
+    })
+}
+
+fn apply_output_path_patches(output: &mut [u8], patches: &[OutputPathPatch]) -> bool {
+    let mut previous_end = 0usize;
+    patches.iter().all(|patch| {
+        if patch.expected.len() != patch.replacement.len() {
+            return false;
+        }
+        let Some(start) = usize::try_from(patch.output_offset).ok() else {
+            return false;
+        };
+        let Some(end) = start.checked_add(patch.expected.len()) else {
+            return false;
+        };
+        if start < previous_end || output.get(start..end) != Some(patch.expected.as_slice()) {
+            return false;
+        }
+        output[start..end].copy_from_slice(&patch.replacement);
+        previous_end = end;
         true
     })
 }
@@ -2520,6 +2724,7 @@ mod tests {
     use super::masked_digest;
     use super::protected_ranges_match;
     use super::refresh_changed_code_signature_hashes;
+    use super::n_oso_archive_path_patches;
     use super::stable_output_basename;
     use super::arguments_digest;
     use crate::args::Input;
@@ -2633,6 +2838,68 @@ mod tests {
         assert_eq!(stable_output_basename(b"e-4903cf8e124ea782"), b"e");
         assert_eq!(stable_output_basename(b"my-tool"), b"my-tool");
         assert_eq!(stable_output_basename(b"tool-2026"), b"tool-2026");
+    }
+
+    #[test]
+    fn rustc_temporary_archive_paths_can_only_move_at_verified_n_oso_entries() {
+        let old_path = "/tmp/rustcAb12Cd/libexample.rlib";
+        let new_path = "/tmp/rustcEf34Gh/libexample.rlib";
+        assert_eq!(old_path.len(), new_path.len());
+
+        let mut output = macho_with_symbol_strings(&[
+            (format!("{old_path}(one.o)"), object::macho::N_OSO.0),
+            (format!("{old_path}(two.o)"), object::macho::N_OSO.0),
+            ("_ordinary_symbol".to_owned(), object::macho::N_SECT.0),
+        ]);
+        let patches = n_oso_archive_path_patches(&output, old_path, new_path).unwrap();
+        assert_eq!(patches.len(), 2);
+        assert!(super::apply_output_path_patches(&mut output, &patches));
+        assert!(!output.windows(old_path.len()).any(|bytes| bytes == old_path.as_bytes()));
+        assert_eq!(
+            output.windows(new_path.len()).filter(|bytes| *bytes == new_path.as_bytes()).count(),
+            2
+        );
+
+        let non_debug_map_occurrence = macho_with_symbol_strings(&[
+            (format!("{old_path}(one.o)"), object::macho::N_OSO.0),
+            (old_path.to_owned(), object::macho::N_SO.0),
+        ]);
+        assert!(n_oso_archive_path_patches(&non_debug_map_occurrence, old_path, new_path).is_none());
+        assert!(n_oso_archive_path_patches(&output, new_path, "/tmp/rustcTooLong/libexample.rlib").is_none());
+    }
+
+    fn macho_with_symbol_strings(symbols: &[(String, u8)]) -> Vec<u8> {
+        const MACH_HEADER_64_SIZE: usize = 32;
+        const SYMTAB_COMMAND_SIZE: usize = 24;
+        const NLIST_64_SIZE: usize = 16;
+
+        let symoff = MACH_HEADER_64_SIZE + SYMTAB_COMMAND_SIZE;
+        let stroff = symoff + symbols.len() * NLIST_64_SIZE;
+        let mut output = vec![0; stroff + 1];
+        output[16..20].copy_from_slice(&1_u32.to_le_bytes());
+        output[MACH_HEADER_64_SIZE..MACH_HEADER_64_SIZE + 4]
+            .copy_from_slice(&object::macho::LC_SYMTAB.0.to_le_bytes());
+        output[MACH_HEADER_64_SIZE + 4..MACH_HEADER_64_SIZE + 8]
+            .copy_from_slice(&(SYMTAB_COMMAND_SIZE as u32).to_le_bytes());
+        output[MACH_HEADER_64_SIZE + 8..MACH_HEADER_64_SIZE + 12]
+            .copy_from_slice(&(symoff as u32).to_le_bytes());
+        output[MACH_HEADER_64_SIZE + 12..MACH_HEADER_64_SIZE + 16]
+            .copy_from_slice(&(symbols.len() as u32).to_le_bytes());
+        output[MACH_HEADER_64_SIZE + 16..MACH_HEADER_64_SIZE + 20]
+            .copy_from_slice(&(stroff as u32).to_le_bytes());
+
+        for (index, (name, n_type)) in symbols.iter().enumerate() {
+            let string_index = output.len() - stroff;
+            let entry = symoff + index * NLIST_64_SIZE;
+            output[entry..entry + 4].copy_from_slice(&(string_index as u32).to_le_bytes());
+            output[entry + 4] = *n_type;
+            output.extend_from_slice(name.as_bytes());
+            output.push(0);
+        }
+        let string_size = output.len() - stroff;
+        output[MACH_HEADER_64_SIZE + 20..MACH_HEADER_64_SIZE + SYMTAB_COMMAND_SIZE]
+            .copy_from_slice(&(string_size as u32).to_le_bytes());
+        output
     }
 
     #[test]
