@@ -33,7 +33,7 @@ Baseline checks completed on this host:
   (185 `libwild` tests, 35 Mach-O integration tests, recorder tests, and remaining workspace/doc
   tests).
 * `WILD_TEST_IGNORE_FORMAT=1 cargo +nightly-2026-07-24 test --profile ci --workspace --features
-  macho` — pass (all workspace unit tests and doctests, including 208 `libwild` tests and 67
+  macho` — pass (all workspace unit tests and doctests, including 209 `libwild` tests and 68
   ARM64 Mach-O integrations). This is the reproducible dated-nightly gate; it is run with the
   installed `rust-src` and `llvm-tools` components, not by falling back to stable Rust.
 * Without `WILD_TEST_IGNORE_FORMAT=1`, only tidy tests fail because this host lacks `taplo` and
@@ -68,7 +68,7 @@ than supported facilities:
 | dylib | `trivial-dynamic` now links its `foo.c` dylib with Wild and consumes it at runtime; `macho/dylib-install-name-consumer` consumes an Apple-built physical-name mismatch through its `LC_ID_DYLIB` | Apple control, Wild load-command assertion, and C runtime pass | retained Cargo Rust `dylib` producer/consumer links each final artifact through Wild and loads through `@loader_path` rpath | n/a | bounded C/Rust dylib runtime green |
 | proc macro | `cargo_macho_macro_producer` expands through `TokenStream::from_str` into `40 + 2` | Apple control builds the producer/consumer pair | retained Cargo producer and consumer final links select Wild; the consumer runs the non-identity expansion | n/a | bounded ARM64 Cargo proc-macro runtime green |
 | framework | `macho/framework-security` calls `SecRandomCopyBytes` through `-framework Security` | Apple control and Wild output both carry the current SDK Security framework load command; both run successfully | C framework consumer runs through Wild | n/a | bounded ARM64 framework runtime/structural green |
-| Objective-C selector dispatch | `macho/objc-runtime`, `objc-multi-selector`, and `objc-dead-selector` compile normal ARC calls without compiler workarounds | Apple ld establishes one 32-byte `__objc_stubs` veneer and one chained-rebase `__objc_selrefs` slot per live selector | n/a | repeated selectors deduplicate lexically; a dead selector atom emits neither synthetic section | bounded ARM64 Objective-C runtime green |
+| Objective-C selector dispatch | `macho/objc-runtime`, `objc-multi-selector`, `objc-const-selrefs`, and `objc-dead-selector` compile normal ARC calls without compiler workarounds | Apple ld establishes one 32-byte `__objc_stubs` veneer and one chained-rebase `__objc_selrefs` slot per live selector; `-const_selrefs` instead uses regular `__DATA_CONST` storage | n/a | repeated selectors deduplicate lexically; a dead selector atom emits neither synthetic section | bounded ARM64 Objective-C runtime green |
 | dead strip | `macho/dead-strip` | code/data/export parity pass | C runtime pass | pending | atom smoke green |
 | ABI-level symbols | `macho/common-symbols`, `symbol-aliases`, `weak-symbols`, `weak-undefined`, `cxx-init-teardown` | Apple controls establish common/alias/weak behavior | `macho/rust-native-ffi` calls C through Wild | pending | bounded C/C++/Rust smoke green |
 | TLS | `macho/tls-local`, `macho/tls-dynamic`, `macho/rust-thread-local` | Apple ld binds the imported descriptor through `__got`; ld64.lld uses `__thread_ptrs` | C and Rust two-thread runtime passes under Wild; Rust static/dylib TLS qualification remains external | pending | bounded C/Rust local/dylib smoke green |
@@ -256,7 +256,9 @@ Modern ARM64 Clang leaves an undefined `_objc_msgSend$selector` branch at an ord
 message send. That spelling is linker protocol, not a libobjc export. `MachO::raw_symbol_name`
 resolves it through the real dynamic `_objc_msgSend` import while
 `MachO::create_finalise_sizes_ext` retains each live selector branch and allocates one lexical
-`__TEXT,__objc_stubs` entry plus one `__DATA,__objc_selrefs` slot per distinct selector.
+`__TEXT,__objc_stubs` entry plus one `__DATA,__objc_selrefs` slot per distinct selector. With
+`-const_selrefs`, `MachOArgs::const_selrefs` instead selects a regular zero-flag
+`__DATA_CONST,__objc_selrefs` section, matching ld64's post-fixup read-only contract.
 `macho_writer::write_objc_message_stubs` emits ld64's fixed
 `ADRP/LDR x1; ADRP/LDR x16; BR; BRK*3` veneer and adds the selector slot to the local chained
 rebase plan. The selector is found through the final merged `__objc_methname` map, so identical
@@ -266,9 +268,11 @@ strings from different objects cannot retain stale input addresses.
 `objc-classes` field materialized as class and metaclass symbols. `objc-multi-selector` proves
 the 32-byte/8-byte-per-selector layout, lexical deduplication, and runtime dispatch; the minimal
 assembler `objc-dead-selector` proves dead selector branches do not create output sections.
+`objc-const-selrefs` proves normal ARC dispatch while asserting the 8-byte selector slot belongs
+to `__DATA_CONST` and carries ld64's regular-section flags.
 This is deliberately limited to Clang's `_objc_msgSend$<nonempty-selector>` ARM64 form. It does
-not claim a generic Objective-C metadata linker, `-const_selrefs`, selector-stub branch islands,
-or Objective-C dSYM support.
+not claim a generic Objective-C metadata linker, selector-stub branch islands, or Objective-C
+dSYM support.
 
 ### Bounded C `dsymutil` debug map
 
@@ -447,7 +451,7 @@ workload evidence—not a speed or general-performance claim.
 * x86_64 Mach-O is outside the agreed scope for this effort.
 * C++/Objective-C/Rust/archived/split-DWARF dSYM debug maps and generic output-DWARF relocation.
 * Objective-C selector forms other than ARM64 `_objc_msgSend$<selector>`, including selector-stub
-  range-extension islands and `-const_selrefs` output placement.
+  range-extension islands.
 
 ## Next work items
 

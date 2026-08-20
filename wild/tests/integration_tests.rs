@@ -97,6 +97,8 @@
 //!   or 1 if sh_entsize is 0).
 //!   flags=WAX: Asserts the section has the specified section flags.
 //!   type=int: Asserts the section has the specified section type.
+//!   segment=name: Asserts the section belongs to the named segment.
+//!   macho_flags=int: Asserts the raw Mach-O section flags.
 //!
 //! RelrCount:N Checks that .relr.dyn encodes at least N total relocations (counting both address
 //! entries and bitmap-encoded relocations).
@@ -2506,6 +2508,8 @@ struct ExpectedSection {
 struct SectionAssertions {
     size: Option<u64>,
 
+    segment: Option<String>,
+
     max_entries: Option<u64>,
 
     #[serde(deserialize_with = "SectionFlags::deserialize", default)]
@@ -2513,6 +2517,8 @@ struct SectionAssertions {
 
     #[serde(rename = "type")]
     stype: Option<u32>,
+
+    macho_flags: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -5855,6 +5861,16 @@ impl Assertions {
                 );
             }
 
+            if let Some(expected_segment) = expected.assertions.segment.as_deref() {
+                let actual_segment = section.segment_name()?;
+                ensure!(
+                    actual_segment == Some(expected_segment),
+                    "Section `{}` segment mismatch: expected `{expected_segment}`, got `{}`",
+                    expected.section_name,
+                    actual_segment.unwrap_or("<none>")
+                );
+            }
+
             if let Some(expected_flags) = expected.assertions.flags {
                 let flags = match section.flags() {
                     object::SectionFlags::Elf { sh_flags, .. } => {
@@ -5882,6 +5898,21 @@ impl Assertions {
                     expected.section_name,
                     expected_type,
                     ptype
+                );
+            }
+
+            if let Some(expected_flags) = expected.assertions.macho_flags {
+                let actual_flags = match section.flags() {
+                    object::SectionFlags::MachO { flags, .. } => flags.0,
+                    _ => bail!(
+                        "Section `{}` is not Mach-O but asserts macho_flags",
+                        expected.section_name
+                    ),
+                };
+                ensure!(
+                    actual_flags == expected_flags,
+                    "Section `{}` Mach-O flags mismatch: expected {expected_flags:#x}, got {actual_flags:#x}",
+                    expected.section_name
                 );
             }
         }

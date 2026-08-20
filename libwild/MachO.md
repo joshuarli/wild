@@ -106,10 +106,12 @@ one lexical 32-byte `__TEXT,__objc_stubs` veneer and one 8-byte rebased
 `__DATA,__objc_selrefs` slot per live selector. The stub loads the selector into `x1`, loads the
 real `_objc_msgSend` from its GOT slot, and branches to it. The selector slot points to the final
 merged `__objc_methname` string and therefore participates in the chained local-rebase plan.
+`-const_selrefs` selects the equivalent regular zero-flag `__DATA_CONST,__objc_selrefs` output
+section, which dyld makes immutable after applying the same rebases.
 
-Only Clang's default ARM64 `_objc_msgSend$selector` form is implemented. `-const_selrefs`, other
-selector message forms, generic Objective-C metadata linking, Objective-C dSYM maps, and
-range-extension islands for selector veneers remain outside this bounded support.
+Only Clang's default ARM64 `_objc_msgSend$selector` form is implemented. Other selector message
+forms, generic Objective-C metadata linking, Objective-C dSYM maps, and range-extension islands
+for selector veneers remain outside this bounded support.
 
 - generally speaking the mach-O format is pretty close to the ELF container
 

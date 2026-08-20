@@ -125,6 +125,9 @@ enum SinglePartSectionId {
     /// Selector-reference slots synthesized for Clang's modern ARM64 Objective-C message
     /// dispatch ABI. dyld rebases each slot and libobjc canonicalises it during image setup.
     ObjcSelectorReferences,
+    /// `-const_selrefs` uses the same selector ABI, but preserves the post-fixup read-only
+    /// contract by placing the slots in `__DATA_CONST` rather than writable `__DATA`.
+    ObjcConstSelectorReferences,
     /// Linker-synthesized ARM64 stubs for undefined `_objc_msgSend$selector` references.
     /// They load the selector reference into x1 before branching through `_objc_msgSend`'s GOT.
     ObjcMessageStubs,
@@ -157,6 +160,8 @@ pub(crate) mod part_id {
     pub(crate) const PLT_GOT: PartId = SinglePartSectionId::PltGot.part_id();
     pub(crate) const OBJC_SELECTOR_REFERENCES: PartId =
         SinglePartSectionId::ObjcSelectorReferences.part_id();
+    pub(crate) const OBJC_CONST_SELECTOR_REFERENCES: PartId =
+        SinglePartSectionId::ObjcConstSelectorReferences.part_id();
     pub(crate) const OBJC_MESSAGE_STUBS: PartId = SinglePartSectionId::ObjcMessageStubs.part_id();
     pub(crate) const SYMTAB_GLOBAL: PartId = SinglePartSectionId::SymtabGlobal.part_id();
     pub(crate) const LOAD_COMMANDS: PartId = SinglePartSectionId::LoadCommands.part_id();
@@ -178,6 +183,8 @@ pub(crate) mod output_section_id {
     pub(crate) const PLT_GOT: OutputSectionId = SinglePartSectionId::PltGot.output_section_id();
     pub(crate) const OBJC_SELECTOR_REFERENCES: OutputSectionId =
         SinglePartSectionId::ObjcSelectorReferences.output_section_id();
+    pub(crate) const OBJC_CONST_SELECTOR_REFERENCES: OutputSectionId =
+        SinglePartSectionId::ObjcConstSelectorReferences.output_section_id();
     pub(crate) const OBJC_MESSAGE_STUBS: OutputSectionId =
         SinglePartSectionId::ObjcMessageStubs.output_section_id();
     pub(crate) const SYMTAB_GLOBAL: OutputSectionId =
@@ -251,6 +258,27 @@ pub(crate) const OBJC_SELECTOR_REFERENCE_SIZE: u64 = 8;
 /// not accepted: they are neither emitted by Clang nor a meaningful Objective-C selector.
 pub(crate) fn objc_message_selector(name: &[u8]) -> Option<&[u8]> {
     name.strip_prefix(b"_objc_msgSend$").filter(|selector| !selector.is_empty())
+}
+
+/// Returns the synthetic selector-reference storage selected by the Mach-O command-line ABI.
+/// The two variants deliberately have separate section IDs: a built-in output section's segment
+/// and flags are fixed before layout, while `-const_selrefs` changes both of those properties.
+pub(crate) fn objc_selector_references_part_id(args: &MachOArgs) -> crate::part_id::PartId {
+    if args.const_selrefs {
+        part_id::OBJC_CONST_SELECTOR_REFERENCES
+    } else {
+        part_id::OBJC_SELECTOR_REFERENCES
+    }
+}
+
+pub(crate) fn objc_selector_references_output_section_id(
+    args: &MachOArgs,
+) -> crate::output_section_id::OutputSectionId {
+    if args.const_selrefs {
+        output_section_id::OBJC_CONST_SELECTOR_REFERENCES
+    } else {
+        output_section_id::OBJC_SELECTOR_REFERENCES
+    }
 }
 
 /// `compact_unwind_entry` records in `__LD,__compact_unwind` are fixed-width. They are only an
@@ -2511,7 +2539,7 @@ impl platform::Platform for MachO {
     }
 
     fn create_finalise_sizes_ext<'data, 'states, 'files, A: platform::Arch<Platform = Self>>(
-        _args: &Self::Args,
+        args: &Self::Args,
         groups: &'files mut [layout::GroupState<'data, Self>],
         symbol_db: &crate::symbol_db::SymbolDb<'data, Self>,
     ) -> Result<Self::FinaliseSizesExt<'data>>
@@ -2647,7 +2675,7 @@ impl platform::Platform for MachO {
                     .context("Mach-O Objective-C message-stub size overflows")?,
             );
             epilogue_group.common.allocate(
-                part_id::OBJC_SELECTOR_REFERENCES,
+                objc_selector_references_part_id(args),
                 count
                     .checked_mul(OBJC_SELECTOR_REFERENCE_SIZE)
                     .context("Mach-O Objective-C selector-reference size overflows")?,
@@ -2922,7 +2950,7 @@ impl platform::Platform for MachO {
     fn finalise_layout_epilogue<'data>(
         _epilogue_state: &mut Self::EpilogueLayoutExt,
         memory_offsets: &mut crate::output_section_part_map::OutputSectionPartMap<u64>,
-        _symbol_db: &crate::symbol_db::SymbolDb<'data, Self>,
+        symbol_db: &crate::symbol_db::SymbolDb<'data, Self>,
         format_specific: &Self::FinaliseSizesExt<'data>,
         _dynsym_start_index: u32,
         _dynamic_symbol_defs: &[crate::layout::DynamicSymbolDefinition<Self>],
@@ -2938,7 +2966,7 @@ impl platform::Platform for MachO {
                 .context("Mach-O Objective-C message-stub size overflows")?,
         );
         memory_offsets.increment(
-            part_id::OBJC_SELECTOR_REFERENCES,
+            objc_selector_references_part_id(symbol_db.args),
             objc_stub_count
                 .checked_mul(OBJC_SELECTOR_REFERENCE_SIZE)
                 .context("Mach-O Objective-C selector-reference size overflows")?,
@@ -3320,6 +3348,10 @@ impl platform::Platform for MachO {
             add_sections_in_segment(&mut builder, output_sections, &custom.ro, segment);
             add_sections_in_segment(&mut builder, output_sections, &custom.data, segment);
             add_sections_in_segment(&mut builder, output_sections, &custom.bss, segment);
+            // `-const_selrefs` makes selector slots read-only after dyld rebases them. Keep them
+            // after other data-const Objective-C registrations (such as `__objc_classlist`), as
+            // ld64 does; the ordinary writable variant is emitted in the __DATA block below.
+            builder.add_section(output_section_id::OBJC_CONST_SELECTOR_REFERENCES);
         }
 
         // A dynamic TLS reference is a pointer to a dylib's `__thread_vars` descriptor, not a
@@ -3697,6 +3729,18 @@ const SECTION_DEFINITIONS: [BuiltInSectionDetails; NUM_BUILT_IN_SECTIONS] = {
         section_flags: macho::S_LITERAL_POINTERS
             .to_flags()
             .with(S_ATTR_NO_DEAD_STRIP),
+        min_alignment: alignment::USIZE,
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::OBJC_CONST_SELECTOR_REFERENCES.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionIdentity::new(
+            SectionName(b"__objc_selrefs"),
+            Some(SegmentName::DATA_CONST),
+        )),
+        // ld64 emits a regular zero-flag section here. The selector list is already limited to
+        // live selector-dispatch stubs, so the writable variant's no-dead-strip attribute is not
+        // part of the `-const_selrefs` contract.
+        section_flags: macho::S_REGULAR.to_flags(),
         min_alignment: alignment::USIZE,
         ..DEFAULT_DEFS
     };

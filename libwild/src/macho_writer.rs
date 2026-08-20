@@ -69,6 +69,7 @@ use crate::macho::output_section_id::LOAD_COMMANDS;
 use crate::macho::part_id;
 use crate::macho::parse_eh_frame_records;
 use crate::macho::objc_message_selector;
+use crate::macho::objc_selector_references_output_section_id;
 use crate::output_section_id::OrderEvent;
 use crate::output_section_id::OutputSectionId;
 use crate::output_section_id::SectionName;
@@ -198,7 +199,9 @@ pub(crate) fn write<'data, A: Arch<Platform = MachO>>(
     write_objc_selector_references(
         layout,
         &objc_selector_rebases,
-        section_buffers.get_mut(output_section_id::OBJC_SELECTOR_REFERENCES),
+        section_buffers.get_mut(objc_selector_references_output_section_id(
+            layout.symbol_db.args,
+        )),
     )?;
     let mut merged_string_buffers = split_buffers_by_alignment(&mut section_buffers, layout);
     write_merged_strings(layout, &mut merged_string_buffers);
@@ -2490,7 +2493,7 @@ fn write_objc_message_stubs(
     let stubs_layout = layout.section_layouts.get(output_section_id::OBJC_MESSAGE_STUBS);
     let selrefs_layout = layout
         .section_layouts
-        .get(output_section_id::OBJC_SELECTOR_REFERENCES);
+        .get(objc_selector_references_output_section_id(layout.symbol_db.args));
     let expected_stub_size = layout
         .format_specific
         .objc_message_stubs
@@ -2573,7 +2576,7 @@ fn write_objc_selector_references(
 ) -> Result {
     let refs_layout = layout
         .section_layouts
-        .get(output_section_id::OBJC_SELECTOR_REFERENCES);
+        .get(objc_selector_references_output_section_id(layout.symbol_db.args));
     for (&address, &target) in selector_rebases {
         let offset = usize::try_from(
             address

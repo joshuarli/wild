@@ -28,6 +28,10 @@ pub struct MachOArgs {
     pub(crate) plugin_path: Option<String>,
     pub(crate) dead_strip_dylibs: bool,
     pub(crate) gc_sections: bool,
+    /// Place linker-synthesized Objective-C selector references in the immutable-after-fixups
+    /// segment. This is ld64's `-const_selrefs` ABI contract, not a generic data-const switch:
+    /// it changes both the output segment and the Mach-O section flags for `__objc_selrefs`.
+    pub(crate) const_selrefs: bool,
     pub(crate) output_kind: MachOOutputKind,
     pub(crate) strip: Strip,
     pub(crate) install_name: Option<String>,
@@ -118,6 +122,7 @@ impl Default for MachOArgs {
             plugin_path: None,
             dead_strip_dylibs: false,
             gc_sections: false,
+            const_selrefs: false,
             output_kind: MachOOutputKind::Executable,
             strip: Strip::Nothing,
             install_name: None,
@@ -387,6 +392,15 @@ fn setup_argument_parser() -> ArgumentParser<MachOArgs> {
         .help("Remove unreferenced sections")
         .execute(|args, _modifier_stack| {
             args.gc_sections = true;
+            Ok(())
+        });
+
+    parser
+        .declare()
+        .long("const_selrefs")
+        .help("Place Objective-C selector references in __DATA_CONST")
+        .execute(|args, _modifier_stack| {
+            args.const_selrefs = true;
             Ok(())
         });
 
@@ -776,5 +790,15 @@ mod tests {
         args.parse(["-dylib"].iter()).unwrap();
 
         assert!(args.should_export_dynamic(b"libarchive-member.a"));
+    }
+
+    #[test]
+    fn const_selrefs_changes_the_objective_c_selector_reference_contract() {
+        let mut args = MachOArgs::new().unwrap();
+        assert!(!args.const_selrefs);
+
+        args.parse(["-const_selrefs"].iter()).unwrap();
+
+        assert!(args.const_selrefs);
     }
 }
