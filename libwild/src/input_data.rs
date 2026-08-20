@@ -33,6 +33,7 @@ use rayon::Scope;
 use rayon::iter::IntoParallelIterator;
 use rayon::iter::IntoParallelRefIterator;
 use rayon::iter::ParallelIterator;
+use std::borrow::Cow;
 use std::fmt::Display;
 use std::path::Path;
 use std::path::PathBuf;
@@ -1167,6 +1168,23 @@ impl std::fmt::Display for FileId {
 }
 
 impl<'data> InputRef<'data> {
+    /// Returns the path spelling that Apple's `dsymutil` expects in an `N_OSO` record. Archive
+    /// members use `archive.a(member.o)`, while ordinary inputs use their own absolute path.
+    pub(crate) fn dsymutil_object_path(&self) -> Cow<'data, [u8]> {
+        let archive_path = self.file.filename.as_os_str().as_encoded_bytes();
+        let Some(entry) = &self.entry else {
+            return Cow::Borrowed(archive_path);
+        };
+
+        let member_name = entry.identifier.as_slice();
+        let mut object_path = Vec::with_capacity(archive_path.len() + member_name.len() + 2);
+        object_path.extend_from_slice(archive_path);
+        object_path.push(b'(');
+        object_path.extend_from_slice(member_name);
+        object_path.push(b')');
+        Cow::Owned(object_path)
+    }
+
     pub(crate) fn lib_name(&self) -> &'data [u8] {
         self.file.original_filename.as_os_str().as_encoded_bytes()
     }

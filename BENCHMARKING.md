@@ -24,13 +24,41 @@ or [`benchmarks/e.benchmark.json`](benchmarks/e.benchmark.json).
 It measures a fresh Cargo target, a Cargo incremental rebuild after a controlled source edit, and
 direct replays of that incremental final-link argv. This separates Rust/LTO rebuild time from the
 incremental linker target. It records Apple-ld64/Wild linker-selection evidence and validates the
-resulting ARM64 Mach-O header. It alternates Apple ld64 and Wild by sample to avoid link-order
-thermal or filesystem-cache bias. The runner copies the source checkout to a disposable sibling
-and never mutates it. Rustc deletes the final temporary codegen object after ordinary links, so the
-unmeasured direct-link capture uses a separate disposable `-C save-temps` rebuild. See
+resulting ARM64 Mach-O header, strict `codesign --verify --strict` evidence, and a checked-in
+workload runtime smoke check. Runtime checks execute with all `DYLD_*` environment overrides
+removed; a cache-hit record is emitted only after that artifact passes all three validations. It
+alternates Apple ld64 and Wild by sample to avoid link-order thermal or filesystem-cache bias. The
+runner copies the source checkout to a disposable sibling and never mutates it. Rustc deletes the
+final temporary codegen object after ordinary links, so the unmeasured direct-link capture uses a
+separate disposable `-C save-temps` rebuild. With `--wild-timing-json`, each direct Wild replay's
+matching `--time=json` phase records are retained under `wild_timing_phases` in the result JSON;
+the runner rejects a requested timing capture that emits no records. See
 `python3 benchmarks/cargo_link_benchmark.py --help` for the required result path and opt-in goal
 enforcement. Its default Wild path is `target/release/wild`; do not use the unoptimized `ci`
 profile for a wall-time comparison.
+
+Each executable workload manifest has a `runtime` object. Its `arguments` are passed to the produced
+ARM64 executable, `expected_exit` defaults to zero, and one of `stdout_contains` or
+`stderr_contains` must match; native smoke programs that intentionally print nothing may use
+`"output": "exit"`. A non-executable Mach-O artifact such as a proc-macro dylib uses
+`"runtime": null` and is still required to pass ARM64 header and strict codesign validation.
+Workspace profiles may list multiple `artifacts`; the first is the direct-link replay target and all
+listed outputs are validated after each Cargo build. Hashed Cargo outputs can use a glob path, but
+it must resolve to exactly one file. This keeps the runtime contract deterministic without requiring
+network credentials (the Pi headless profile intentionally checks its missing-key startup error).
+
+The checked-in source-build matrix includes `e.benchmark.json`, `e-large-rust-lto.benchmark.json`
+(`e`'s checked-in release profile uses fat LTO and links its dependency archives),
+`pi-agent.benchmark.json`, `pi-agent-headless.benchmark.json`, and
+`pi-agent-workspace.benchmark.json`. The checked-in qualification fixtures add
+`cargo-macho-proc-macro.benchmark.json` and `cargo-macho-native-cpp.benchmark.json`; invoke those
+with `--workspace wild/tests/cargo_macho_qualification` and
+`--workspace wild/tests/cargo_macho_real_corpus`, respectively. The runner's `--workspace` argument
+is the clean checkout to copy, while these manifests keep the Cargo package, artifact, mutation,
+and validation contracts reviewable in the Wild repository. The proc-macro profile sets
+`"target": null` deliberately: Cargo builds proc-macro crates for the host, and on the qualified
+machine that host is ARM64 macOS; passing `--target` would suppress the host linker selection
+evidence.
 
 Each workload's `incremental_mutation` is an exact append or exact one-occurrence replacement.
 Prefer a same-size replacement that changes a real emitted byte over a comment-only edit. For a

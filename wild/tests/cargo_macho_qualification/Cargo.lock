@@ -23,3 +23,14 @@ dependencies = [
 [[package]]
 name = "cargo-macho-macro-producer"
 version = "0.1.0"
+
+[[package]]
+name = "cargo-macho-rlib-consumer"
+version = "0.1.0"
+dependencies = [
+ "cargo-macho-rlib-producer",
+]
+
+[[package]]
+name = "cargo-macho-rlib-producer"
+version = "0.1.0"

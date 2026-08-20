@@ -29,6 +29,25 @@ _main:
     cmp x0, x1
     b.ne Lfailure
 
+    // ARM64 also permits a 32-bit static-data expression. The result is intentionally checked
+    // modulo 2^32, because the image addresses themselves are above the 32-bit address space.
+    adrp x8, _wild_subtractor_32_value@PAGE
+    ldr w0, [x8, _wild_subtractor_32_value@PAGEOFF]
+    adrp x8, _wild_subtractor_local_minuend@PAGE
+    add x1, x8, _wild_subtractor_local_minuend@PAGEOFF
+    adrp x8, _wild_subtractor_local_subtrahend@PAGE
+    add x2, x8, _wild_subtractor_local_subtrahend@PAGEOFF
+    sub x1, x1, x2
+    add x1, x1, #17
+    cmp w0, w1
+    b.ne Lfailure
+    adrp x8, _wild_subtractor_32_guard@PAGE
+    ldr w3, [x8, _wild_subtractor_32_guard@PAGEOFF]
+    mov w4, #0x9bdf
+    movk w4, #0x1357, lsl #16
+    cmp w3, w4
+    b.ne Lfailure
+
     adrp x8, _wild_subtractor_external_value@PAGE
     ldr x0, [x8, _wild_subtractor_external_value@PAGEOFF]
     adrp x8, _wild_subtractor_external_minuend@PAGE
@@ -89,6 +108,14 @@ _wild_subtractor_private_value:
 .globl _wild_subtractor_dead_atom
 _wild_subtractor_dead_atom:
     .quad 0
+
+.p2align 3
+.globl _wild_subtractor_32_value
+_wild_subtractor_32_value:
+    .long _wild_subtractor_local_minuend - _wild_subtractor_local_subtrahend + 17
+.globl _wild_subtractor_32_guard
+_wild_subtractor_32_guard:
+    .long 0x13579bdf
 
 .section __DATA_CONST,__const
 .p2align 3

@@ -3108,8 +3108,12 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
         // in-place word as its two's-complement addend: `minuend - subtrahend + addend`.
         let (subtrahend, _, subtrahend_symbol_id) =
             get_resolution(subtractor, object_layout, layout)?;
-        let in_place_addend =
-            u64::from_le_bytes(out[output_offset..][..size_of::<u64>()].try_into().unwrap());
+        let in_place_addend = out[output_offset..][..relocation_width]
+            .iter()
+            .enumerate()
+            .fold(0u64, |value, (byte_index, byte)| {
+                value | (u64::from(*byte) << (byte_index * 8))
+            });
         let value = resolution
             .raw_value
             .wrapping_sub(subtrahend.raw_value)
@@ -4235,7 +4239,7 @@ fn write_dsymutil_debug_map<'data>(
     layout: &MachOLayout<'data>,
     symbol_writer: &mut MachOSymbolTableWriter,
 ) -> Result {
-    if layout.args().should_strip_debug() || object.input.entry.is_some() {
+    if layout.args().should_strip_debug() {
         return Ok(());
     }
     let Some(debug_map) = object.object.dsymutil_debug_map(&object.sections, |section, offset| {
@@ -4244,7 +4248,7 @@ fn write_dsymutil_debug_map<'data>(
         return Ok(());
     };
 
-    let object_path = object.input.file.filename.as_os_str().as_encoded_bytes();
+    let object_path = object.input.dsymutil_object_path();
     symbol_writer.define_stab(
         buffers,
         Some(&debug_map.source_path),
@@ -4256,7 +4260,7 @@ fn write_dsymutil_debug_map<'data>(
     // `n_desc == 1` is the low ARM64 CPU subtype byte used by Apple's and lld's C debug maps.
     symbol_writer.define_stab(
         buffers,
-        Some(object_path),
+        Some(&object_path),
         macho::N_OSO,
         0,
         object::macho::SymbolDesc::from_inner(1),

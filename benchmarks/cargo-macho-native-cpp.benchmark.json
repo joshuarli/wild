@@ -1,0 +1,21 @@
+{
+  "schema_version": "cargo-link-workload/v1",
+  "name": "cargo-macho-native-cpp",
+  "target": "aarch64-apple-darwin",
+  "profile": "release",
+  "cargo_arguments": ["--package", "cargo-macho-corpus-native-cpp"],
+  "artifact": "{target}/{profile}/cargo-macho-corpus-native-cpp",
+  "macho_file_type": 2,
+  "incremental_mutation": {
+    "path": "native-cpp/src/main.rs",
+    "append": "\n// wild benchmark native-C++ incremental-rebuild marker\n"
+  },
+  "runtime": {
+    "arguments": [],
+    "output": "exit"
+  },
+  "goals": {
+    "cold_wild_over_apple_max": 1.05,
+    "incremental_wild_over_apple_max": 0.5
+  }
+}

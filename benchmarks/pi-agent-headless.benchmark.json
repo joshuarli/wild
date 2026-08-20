@@ -11,6 +11,18 @@
     "path": "crates/pi-agent-tui/src/bin/pi-agent-headless.rs",
     "append": "\n// wild benchmark incremental-rebuild marker\n"
   },
+  "runtime": {
+    "arguments": [
+      "--model",
+      "benchmark-model",
+      "--prompt",
+      "benchmark startup check",
+      "--cwd",
+      "."
+    ],
+    "expected_exit": 2,
+    "stderr_contains": "OPENROUTER_API_KEY must be supplied by the caller"
+  },
   "goals": {
     "cold_wild_over_apple_max": 1.05,
     "incremental_wild_over_apple_max": 0.5

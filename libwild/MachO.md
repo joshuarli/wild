@@ -178,9 +178,10 @@ This is intentionally a bounded ARM64 implementation. For a live
 `UNWIND_ARM64_MODE_DWARF` (`0x03000000`) record, Wild selects the paired input `__eh_frame` FDE
 by its input function relocation (not by a merged output symbol), retains its CIE only when it has
 a live FDE, and serializes a final `__TEXT,__eh_frame` table. The supported Rust grammar is
-DWARF32 CIE augmentation `zR` with `R = 0x10`, or `zPLR` with `P = 0x9b` (indirect PC-relative
-signed 4-byte personality pointer) and `L` / `R = 0x10`, plus the corresponding PC-relative FDE
-CIE, function, and optional LSDA fields. The writer rewrites every DWARF compact-unwind encoding's
+DWARF32 CIE augmentation `zR` with `R = 0x10`, `0x18`, or `0x1c`, or `zPLR` with `P = 0x9b`
+(indirect PC-relative signed 4-byte personality pointer) and `L` / `R` one of those same
+eight-byte PC-relative encodings, plus the corresponding PC-relative FDE CIE, function, and
+optional LSDA fields. The writer rewrites every DWARF compact-unwind encoding's
 low 24 bits to that FDE's final section offset and sets `UNWIND_HAS_LSDA` when applicable.
 
 An indirect local personality pointer uses the already allocated GOT cell and contributes one

@@ -51,19 +51,20 @@ For each completed change, report:
 - tests run;
 - remaining limiting phase and the next proposed experiment.
 
-## Remaining macOS finish line
+## Completed macOS finish line
 
 The current ARM64 qualification is deliberately bounded. Keep the limitations and evidence in
 [`docs/macho-rust-status.md`](docs/macho-rust-status.md), and do not advertise broad macOS support
 until the ARM64 expansion is complete.
 
-ARM64 expansion:
+ARM64 expansion completed with the bounded evidence and limitations recorded in
+[`docs/macho-rust-status.md`](docs/macho-rust-status.md):
 
-- [ ] Broaden `__TEXT,__eh_frame` CIE/FDE grammar and qualify additional C++, Objective-C, and Rust
+- [x] Broaden `__TEXT,__eh_frame` CIE/FDE grammar and qualify additional C++, Objective-C, and Rust
   language forms, including archive debug-map inputs.
-- [ ] Broaden ARM64 subtractor relocation coverage beyond the validated ordinary 64-bit static-data
+- [x] Broaden ARM64 subtractor relocation coverage beyond the validated ordinary 64-bit static-data
   form.
-- [ ] Expand dylib, proc-macro, Rust TLS, crate-type, and stress qualification.
-- [ ] Expand the Apple differential corpus and retain reproducible ARM64 Rust workload evidence.
+- [x] Expand dylib, proc-macro, Rust TLS, crate-type, and stress qualification.
+- [x] Expand the Apple differential corpus and retain reproducible ARM64 Rust workload evidence.
 
 x86_64 macOS is out of scope.

@@ -14,7 +14,9 @@ The workspace currently exercises four final Rust executable links:
 
 The qualification harness runs `cargo clean`, `cargo build`, and `cargo test --workspace`
 with `--locked` for both `stable` and `nightly-2026-07-24`, using a fresh target directory for
-each compiler. It requires macOS ARM64 and enables the harness with
+each compiler. After each build it checks every executable's thin ARM64 `MH_EXECUTE` header,
+strict ad-hoc code signature, and runtime behavior with `DYLD_*` overrides removed; `cargo test`
+then executes each package's unit-test harness. It requires macOS ARM64 and enables the harness with
 `WILD_RUN_MACHO_REAL_CARGO_CORPUS=1`.
 
 To refresh the lockfile when intentionally changing dependencies, use the pinned nightly and

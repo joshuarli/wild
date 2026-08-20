@@ -518,9 +518,9 @@ impl<'data> Iterator for PairedRelocations<'data> {
                         && unsigned_info.r_extern
                         && !first_info.r_pcrel
                         && !unsigned_info.r_pcrel
-                        && first_info.r_length == 3
-                        && unsigned_info.r_length == 3,
-                    "ARM64_RELOC_SUBTRACTOR/ARM64_RELOC_UNSIGNED requires external non-pcrel 64-bit relocation records"
+                        && first_info.r_length == unsigned_info.r_length
+                        && matches!(first_info.r_length, 2 | 3),
+                    "ARM64_RELOC_SUBTRACTOR/ARM64_RELOC_UNSIGNED requires matching external non-pcrel 32-bit or 64-bit relocation records"
                 );
                 Ok(NormalizedRelocation {
                     info: unsigned_info,
@@ -582,7 +582,9 @@ pub(crate) struct EhFrameRecords {
 /// intentionally ignored. A CIE that explicitly advertises all of `zPLR`, but uses a different
 /// pointer representation, fails clearly rather than silently producing a catchable panic with
 /// the wrong unwind target. The supported encoding is `P=0x9b` (pcrel indirect sdata4), and
-/// `L=R=0x10` (pcrel 64-bit), which is the arm64 Mach-O encoding produced by rustc/LLVM.
+/// `L`/`R` one of `0x10` (pcrel absptr), `0x18` (pcrel udata8), or `0x1c` (pcrel sdata8).
+/// All three encodings occupy one 64-bit field on arm64 and therefore share the same relocation
+/// and final-output rewrite below.
 pub(crate) fn eh_frame_augmentations(data: &[u8]) -> Result<Vec<EhFrameAugmentation>> {
     let records = parse_eh_frame_records(data)?;
     Ok(records
@@ -718,8 +720,8 @@ fn parse_eh_frame_cie(
             .context("truncated Mach-O __eh_frame zR FDE encoding")?;
         offset += 1;
         ensure!(
-            fde_encoding == 0x10 && offset == augmentation_end,
-            "unsupported Mach-O __eh_frame zR encoding: expected R=0x10"
+            eh_frame_pcrel_64_encoding(fde_encoding) && offset == augmentation_end,
+            "unsupported Mach-O __eh_frame zR encoding: expected R=0x10, 0x18, or 0x1c"
         );
         None
     } else {
@@ -739,10 +741,10 @@ fn parse_eh_frame_cie(
         offset += 1;
         ensure!(
             personality_encoding == 0x9b
-                && lsda_encoding == 0x10
-                && fde_encoding == 0x10
+                && eh_frame_pcrel_64_encoding(lsda_encoding)
+                && eh_frame_pcrel_64_encoding(fde_encoding)
                 && offset == augmentation_end,
-            "unsupported Mach-O __eh_frame zPLR encoding: expected P=0x9b, L=R=0x10"
+            "unsupported Mach-O __eh_frame zPLR encoding: expected P=0x9b and L/R=0x10, 0x18, or 0x1c"
         );
         Some(pointer_offset)
     };
@@ -798,6 +800,14 @@ fn parse_eh_frame_fde(
         function_relocation_offset,
         lsda_relocation_offset,
     })
+}
+
+/// Return whether a DWARF pointer encoding is an eight-byte PC-relative field on arm64.
+/// `DW_EH_PE_absptr` is pointer-sized, while the explicit `udata8`/`sdata8` formats are also
+/// eight bytes. Their final representation is the same two's-complement 64-bit delta here; the
+/// relocation and serializer do not need to distinguish those format names.
+fn eh_frame_pcrel_64_encoding(encoding: u8) -> bool {
+    matches!(encoding, 0x10 | 0x18 | 0x1c)
 }
 
 fn eh_frame_u32(data: &[u8], offset: usize) -> Result<u32> {
@@ -3395,13 +3405,13 @@ impl platform::Platform for MachO {
         // C/Rust path, reserve the STABS debug map that lets `dsymutil` reopen this loose input
         // object and do the address rewriting itself. Keep this allocation exactly in sync with
         // `write_dsymutil_debug_map` in the writer.
-        if !symbol_db.args.should_strip_debug() && state.input.entry.is_none() {
+        if !symbol_db.args.should_strip_debug() {
             if let Some(debug_map) = state.object.dsymutil_debug_map(&state.sections, |section, offset| {
                 state.input_offset_is_live(section, offset)
             })? {
                 num_globals += 3 + 2 * debug_map.functions.len() as u64;
                 strings_size += debug_map.source_path.len() + 1;
-                strings_size += state.input.file.filename.as_os_str().as_encoded_bytes().len() + 1;
+                strings_size += state.input.dsymutil_object_path().len() + 1;
                 strings_size += debug_map
                     .functions
                     .iter()
@@ -4215,6 +4225,12 @@ fn process_relocation<'data, 'scope, A: platform::Arch<Platform = MachO>>(
         let local_symbol = object.object.symbol(local_sym_index)?;
         let symbol_id = symbol_db.definition(local_symbol_id);
         let target_is_dynamic = is_dynamic_library(&symbol_db.file(symbol_db.file_id_for_symbol(symbol_id)));
+        ensure!(
+            !(target_is_dynamic
+                && rel_info.r_type == object::macho::ARM64_RELOC_UNSIGNED
+                && rel_info.r_length == 2),
+            "32-bit ARM64_RELOC_UNSIGNED dynamic data references are unsupported"
+        );
         let objc_selector_dispatch = objc_message_selector(
             object.object.raw_symbol_name(local_sym_index)?,
         )
@@ -5175,6 +5191,31 @@ mod tests {
     }
 
     #[test]
+    fn eh_frame_zplr_accepts_explicit_arm64_pcrel_64_encodings() {
+        // `0x18` (udata8) and `0x1c` (sdata8) occupy the same eight-byte PC-relative fields as
+        // the pointer-sized `0x10` form. The output writer emits the final value as a 64-bit
+        // delta for all three, while the relocation contract remains unchanged.
+        for encoding in [0x18, 0x1c] {
+            let mut data = vec![
+                24, 0, 0, 0, // CIE length
+                0, 0, 0, 0, // CIE marker
+                1, b'z', b'P', b'L', b'R', 0, 1, 0x78, 30, 7, 0x9b,
+                0, 0, 0, 0, // personality pointer relocation storage
+                encoding, encoding, 0x0c, 0x1f, 0,
+                29, 0, 0, 0, // FDE length
+                32, 0, 0, 0, // CIE pointer: (FDE + 4) - CIE
+            ];
+            data.extend_from_slice(&[0; 16]); // function and range
+            data.push(8); // FDE augmentation size
+            data.extend_from_slice(&[0; 8]); // LSDA relocation storage
+            data.extend_from_slice(&[0; 4]); // final zero-length record
+
+            assert_eq!(eh_frame_augmentations(&data).unwrap().len(), 1);
+            assert_eq!(parse_eh_frame_records(&data).unwrap().fdes.len(), 1);
+        }
+    }
+
+    #[test]
     fn regular_text_section_requires_the_text_segment_identity() {
         let mut output_sections = OutputSections::<MachO>::with_base_address(
             MACHO_START_MEM_ADDRESS,
@@ -5332,6 +5373,23 @@ mod tests {
     }
 
     #[test]
+    fn preserves_32_bit_arm64_subtractor_pairs_as_one_relocation_expression() {
+        let relocations = [
+            raw_relocation(16, 5, false, 2, true, macho::ARM64_RELOC_SUBTRACTOR),
+            raw_relocation(16, 9, false, 2, true, macho::ARM64_RELOC_UNSIGNED),
+        ];
+
+        let relocations = paired_relocations(&relocations)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+
+        assert_eq!(relocations.len(), 1);
+        assert_eq!(relocations[0].info.r_length, 2);
+        assert_eq!(relocations[0].info.r_type, macho::ARM64_RELOC_UNSIGNED);
+        assert_eq!(relocations[0].subtractor.unwrap().r_length, 2);
+    }
+
+    #[test]
     fn rejects_malformed_arm64_addend_pairs() {
         let missing_primary = [raw_relocation(
             0,
@@ -5399,16 +5457,16 @@ mod tests {
             .to_string()
             .contains("same offset"));
 
-        let unsupported_fields = [
+        let mismatched_widths = [
             raw_relocation(0, 1, false, 2, true, macho::ARM64_RELOC_SUBTRACTOR),
-            raw_relocation(0, 3, false, 2, true, macho::ARM64_RELOC_UNSIGNED),
+            raw_relocation(0, 3, false, 3, true, macho::ARM64_RELOC_UNSIGNED),
         ];
-        assert!(paired_relocations(&unsupported_fields)
+        assert!(paired_relocations(&mismatched_widths)
             .next()
             .unwrap()
             .unwrap_err()
             .to_string()
-            .contains("external non-pcrel 64-bit"));
+            .contains("matching external non-pcrel 32-bit or 64-bit"));
     }
 
     #[test]

@@ -61,11 +61,11 @@ or a known failure in the named workflow.
 | Mach-O argument semantics | Models ARM64, dylib/executable, install names, rpaths, export lists, framework paths, strip options, input-local `-force_load`, and `-dead_strip_dylibs` without removing dyld-required libSystem. | partial |
 | Section/symbol classification | Carries section-derived function/TLS facts beside raw nlists, handles data access, debug/non-alloc, `__DATA_CONST`, TLV storage, no-dead-strip, C strings, and Mach-O-specific no-op hooks. `__thread_bss` extends its containing `__DATA` segment, unlike ELF's `PT_TLS`-only zero-fill convention. | partial |
 | ABI-level symbols | Bounded ARM64 fixtures cover tentative/common `N_UNDF` definitions (size and `n_desc` alignment in `__DATA,__common`), direct `N_INDR` aliases, `N_PEXT` visibility, hidden synthetic `___dso_handle`, C++ initialization/`atexit`/destruction, and Rust calling a native C function. Weak dylib imports retain `N_WEAK_REF` separately from weak definitions: all-weak dependencies use `LC_LOAD_WEAK_DYLIB` and the chained-import weak bit, while an unprovided weak import remains an undefined-symbol error. Absolute symbols, alias chains, and broad mixed-language qualification remain outside this bounded result. | partial; focused Apple controls and Wild runtime/structural fixtures green |
-| ARM64 relocations / thunks | Validates supported standalone forms, `POINTER_TO_GOT`, local and dylib-imported TLVP descriptors, paired `ADDEND`, bounded ordinary-data `SUBTRACTOR`/`UNSIGNED` expressions, and out-of-range `BRANCH26` via nearby text islands. Authenticated paths remain explicitly diagnosed or absent. | partial; unqualified |
+| ARM64 relocations / thunks | Validates supported standalone forms, `POINTER_TO_GOT`, local and dylib-imported TLVP descriptors, paired `ADDEND`, bounded ordinary-data 32-bit and 64-bit `SUBTRACTOR`/`UNSIGNED` expressions, and out-of-range `BRANCH26` via nearby text islands. Authenticated paths remain explicitly diagnosed or absent. | partial; unqualified |
 | Chained fixups | Plans address-ordered imported binds and local rebases per segment; gaps, leading local slots, 16 KiB pages, and malformed encodings are handled. `macho/chained-fixups-multipage` executes 2300 imported `__got` binds across two pages, while `macho/chained-fixups-tlvp` executes two imported descriptor binds in `__thread_ptrs`. Wider pointer-format/arm64e qualification remains. | partial; bounded ARM64 runtime green |
 | Dylib output / rpaths / exports | Emits `MH_DYLIB`, `LC_ID_DYLIB`, requested `LC_RPATH`, and omits executable-only commands. Undefined nlists owned by input dylibs remain dyld imports rather than being recursively rejected by the static link. Supported ARM64 output is always `MH_TWOLEVEL`: flat/interposable namespace modes are rejected, and a dylib self-reference stays bound to its own ordinal. C and bounded Rust `dylib` producer/consumer runtime controls pass. Dependency ordinals and weak/reexport behavior remain. | partial; bounded C/Rust dylib runtime green |
 | Dead strip / atoms | `MH_SUBSECTIONS_VIA_SYMBOLS` inputs are split into live symbol-delimited spans under `-dead_strip`; whole-section behavior is retained otherwise. | partial; differential smoke green |
-| TLS, compact unwind, DWARF, string merging | A local C TLS descriptor fixture executes successfully. ARM64 compact frame/frameless rows, personality pointers, and LSDAs are synthesized and a C++ throw/catch fixture passes. Bounded ARM64 DWARF-mode rows now serialize their live `__eh_frame` CIE/FDE records and pass a Rust `panic=unwind` / `catch_unwind` smoke under `-dead_strip`. Ordinary C, controlled C++14 and Objective-C loose objects, plus a normal Rust executable from `nightly-2026-07-24`, are represented only by bounded `dsymutil` debug maps; final executables intentionally do not copy `__DWARF`. | partial; bounded unwind and C/C++/Objective-C/Rust debug-map smoke green |
+| TLS, compact unwind, DWARF, string merging | A local C TLS descriptor fixture executes successfully. ARM64 compact frame/frameless rows, personality pointers, and LSDAs are synthesized and C++ throw/catch fixtures pass, including a throwing C++ archive member. Bounded ARM64 DWARF-mode rows now serialize their live `__eh_frame` CIE/FDE records and pass a Rust `panic=unwind` / `catch_unwind` smoke under `-dead_strip`. Ordinary C, controlled C++14 and Objective-C loose objects, an extracted C++ archive member, plus a normal Rust executable from `nightly-2026-07-24`, are represented only by bounded `dsymutil` debug maps; final executables intentionally do not copy `__DWARF`. | partial; bounded unwind and C/C++/Objective-C/Rust debug-map smoke green |
 
 ## Compatibility matrix
 
@@ -82,7 +82,7 @@ or a known failure in the named workflow.
 | ABI-level symbols | `macho/common-symbols`, `symbol-aliases`, `weak-symbols`, `weak-undefined`, `cxx-init-teardown` | Apple controls establish common/alias/weak behavior | `macho/rust-native-ffi` calls C through Wild | pending | bounded C/C++/Rust smoke green |
 | TLS | `macho/tls-local`, `tls-dynamic`, `cxx-thread-local`, `cxx-thread-local-dylib`, `rust-thread-local`, and Cargo's Rust-dylib producer/consumer | Apple ld binds the imported descriptor through `__got`; ld64.lld uses `__thread_ptrs` | C, C++, a Rust executable, and a dynamically loaded Rust `dylib` prove two-thread isolation under Wild | pending | bounded C/C++/Rust local/dylib smoke green |
 | compact unwind | `macho/exception`, `cxx-exception-cleanup` C++ throw/catch and RAII cleanup; `rust-panic-unwind`, `rust-cxx-unwind-bridge` | structural section/header check; C++ and Rust runtime pass | ARM64 Rust `panic=unwind` / `catch_unwind`, including Rust → C++ RAII → Rust under the dated nightly | pending | bounded ARM64 support |
-| DWARF / dSYM / LLDB | `macho/debug-dwarf`, `cxx-debug-dwarf`, `objc-debug-dwarf`, `strip-symbols`, and Rust `rust-debug-dwarf` / `rust-debuginfo-line-tables` / `rust-split-debug-dwarf` / `rust-split-debug-packed` | Apple ld and ld64.lld establish the same `N_SO`/`N_OSO`/paired-`N_FUN` control shape; `-S` / `-s` links run, and Wild `dsymutil --dump-debug-map` passes | generated dSYMs verify; LLDB stops at C, C++14, Objective-C, normal Rust, Rust `debuginfo=1`, and Rust `split-debuginfo=unpacked` / `packed` source locations (Rust uses `nightly-2026-07-24`) | pending | bounded loose-object ARM64 C/C++/Objective-C/Rust support |
+| DWARF / dSYM / LLDB | `macho/debug-dwarf`, `cxx-debug-dwarf`, `cxx-exception-archive`, `objc-debug-dwarf`, `strip-symbols`, and Rust `rust-debug-dwarf` / `rust-debuginfo-line-tables` / `rust-split-debug-dwarf` / `rust-split-debug-packed` | Apple ld and ld64.lld establish the same `N_SO`/`N_OSO`/paired-`N_FUN` control shape; `-S` / `-s` links run, and Wild `dsymutil --dump-debug-map` passes | generated dSYMs verify; LLDB stops at C, C++14, Objective-C, normal Rust, Rust `debuginfo=1`, and Rust `split-debuginfo=unpacked` / `packed` source locations (Rust uses `nightly-2026-07-24`) | pending | bounded loose-object and extracted-archive-member ARM64 C/C++/Objective-C/Rust support |
 | chained fixups | `macho/chained-fixups-tlvp`, `chained-fixups-multipage`, `chained-fixups-10000` | Apple controls and Wild runtime pass | pending | 10,000 imported `__got` binds cross five 16 KiB pages; two imported `__thread_ptrs` binds exercise a non-zero TLVP page offset | bounded ARM64 runtime green |
 | branch islands | `macho/branch-island`, `macho/branch-island-call`, `macho/branch-islands` | Apple links forced `B` and `BL` overflows | C runtime pass | multiple islands pass | ARM64 smoke green |
 | malformed input diagnostics | malformed object/TBD/export-list unit controls plus `macho/missing-library`, `missing-framework`, `undefined-symbol`, and relocation/argument controls | n/a | n/a | n/a | malformed object/TBD/export-list input is rejected before layout; missing dependencies and supported negative controls diagnose rather than panic |
@@ -186,17 +186,22 @@ passed wherever Wild is listed as failing.
   `macho/aarch64/objc-debug-dwarf/default`. Each proves Apple ld, ld64.lld, and Wild produce a
   valid dSYM and that LLDB stops at the named source-level helper; the former deliberately emits
   only `DW_LANG_C_plus_plus_14`, while the latter emits only `DW_LANG_ObjC`.
+* Focused C++ archive EH/debug-map fixture: `WILD_TEST_IGNORE_FORMAT=1 cargo
+  +nightly-2026-07-24 test --profile ci -p wild-linker --features macho --test integration_tests
+  -- 'macho/aarch64/cxx-exception-archive/default'`. Its throwing frame is extracted from a
+  `-g` archive member, reaches a C++ catch through its LSDA, and appears in Wild's debug map as
+  `archive.a(member.o)`; the dead helper is absent and LLDB resolves the member's source line.
 * Focused ARM64 subtractor fixture: `WILD_TEST_IGNORE_FORMAT=1 cargo test --profile ci -p
   wild-linker --features macho --test integration_tests -- 'macho/aarch64/subtractor-reloc/default'`.
   Apple clang emits an adjacent, same-offset `ARM64_RELOC_SUBTRACTOR` then
-  `ARM64_RELOC_UNSIGNED` pair, both external-symbol, non-PC-relative, 64-bit records. The
-  unsigned half names the minuend, the subtractor names the subtrahend, and the in-place word is
-  the two's-complement addend. Wild preserves that expression through graph loading and writing:
-  same-object local `ltmp` targets, a target defined by another object, an absolute minuend,
-  `-dead_strip` atom retention, and an in-image-looking arithmetic result that must not become a
-  dyld rebase all execute against Apple controls. This bounded support rejects malformed
-  ordering/fields and dylib or weak-import operands; `__eh_frame` keeps its separately validated
-  reconstruction path.
+  `ARM64_RELOC_UNSIGNED` pair, both external-symbol, non-PC-relative, width-matched 32-bit or
+  64-bit records. The unsigned half names the minuend, the subtractor names the subtrahend, and
+  the in-place word is the width-sized two's-complement addend. Wild preserves that expression
+  through graph loading and writing: same-object local `ltmp` targets, a target defined by another
+  object, an absolute minuend, `-dead_strip` atom retention, and in-image-looking arithmetic
+  results that must not become dyld rebases all execute against Apple controls. This bounded support
+  rejects malformed ordering/fields and dylib or weak-import operands; `__eh_frame` keeps its
+  separately validated reconstruction path.
 * Rust-to-Darwin command capture: [`darwin-linker-recorder.md`](darwin-linker-recorder.md)
   documents the new `darwin-linker-recorder` wrapper and its exact NUL-delimited replay records.
 * A fresh stable `aarch64-apple-darwin` Cargo binary was captured through that recorder. Its final
@@ -251,7 +256,8 @@ rustc invocations (producer, consumer, and proc-macro host). The existing integr
 therefore registers a separate ARM64-only trial,
 `macho/aarch64/cargo-workspace-qualification/default`, rather than pretending those graphs fit a
 single-source fixture. Its retained workspace is `wild/tests/cargo_macho_qualification` and has a
-path-dependent Rust `dylib` producer/consumer plus a `proc-macro = true` producer/consumer.
+path-dependent Rust `dylib` producer/consumer, a `proc-macro = true` producer/consumer, and an
+explicit `rlib` producer consumed by a final Rust executable.
 
 The trial creates one fresh short `/tmp` Cargo target directory for the copied workspace, then
 invokes each package operation with `cargo +nightly-2026-07-24 build -vv` and
@@ -259,6 +265,10 @@ invokes each package operation with `cargo +nightly-2026-07-24 build -vv` and
 `-C prefer-dynamic`. The fresh workspace target forces the initial producer, consumer, and test
 links; later invocations deliberately exercise Cargo rebuild behavior. The explicit selector is
 necessary because rustup chooses Cargo before it opens a nested workspace's `rust-toolchain.toml`.
+The integration harness probes `/opt/homebrew/opt/rustup/bin/cargo` first (the pinned proxy used by
+the benchmark protocol) and rejects a standalone Cargo binary that treats `+nightly-2026-07-24`
+as an unknown subcommand; this keeps the qualification from accidentally running a different
+Cargo/toolchain pair.
 The trial parses every final Clang link
 transcript, requires that each expected producer and consumer artifact selected Wild, requires
 `-arch arm64`, and rejects `x86_64`. The proc macro uses
@@ -276,6 +286,9 @@ implementation body while preserving its API and result, and rebuilds/runs the d
 Its second transcript again requires both producer and consumer final ARM64 links through Wild; a
 snapshot asserts that every retained fixture Rust source is unchanged. This coverage deliberately
 does not use `WILD_SAVE_DIR` or the `cdylib` replay path above.
+The separate `rlib` producer is consumed by a fresh executable in the same target directory; its
+runtime assertion and final `cargo -vv` transcript prove the explicit archive crate type and its
+consumer's ARM64 link through Wild.
 
 The same workspace was also rebuilt in a fresh target directory with the recorded stable
 `1.97.1` toolchain, `clang --ld-path=<Wild> -v`, and `-C prefer-dynamic`. The proc-macro
@@ -326,26 +339,30 @@ dSYM support beyond the separately controlled loose-object `DW_LANG_ObjC` map.
 ### Bounded C/C++/Objective-C/Rust `dsymutil` debug maps
 
 `macho/debug-dwarf` is the permanent ARM64 C control; `macho/cxx-debug-dwarf` is the explicit
-C++14 control; `macho/objc-debug-dwarf` is the normal Objective-C control; and
+C++14 control; `macho/cxx-exception-archive` adds a C++14 throwing archive member;
+`macho/objc-debug-dwarf` is the normal Objective-C control; and
 `macho/rust-debug-dwarf`, `macho/rust-debuginfo-line-tables`,
 `macho/rust-split-debug-dwarf`, and `macho/rust-split-debug-packed` are normal Rust-executable
 controls compiled with `nightly-2026-07-24`; the second uses `-C debuginfo=1`, and the last two
-use `-C split-debuginfo=unpacked` and `packed` respectively. Each supplies one loose debug object
-and links with `-dead_strip`. Wild
+use `-C split-debuginfo=unpacked` and `packed` respectively. The ordinary controls supply one
+loose debug object, while `cxx-exception-archive` supplies one extracted archive member; all link
+with `-dead_strip`. Wild
 intentionally leaves final `__DWARF` sections out of the executable, as Apple ld and ld64.lld do.
 Instead `MachO::allocate_object_symtab_space` reserves, and `write_dsymutil_debug_map` emits,
 `N_SO`, `N_OSO`, one start/terminator `N_FUN` pair for each live executable atom, and the
 terminating empty `N_SO`. Start addresses use the post-GC compacted section mapping; terminators
-retain each atom's original input length. `dsymutil` owns DWARF relocation and address rewriting
-when it builds the dSYM.
+retain each atom's original input length. For an extracted archive member, `N_OSO` names the
+member as `archive.a(member.o)`, matching Apple ld and ld64.lld. `dsymutil` owns DWARF relocation
+and address rewriting when it builds the dSYM.
 
-The supported input is deliberately small: a loose ARM64 Mach-O object with
+The supported input is deliberately small: a loose or extracted archive-member ARM64 Mach-O object with
 `MH_SUBSECTIONS_VIA_SYMBOLS`, ordinary C (`DW_LANG_C89`, `C`, `C99`, `C11`, or `C17`), Rust
 (`DW_LANG_Rust`), explicitly `-std=c++14` C++ (`DW_LANG_C_plus_plus_14`), or Objective-C
 (`DW_LANG_ObjC`) debug data, and live, non-merged executable atoms. Every fixture checks that a
 dead private function is absent from the map, runs `dsymutil --dump-debug-map`, verifies the
 generated dSYM with `dwarfdump`, and uses an LLDB batch source breakpoint. Other C++ and
-Objective-C language forms (including Objective-C++), archives, split-debug modes other than the
+Objective-C language forms (including Objective-C++), archive forms beyond the extracted-member
+control, split-debug modes other than the
 controlled Rust `unpacked`/`packed` forms, Rust library/dylib debug maps, and Rust modes other
 than the controlled normal `debuginfo=1`/default executables remain unclaimed. There is no final-
 section copy or generic debug relocation writer hidden behind these controls.
@@ -482,8 +499,11 @@ ephemeral because Cargo fingerprints and absolute paths are not durable test inp
 
 The corpus also contains a deterministic `git2` CLI. Its `libgit2-sys` dependency compiles a
 vendored archive from 260 native C sources before the final Rust link, then creates, indexes,
-commits, and reads a local repository at runtime. Together with the existing Tokio TCP loopback,
-Clap/Serde/regex derive graph, and `cc`-built C++ client, this gives the stable and
+commits, and reads a local repository at runtime. After each clean build, the qualification
+harness validates every corpus executable as a thin ARM64 `MH_EXECUTE`, verifies its strict ad-hoc
+code signature, and runs it with `DYLD_*` search overrides removed; the subsequent `cargo test`
+invocation executes each package's unit-test harness as well. Together with the existing Tokio
+TCP loopback, Clap/Serde/regex derive graph, and `cc`-built C++ client, this gives the stable and
 `nightly-2026-07-24` clean/build/test corpus real asynchronous, macro/codegen, native C, native
 C++, framework, and substantial dependency-graph coverage. `CORPUS.md` beside the fixture
 records the pinned/offline-refresh contract.
@@ -608,8 +628,8 @@ were not recoverable; that limitation is recorded in their sidecars rather than 
 ## Follow-up expansion work
 
 1. Broaden final `__TEXT,__eh_frame` CIE/FDE grammar and qualify additional C++/Objective-C/Rust
-   language forms plus archive debug-map inputs before designing any generic ordinary-DWARF
-   relocation path.
-2. Broaden subtractor coverage beyond the validated ordinary 64-bit static data form, and expand
+   language forms plus archive/debug-map inputs beyond the extracted-member control before
+   designing any generic ordinary-DWARF relocation path.
+2. Broaden subtractor coverage beyond the validated ordinary 32-bit and 64-bit static data forms, and expand
    the bounded dylib/proc-macro and Rust TLS qualification.
 3. Expand the Apple-differential corpus and ARM64 Rust crate-type/stress qualification.

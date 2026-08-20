@@ -502,6 +502,9 @@ fn run_real_cargo_macho_corpus() -> Result {
                 &wild,
             )?;
             verify_real_cargo_corpus_transcript(&transcript, &wild, toolchain, command)?;
+            if command == "build" {
+                verify_real_cargo_macho_corpus_binaries(target_dir)?;
+            }
         }
     }
     Ok(())
@@ -516,9 +519,8 @@ fn run_cargo_corpus_command(
     rustflags: &str,
     wild: &Path,
 ) -> Result<String> {
-    let mut command = Command::new("cargo");
+    let mut command = cargo_with_toolchain(toolchain)?;
     command
-        .arg(format!("+{toolchain}"))
         .arg(operation)
         .arg("--manifest-path")
         .arg(manifest)
@@ -542,6 +544,61 @@ fn run_cargo_corpus_command(
         wild.display()
     );
     Ok(transcript)
+}
+
+/// The ARM64 Cargo qualification must run through rustup's Cargo proxy so the nested fixture's
+/// dated toolchain is selected explicitly. Some developer environments put a standalone Cargo
+/// binary ahead of rustup; that binary accepts ordinary Cargo commands but reports `+nightly...`
+/// as an unknown subcommand. Probe the requested selector before running a qualification command,
+/// and prefer the documented Homebrew rustup proxy used by the macOS benchmark protocol.
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+fn cargo_with_toolchain(toolchain: &str) -> Result<Command> {
+    rustup_tool_with_toolchain("cargo", toolchain)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+fn rustc_with_toolchain(toolchain: &str) -> Result<Command> {
+    rustup_tool_with_toolchain("rustc", toolchain)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+fn rustup_tool_with_toolchain(tool: &str, toolchain: &str) -> Result<Command> {
+    const HOMEBREW_RUSTUP_BIN: &str = "/opt/homebrew/opt/rustup/bin";
+
+    let mut candidates = Vec::new();
+    let homebrew_tool = Path::new(HOMEBREW_RUSTUP_BIN).join(tool);
+    if homebrew_tool.is_file() {
+        candidates.push(homebrew_tool);
+    }
+    candidates.push(PathBuf::from(tool));
+
+    let selector = format!("+{toolchain}");
+    let mut failures = Vec::new();
+    for candidate in candidates {
+        let probe = Command::new(&candidate)
+            .arg(&selector)
+            .arg("--version")
+            .output();
+        match probe {
+            Ok(output) if output.status.success() => {
+                let mut command = Command::new(candidate);
+                command.arg(selector);
+                return Ok(command);
+            }
+            Ok(output) => failures.push(format!(
+                "{} exited {}: {}",
+                candidate.display(),
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            )),
+            Err(error) => failures.push(format!("{}: {error}", candidate.display())),
+        }
+    }
+
+    bail!(
+        "no rustup {tool} can select toolchain `{toolchain}`; tried {}",
+        failures.join("; ")
+    )
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
@@ -585,6 +642,67 @@ fn verify_real_cargo_corpus_transcript(
             wild,
             linker_lines.join("\n")
         );
+    }
+    Ok(())
+}
+
+/// A verbose Cargo transcript proves linker selection, but a build alone does not execute any of
+/// its binary targets. Run every retained corpus executable after checking its thin ARM64 header,
+/// signature, and file type so this qualification catches a link that merely wrote a plausible
+/// artifact while failing dyld/runtime initialization.
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+fn verify_real_cargo_macho_corpus_binaries(target_dir: &Path) -> Result {
+    let debug_dir = target_dir.join("debug");
+    for (name, expected_stdout) in [
+        ("cargo-macho-corpus-cli-regex", Some("answer")),
+        ("cargo-macho-corpus-async-network", None),
+        ("cargo-macho-corpus-git2-cli", None),
+        ("cargo-macho-corpus-native-cpp", None),
+    ] {
+        let binary = debug_dir.join(name);
+        let bytes = std::fs::read(&binary)
+            .with_context(|| format!("failed to read Cargo corpus binary {}", binary.display()))?;
+        let object = object::File::parse(bytes.as_slice())
+            .with_context(|| format!("failed to parse Cargo corpus binary {}", binary.display()))?;
+        let object::File::MachO64(file) = object else {
+            bail!("Cargo corpus binary {} is not a 64-bit Mach-O", binary.display());
+        };
+        let header = file.macho_header();
+        let endian = file.endianness();
+        ensure!(
+            header.cputype.get(endian) == object::macho::CPU_TYPE_ARM64,
+            "Cargo corpus binary {} is not ARM64 (cputype {:?})",
+            binary.display(),
+            header.cputype.get(endian)
+        );
+        ensure!(
+            header.filetype.get(endian) == object::macho::MH_EXECUTE,
+            "Cargo corpus binary {} is not MH_EXECUTE (filetype {:?})",
+            binary.display(),
+            header.filetype.get(endian)
+        );
+        verify_code_signature(&binary)?;
+
+        let output = Command::new(&binary)
+            .env_remove("DYLD_LIBRARY_PATH")
+            .env_remove("DYLD_FALLBACK_LIBRARY_PATH")
+            .output()
+            .with_context(|| format!("failed to run Cargo corpus binary {}", binary.display()))?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        ensure!(
+            output.status.success(),
+            "Cargo corpus binary {} failed with {}:\n{stdout}{stderr}",
+            binary.display(),
+            output.status
+        );
+        if let Some(expected_stdout) = expected_stdout {
+            ensure!(
+                stdout.contains(expected_stdout),
+                "Cargo corpus binary {} did not print `{expected_stdout}`:\n{stdout}{stderr}",
+                binary.display()
+            );
+        }
     }
     Ok(())
 }
@@ -679,6 +797,24 @@ fn run_cargo_macho_qualification() -> Result {
     run_cargo_macho_binary(
         &target_debug.join("cargo-macho-macro-consumer"),
         "proc macro consumer rebuilt and ran",
+    )?;
+
+    // An explicit Rust `rlib` is the ordinary static crate boundary behind many Cargo
+    // consumers. Keep it separate from the dynamically loaded producer below so this trial
+    // proves that Cargo can select Wild for a final executable which links Rust metadata and
+    // archive members through that crate type.
+    cargo_build_with_wild(
+        &manifest,
+        &target_dir,
+        None,
+        &rustflags,
+        &wild,
+        "cargo-macho-rlib-consumer",
+        &["cargo_macho_rlib_consumer-"],
+    )?;
+    run_cargo_macho_binary(
+        &target_debug.join("cargo-macho-rlib-consumer"),
+        "rlib consumer linked through Wild",
     )?;
 
     cargo_build_with_wild(
@@ -912,9 +1048,8 @@ fn cargo_build_with_wild(
     // `rust-toolchain.toml` is not enough when this integration test starts from Wild's root.
     // Keep the qualification target explicit: its proof must exercise the user's requested
     // dated nightly rather than whichever Cargo happens to be active for the test harness.
-    let mut command = Command::new("cargo");
-    command.arg("+nightly-2026-07-24")
-        .arg("build")
+    let mut command = cargo_with_toolchain("nightly-2026-07-24")?;
+    command.arg("build")
         .arg("--manifest-path")
         .arg(manifest);
     if let Some(target) = target {
@@ -950,9 +1085,8 @@ fn cargo_test_with_wild(
     package: &str,
     expected_final_outputs: &[&str],
 ) -> Result {
-    let mut command = Command::new("cargo");
+    let mut command = cargo_with_toolchain("nightly-2026-07-24")?;
     command
-        .arg("+nightly-2026-07-24")
         .arg("test")
         .arg("--manifest-path")
         .arg(manifest)
@@ -1112,10 +1246,9 @@ fn run_cargo_macho_staticlib_qualification() -> Result {
         .tempdir_in("/tmp")
         .context("failed to create temporary Cargo staticlib target directory")?;
     let target_dir = target_dir_guard.path();
-    let mut cargo = Command::new("cargo");
+    let mut cargo = cargo_with_toolchain("nightly-2026-07-24")?;
     cargo
         // Cargo selects rustup's toolchain before reading the nested manifest.
-        .arg("+nightly-2026-07-24")
         .arg("build")
         .arg("--manifest-path")
         .arg(&manifest)
@@ -1142,9 +1275,8 @@ fn run_cargo_macho_staticlib_qualification() -> Result {
     // Xcode's nm can lag the LLVM that produced the requested nightly's object members. Use the
     // fixture toolchain's llvm-tools component so this archive-level export check remains coupled
     // to the same dated compiler that created the staticlib.
-    let mut rustc = Command::new("rustc");
+    let mut rustc = rustc_with_toolchain("nightly-2026-07-24")?;
     rustc
-        .arg("+nightly-2026-07-24")
         .arg("--print")
         .arg("target-libdir");
     let target_libdir = rustc

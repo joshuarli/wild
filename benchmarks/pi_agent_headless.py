@@ -2,8 +2,9 @@
 """Repeatable cold and incremental Cargo-link benchmark for ARM64 Mach-O repositories.
 
 This script intentionally uses only Python's standard library. A workload JSON file describes a
-Cargo target, output artifact, controlled source mutation, and comparison thresholds. It compares
-Apple ld64 with Wild while keeping Rust's compiler driver as Xcode Clang in both cases.
+Cargo target, output artifact, controlled source mutation, explicit runtime smoke arguments/output
+expectations, and comparison thresholds. It compares Apple ld64 with Wild while keeping Rust's
+compiler driver as Xcode Clang in both cases.
 "Incremental" means Cargo rebuilds after one controlled source-file change with the same target
 directory. By default it does not claim that Wild implements incremental linking; the explicit
 `--wild-incremental-cache` mode instead measures Wild's separately verified stable-layout cache.
@@ -17,6 +18,7 @@ sample share it. This is a cold-Cargo-target benchmark, not an attempt to flush 
 from __future__ import annotations
 
 import argparse
+import glob
 import hashlib
 import json
 import os
@@ -40,7 +42,9 @@ SCHEMA_VERSION = "cargo-link-build-benchmark/v1"
 MACHO_64_MAGIC = 0xFEEDFACF
 CPU_TYPE_ARM64 = 0x0100000C
 MH_EXECUTE = 2
+MH_DYLIB = 6
 STABLE_LAYOUT_CACHE_HIT_PREFIX = "wild: Mach-O stable-layout cache hit:"
+STABLE_LAYOUT_CACHE_MISS_PREFIX = "wild: Mach-O stable-layout cache miss:"
 
 
 @dataclass(frozen=True)
@@ -60,11 +64,31 @@ class SourceMutation:
 
 
 @dataclass(frozen=True)
+class RuntimeCheck:
+    """The bounded, deterministic process check required for an executable artifact."""
+
+    arguments: tuple[str, ...]
+    expected_exit: int = 0
+    stdout_contains: str | None = None
+    stderr_contains: str | None = None
+    output_mode: str = "contains"
+
+
+@dataclass(frozen=True)
+class ArtifactSpec:
+    """One Cargo output validated by a workload; the first spec is replayed directly."""
+
+    path: str
+    macho_file_type: int
+    runtime: RuntimeCheck | None
+
+
+@dataclass(frozen=True)
 class Workload:
     """Stable benchmark contract supplied by a checked-in JSON workload profile."""
 
     name: str
-    target: str
+    target: str | None
     profile: str
     cargo_arguments: tuple[str, ...]
     artifact: str
@@ -73,15 +97,19 @@ class Workload:
     cold_max: float
     incremental_max: float
     deployment_target: str
+    runtime: RuntimeCheck | None
+    artifacts: tuple[ArtifactSpec, ...] = ()
 
 
 def load_workload(path: Path) -> Workload:
-    """Loads the deliberately small JSON schema used for future repository workloads."""
+    """Load the checked-in workload schema, including multi-output Cargo workspaces."""
     raw = json.loads(path.read_text(encoding="utf-8"))
     if raw.get("schema_version") != "cargo-link-workload/v1":
         raise ValueError(f"Unsupported workload schema in {path}")
     mutation = raw.get("incremental_mutation")
     goals = raw.get("goals")
+    runtime = raw.get("runtime")
+    artifact_entries = raw.get("artifacts")
     if not isinstance(mutation, dict) or not isinstance(goals, dict):
         raise ValueError(f"Workload {path} needs incremental_mutation and goals objects")
     try:
@@ -97,24 +125,108 @@ def load_workload(path: Path) -> Workload:
             )
         else:
             raise ValueError("incremental_mutation must specify append or replace_before/replace_after")
+
+        def parse_runtime(value: Any, *, required: bool) -> RuntimeCheck | None:
+            if value is None:
+                if required:
+                    raise ValueError("executable artifacts require a runtime object")
+                return None
+            if not isinstance(value, dict):
+                raise ValueError("runtime must be an object or null")
+            arguments = value["arguments"]
+            expected_exit = value.get("expected_exit", 0)
+            stdout_contains = value.get("stdout_contains")
+            stderr_contains = value.get("stderr_contains")
+            output_mode = value.get("output", "contains")
+            if output_mode == "exit":
+                if stdout_contains is not None or stderr_contains is not None:
+                    raise ValueError("runtime output=exit cannot specify stdout/stderr expectations")
+            elif output_mode != "contains":
+                raise ValueError("runtime output must be contains or exit")
+            elif stdout_contains is None and stderr_contains is None:
+                raise ValueError(
+                    "runtime output=contains needs stdout_contains or stderr_contains"
+                )
+            if (
+                not isinstance(arguments, list)
+                or any(not isinstance(argument, str) for argument in arguments)
+                or not isinstance(expected_exit, int)
+                or isinstance(expected_exit, bool)
+                or (stdout_contains is not None and not isinstance(stdout_contains, str))
+                or (stderr_contains is not None and not isinstance(stderr_contains, str))
+                or stdout_contains == ""
+                or stderr_contains == ""
+            ):
+                raise ValueError(
+                    "runtime needs string arguments, an integer expected_exit, and valid "
+                    "stdout/stderr expectations"
+                )
+            return RuntimeCheck(
+                arguments=tuple(arguments),
+                expected_exit=expected_exit,
+                stdout_contains=stdout_contains,
+                stderr_contains=stderr_contains,
+                output_mode=output_mode,
+            )
+
+        def parse_artifact(value: Any, *, default_runtime: Any = None) -> ArtifactSpec:
+            if not isinstance(value, dict):
+                raise ValueError("each artifacts entry must be an object")
+            artifact_path = value.get("path", value.get("artifact"))
+            file_type = value.get("macho_file_type")
+            if not isinstance(artifact_path, str) or not artifact_path:
+                raise ValueError("artifact path must be a non-empty string")
+            if not isinstance(file_type, int) or isinstance(file_type, bool):
+                raise ValueError("artifact macho_file_type must be an integer")
+            if file_type not in {MH_EXECUTE, MH_DYLIB}:
+                raise ValueError(f"unsupported ARM64 Mach-O file type {file_type}")
+            value_runtime = value["runtime"] if "runtime" in value else default_runtime
+            return ArtifactSpec(
+                path=artifact_path,
+                macho_file_type=file_type,
+                runtime=parse_runtime(value_runtime, required=file_type == MH_EXECUTE),
+            )
+
+        if artifact_entries is None:
+            artifact_specs = (
+                parse_artifact(
+                    {
+                        "path": raw["artifact"],
+                        "macho_file_type": raw["macho_file_type"],
+                        "runtime": runtime,
+                    }
+                ),
+            )
+            runtime_check = artifact_specs[0].runtime
+        else:
+            if not isinstance(artifact_entries, list) or not artifact_entries:
+                raise ValueError("artifacts must be a non-empty list")
+            artifact_specs = tuple(
+                parse_artifact(entry, default_runtime=runtime if index == 0 else None)
+                for index, entry in enumerate(artifact_entries)
+            )
+            runtime_check = artifact_specs[0].runtime
+        primary = artifact_specs[0]
         workload = Workload(
             name=str(raw["name"]),
-            target=str(raw["target"]),
+            target=(str(raw["target"]) if raw.get("target") is not None else None),
             profile=str(raw["profile"]),
             cargo_arguments=tuple(str(argument) for argument in raw["cargo_arguments"]),
-            artifact=str(raw["artifact"]),
-            macho_file_type=int(raw["macho_file_type"]),
+            artifact=primary.path,
+            macho_file_type=primary.macho_file_type,
             mutation=source_mutation,
             cold_max=float(goals["cold_wild_over_apple_max"]),
             incremental_max=float(goals["incremental_wild_over_apple_max"]),
             deployment_target=str(raw.get("deployment_target", "11.0")),
+            runtime=runtime_check,
+            artifacts=artifact_specs,
         )
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError(f"Invalid workload {path}: {error}") from error
     if not workload.cargo_arguments or not workload.mutation.path:
         raise ValueError(f"Workload {path} has an empty Cargo target or mutation contract")
-    if workload.macho_file_type != MH_EXECUTE:
-        raise ValueError(f"Workload {path} must currently name an MH_EXECUTE artifact")
+    if workload.target == "":
+        raise ValueError(f"Workload {path} has an empty target; omit target for the host")
     return workload
 
 
@@ -168,6 +280,105 @@ def parse_macho_arm64_executable(path: Path, expected_file_type: int = MH_EXECUT
         "cpu_type": f"{cpu_type:#x}",
         "file_type": file_type,
     }
+
+
+def verify_codesign(path: Path) -> dict[str, Any]:
+    """Requires Apple's strict verifier to accept an artifact before it is recorded."""
+    command = ["codesign", "--verify", "--strict", "--verbose=2", str(path)]
+    completed = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+    )
+    evidence = {
+        "command": command,
+        "returncode": completed.returncode,
+        "output": completed.stdout,
+    }
+    if completed.returncode:
+        raise RuntimeError(
+            f"Strict codesign verification failed for {path} (status {completed.returncode}): "
+            f"{completed.stdout.strip()}"
+        )
+    return evidence
+
+
+def runtime_environment(environment: dict[str, str]) -> tuple[dict[str, str], list[str]]:
+    """Returns an explicit child environment with every DYLD_* override removed."""
+    removed = sorted(key for key in environment if key.startswith("DYLD_"))
+    return (
+        {key: value for key, value in environment.items() if not key.startswith("DYLD_")},
+        removed,
+    )
+
+
+def run_runtime_check(
+    path: Path,
+    runtime: RuntimeCheck,
+    *,
+    cwd: Path,
+    environment: dict[str, str],
+) -> dict[str, Any]:
+    """Executes the workload's checked-in smoke command without dynamic-loader overrides."""
+    child_environment, removed_overrides = runtime_environment(environment)
+    command = [str(path), *runtime.arguments]
+    completed = subprocess.run(
+        command,
+        cwd=cwd,
+        env=child_environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    evidence = {
+        "command": command,
+        "cwd": str(cwd),
+        "exit_code": completed.returncode,
+        "expected_exit": runtime.expected_exit,
+        "stdout": completed.stdout,
+        "stderr": completed.stderr,
+        "stdout_contains": runtime.stdout_contains,
+        "stderr_contains": runtime.stderr_contains,
+        "dyld_overrides_removed": removed_overrides,
+    }
+    if completed.returncode != runtime.expected_exit:
+        raise RuntimeError(
+            f"Runtime check failed for {path}: expected exit {runtime.expected_exit}, "
+            f"got {completed.returncode}; stderr={completed.stderr.strip()!r}"
+        )
+    if runtime.stdout_contains is not None and runtime.stdout_contains not in completed.stdout:
+        raise RuntimeError(
+            f"Runtime check failed for {path}: stdout did not contain "
+            f"{runtime.stdout_contains!r}; stdout={completed.stdout!r}"
+        )
+    if runtime.stderr_contains is not None and runtime.stderr_contains not in completed.stderr:
+        raise RuntimeError(
+            f"Runtime check failed for {path}: stderr did not contain "
+            f"{runtime.stderr_contains!r}; stderr={completed.stderr!r}"
+        )
+    return evidence
+
+
+def validate_artifact(
+    path: Path,
+    expected_file_type: int,
+    runtime: RuntimeCheck | None,
+    *,
+    cwd: Path,
+    environment: dict[str, str],
+) -> dict[str, Any]:
+    """Records an artifact only after header, strict signature, and runtime validation."""
+    evidence = parse_macho_arm64_executable(path, expected_file_type)
+    evidence["codesign"] = verify_codesign(path)
+    evidence["runtime"] = (
+        run_runtime_check(path, runtime, cwd=cwd, environment=environment)
+        if runtime is not None
+        else None
+    )
+    return evidence
 
 
 def clean_git_revision(workspace: Path) -> str:
@@ -237,6 +448,9 @@ def with_wild_incremental_cache(environment: dict[str, str], cache_dir: Path) ->
         # interpreting them as compiler options itself.
         + f" -C link-arg=-Wl,-incremental_cache -C link-arg=-Wl,{cache_dir}"
     )
+    # Cache diagnostics are opt-in in Wild. A benchmark result must retain miss reasons alongside
+    # hit evidence so an apparent cache slowdown cannot be mistaken for a fast-path measurement.
+    updated["WILD_MACHO_INCREMENTAL_CACHE_DIAGNOSTICS"] = "1"
     return updated
 
 
@@ -246,12 +460,10 @@ def cargo_command(cargo: Path, channel: str, workload: Workload, *, offline: boo
         f"+{channel}",
         "build",
         "--locked",
-        "--target",
-        workload.target,
-        "--profile",
-        workload.profile,
-        "-vv",
     ]
+    if workload.target is not None:
+        command.extend(["--target", workload.target])
+    command.extend(["--profile", workload.profile, "-vv"])
     command.extend(workload.cargo_arguments)
     if offline:
         command.append("--offline")
@@ -302,7 +514,13 @@ def linker_selection_evidence(log_path: Path, linker: Linker) -> list[str]:
     return evidence
 
 
-def final_link_command(log_path: Path, linker: Linker) -> list[str]:
+def final_link_command(
+    log_path: Path,
+    linker: Linker,
+    *,
+    output: Path | None = None,
+    cargo_artifact: Path | None = None,
+) -> list[str]:
     """Extracts Clang's final ARM64 linker child from a verbose Cargo log.
 
     Cargo's changed-source build produces many Rust compiler invocations. Clang `-v` emits the
@@ -316,6 +534,13 @@ def final_link_command(log_path: Path, linker: Linker) -> list[str]:
             continue
         if "-arch" not in command or "arm64" not in command or "-o" not in command:
             continue
+        command_output = Path(command[command.index("-o") + 1])
+        if output is not None and command_output != output:
+            continue
+        if cargo_artifact is not None and not cargo_final_output_matches(
+            command_output, cargo_artifact
+        ):
+            continue
         executable = Path(command[0])
         expected = linker.path
         if expected is None:
@@ -327,6 +552,26 @@ def final_link_command(log_path: Path, linker: Linker) -> list[str]:
     raise RuntimeError(f"No direct final {linker.name} ARM64 linker command found in {log_path}")
 
 
+def cargo_output_identity(path: Path) -> str:
+    """Normalizes only Cargo/rustc's hexadecimal final-artifact disambiguator."""
+    suffix = path.suffix
+    stem = path.name[: -len(suffix)] if suffix else path.name
+    prefix, separator, disambiguator = stem.rpartition("-")
+    if separator and len(disambiguator) >= 8 and all(
+        character in "0123456789abcdefABCDEF" for character in disambiguator
+    ):
+        return f"{prefix}{suffix}"
+    return path.name
+
+
+def cargo_final_output_matches(command_output: Path, cargo_artifact: Path) -> bool:
+    """Matches Cargo's stable artifact path to the hashed `deps` linker output."""
+    return (
+        command_output.parent in {cargo_artifact.parent, cargo_artifact.parent / "deps"}
+        and cargo_output_identity(command_output) == cargo_output_identity(cargo_artifact)
+    )
+
+
 def replay_incremental_link(
     *,
     command: list[str],
@@ -335,6 +580,8 @@ def replay_incremental_link(
     linker: Linker,
     repetitions: int,
     expected_file_type: int,
+    runtime: RuntimeCheck | None,
+    runtime_cwd: Path,
     fixed_output: Path | None = None,
     prepare_replay: Callable[[], None] | None = None,
     require_stable_layout_cache_hit: bool = False,
@@ -365,7 +612,20 @@ def replay_incremental_link(
         elapsed = time.perf_counter_ns() - start
         if completed.returncode:
             raise RuntimeError(f"{linker.name} incremental replay failed; see {log_path}")
+        artifact = validate_artifact(
+            output,
+            expected_file_type,
+            runtime,
+            cwd=runtime_cwd,
+            environment=environment,
+        )
         cache_hits = stable_layout_cache_hit_evidence(log_path)
+        cache_misses = stable_layout_cache_miss_evidence(log_path)
+        timing_phases = wild_timing_phases(log_path, output)
+        if "--time=json" in replay and not timing_phases:
+            raise RuntimeError(
+                f"Wild --time=json emitted no phase records for {output}; see {log_path}"
+            )
         if require_stable_layout_cache_hit and not cache_hits:
             raise RuntimeError(
                 f"Wild stable-layout cache missed during incremental replay; see {log_path}"
@@ -375,8 +635,10 @@ def replay_incremental_link(
                 "elapsed_ns": elapsed,
                 "log": str(log_path),
                 "command": replay,
-                "artifact": parse_macho_arm64_executable(output, expected_file_type),
+                "artifact": artifact,
                 "stable_layout_cache_hits": cache_hits,
+                "stable_layout_cache_misses": cache_misses,
+                "wild_timing_phases": timing_phases,
             }
         )
     return samples
@@ -389,6 +651,43 @@ def stable_layout_cache_hit_evidence(log_path: Path) -> list[str]:
         for line in log_path.read_text(errors="replace").splitlines()
         if line.strip().startswith(STABLE_LAYOUT_CACHE_HIT_PREFIX)
     ]
+
+
+def stable_layout_cache_miss_evidence(log_path: Path) -> list[str]:
+    """Returns opt-in cache miss diagnostics, retaining the fail-closed reason text."""
+    return [
+        line.strip()
+        for line in log_path.read_text(errors="replace").splitlines()
+        if line.strip().startswith(STABLE_LAYOUT_CACHE_MISS_PREFIX)
+    ]
+
+
+def wild_timing_phases(log_path: Path, output: Path) -> list[dict[str, Any]]:
+    """Extracts complete `--time=json` phase records for one direct replay output."""
+    phases = []
+    for line in log_path.read_text(errors="replace").splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if (
+            event.get("schema_version") != 1
+            or event.get("event") != "phase"
+            or event.get("output") != str(output)
+            or not isinstance(event.get("name"), str)
+            or not isinstance(event.get("wall_time_ns"), int)
+            or isinstance(event["wall_time_ns"], bool)
+            or not isinstance(event.get("counters"), list)
+        ):
+            continue
+        phases.append(
+            {
+                "name": event["name"],
+                "wall_time_ns": event["wall_time_ns"],
+                "counters": event["counters"],
+            }
+        )
+    return phases
 
 
 def restore_cached_direct_baseline(
@@ -450,6 +749,99 @@ def median_ns(samples: list[int]) -> int:
     return int(statistics.median(samples))
 
 
+def resolve_artifact(
+    target_dir: Path,
+    spec: ArtifactSpec,
+    *,
+    target: str,
+    profile: str,
+    expected_output: Path | None = None,
+) -> Path:
+    """Resolve one Cargo output, requiring an unambiguous path or hashed `deps` glob."""
+    candidate = target_dir / spec.path.format(target=target, profile=profile)
+    if expected_output is not None and expected_output.exists():
+        return expected_output
+    if any(character in str(candidate) for character in "*?["):
+        matches = sorted(Path(match) for match in glob.glob(str(candidate)))
+        if len(matches) != 1:
+            raise RuntimeError(
+                f"Expected one artifact matching {candidate}, found {len(matches)}: {matches}"
+            )
+        return matches[0]
+    if not candidate.is_file():
+        raise FileNotFoundError(f"Expected Cargo artifact does not exist: {candidate}")
+    return candidate
+
+
+def workload_artifact_paths(
+    target_dir: Path, workload: Workload, *, primary_output: Path | None = None
+) -> list[Path]:
+    """Resolve every declared output so workspace builds validate all final images."""
+    specs = workload.artifacts or (
+        ArtifactSpec(workload.artifact, workload.macho_file_type, workload.runtime),
+    )
+    return [
+        resolve_artifact(
+            target_dir,
+            spec,
+            target=workload.target or "",
+            profile=workload.profile,
+            expected_output=primary_output if index == 0 else None,
+        )
+        for index, spec in enumerate(specs)
+    ]
+
+
+def validate_workload_artifacts(
+    target_dir: Path,
+    workload: Workload,
+    *,
+    cwd: Path,
+    environment: dict[str, str],
+    primary_output: Path | None = None,
+) -> list[dict[str, Any]]:
+    """Validate every declared Cargo artifact and return evidence in manifest order."""
+    specs = workload.artifacts or (
+        ArtifactSpec(workload.artifact, workload.macho_file_type, workload.runtime),
+    )
+    evidence = []
+    for spec, artifact_path in zip(
+        specs,
+        workload_artifact_paths(target_dir, workload, primary_output=primary_output),
+    ):
+        evidence.append(
+            validate_artifact(
+                artifact_path,
+                spec.macho_file_type,
+                spec.runtime,
+                cwd=cwd,
+                environment=environment,
+            )
+        )
+    return evidence
+
+
+def primary_artifact_path(
+    target_dir: Path, workload: Workload, log_path: Path, linker: Linker
+) -> Path:
+    """Use Clang's final `-o` for hashed outputs that Cargo may retain across rebuilds."""
+    specs = workload.artifacts or (
+        ArtifactSpec(workload.artifact, workload.macho_file_type, workload.runtime),
+    )
+    spec = specs[0]
+    if any(character in spec.path for character in "*?["):
+        command = final_link_command(log_path, linker)
+        return Path(command[command.index("-o") + 1])
+    artifact = resolve_artifact(
+        target_dir,
+        spec,
+        target=workload.target or "",
+        profile=workload.profile,
+    )
+    command = final_link_command(log_path, linker, cargo_artifact=artifact)
+    return Path(command[command.index("-o") + 1])
+
+
 def run_sample(
     *,
     source: Path,
@@ -495,13 +887,20 @@ def run_sample(
         _, cold_elapsed = run_cargo_build(
             command, workspace=workspace, environment=environment, target_dir=target_dir, log_path=cold_log
         )
-        artifact_path = target_dir / workload.artifact.format(
-            target=workload.target, profile=workload.profile
+        cold_primary_output = primary_artifact_path(target_dir, workload, cold_log, linker)
+        cold_artifacts = validate_workload_artifacts(
+            target_dir,
+            workload,
+            cwd=workspace,
+            environment=environment,
+            primary_output=cold_primary_output,
         )
-        cold_artifact = parse_macho_arm64_executable(artifact_path, workload.macho_file_type)
+        cold_artifact = cold_artifacts[0]
         cold_evidence = linker_selection_evidence(cold_log, linker)
 
         cache_setup_log: Path | None = None
+        cache_setup_hits: list[str] = []
+        cache_setup_misses: list[str] = []
         incremental_target_dir = target_dir
         incremental_environment = environment
         if cache_setup_target is not None:
@@ -516,6 +915,8 @@ def run_sample(
                 target_dir=cache_setup_target,
                 log_path=cache_setup_log,
             )
+            cache_setup_hits = stable_layout_cache_hit_evidence(cache_setup_log)
+            cache_setup_misses = stable_layout_cache_miss_evidence(cache_setup_log)
             incremental_target_dir = cache_setup_target
             incremental_environment = cache_environment
 
@@ -528,14 +929,20 @@ def run_sample(
             target_dir=incremental_target_dir,
             log_path=incremental_log,
         )
-        incremental_artifact_path = incremental_target_dir / workload.artifact.format(
-            target=workload.target, profile=workload.profile
+        incremental_primary_output = primary_artifact_path(
+            incremental_target_dir, workload, incremental_log, linker
         )
-        incremental_artifact = parse_macho_arm64_executable(
-            incremental_artifact_path, workload.macho_file_type
+        incremental_artifacts = validate_workload_artifacts(
+            incremental_target_dir,
+            workload,
+            cwd=workspace,
+            environment=incremental_environment,
+            primary_output=incremental_primary_output,
         )
+        incremental_artifact = incremental_artifacts[0]
         incremental_evidence = linker_selection_evidence(incremental_log, linker)
         incremental_cache_hits = stable_layout_cache_hit_evidence(incremental_log)
+        incremental_cache_misses = stable_layout_cache_miss_evidence(incremental_log)
         if cache_enabled and not incremental_cache_hits:
             raise RuntimeError(
                 f"Wild stable-layout cache missed during Cargo incremental build; see {incremental_log}"
@@ -560,12 +967,18 @@ def run_sample(
                 log_path=capture_log,
             )
             incremental_link = replay_incremental_link(
-                command=final_link_command(capture_log, linker),
+                command=final_link_command(
+                    capture_log,
+                    linker,
+                    output=primary_artifact_path(capture_target, workload, capture_log, linker),
+                ),
                 environment=capture_environment,
                 output_dir=logs_dir / f"{linker.name}-{sample_index}-incremental-link",
                 linker=linker,
                 repetitions=link_repetitions,
                 expected_file_type=workload.macho_file_type,
+                runtime=workload.runtime,
+                runtime_cwd=workspace,
             )
             incremental_link_capture: dict[str, Any] = {
                 "capture_log": str(capture_log),
@@ -593,7 +1006,11 @@ def run_sample(
                 target_dir=direct_target,
                 log_path=baseline_log,
             )
-            baseline_command = final_link_command(baseline_log, linker)
+            baseline_command = final_link_command(
+                baseline_log,
+                linker,
+                output=primary_artifact_path(direct_target, workload, baseline_log, linker),
+            )
             baseline_output = Path(baseline_command[baseline_command.index("-o") + 1])
             baseline_output_snapshot = logs_dir / f"{linker.name}-{sample_index}-cache-baseline-output"
             shutil.copy2(baseline_output, baseline_output_snapshot)
@@ -610,8 +1027,19 @@ def run_sample(
                 target_dir=direct_target,
                 log_path=capture_log,
             )
-            changed_command = final_link_command(capture_log, linker)
+            changed_command = final_link_command(
+                capture_log,
+                linker,
+                output=primary_artifact_path(direct_target, workload, capture_log, linker),
+            )
             changed_output = Path(changed_command[changed_command.index("-o") + 1])
+            capture_artifact = validate_artifact(
+                changed_output,
+                workload.macho_file_type,
+                workload.runtime,
+                cwd=workspace,
+                environment=capture_environment,
+            )
             capture_hits = stable_layout_cache_hit_evidence(capture_log)
             if not capture_hits:
                 raise RuntimeError(
@@ -624,6 +1052,8 @@ def run_sample(
                 linker=linker,
                 repetitions=link_repetitions,
                 expected_file_type=workload.macho_file_type,
+                runtime=workload.runtime,
+                runtime_cwd=workspace,
                 fixed_output=changed_output,
                 prepare_replay=lambda: restore_cached_direct_baseline(
                     baseline_output=baseline_output,
@@ -646,7 +1076,11 @@ def run_sample(
                     "baseline_output": str(baseline_output),
                     "changed_output": str(changed_output),
                     "baseline_sidecars": str(cache_snapshot),
+                    "baseline_hits": stable_layout_cache_hit_evidence(baseline_log),
+                    "baseline_misses": stable_layout_cache_miss_evidence(baseline_log),
                     "capture_hits": capture_hits,
+                    "capture_misses": stable_layout_cache_miss_evidence(capture_log),
+                    "capture_artifact": capture_artifact,
                     "direct_samples_require_hits": True,
                 },
                 "samples": incremental_link,
@@ -661,12 +1095,16 @@ def run_sample(
                 "log": str(cold_log),
                 "selection_evidence": cold_evidence,
                 "artifact": cold_artifact,
+                "artifacts": cold_artifacts,
             },
             "incremental": {
                 "elapsed_ns": incremental_elapsed,
                 "log": str(incremental_log),
                 "selection_evidence": incremental_evidence,
                 "stable_layout_cache_hits": incremental_cache_hits,
+                "stable_layout_cache_misses": incremental_cache_misses,
+                "cache_setup_hits": cache_setup_hits,
+                "cache_setup_misses": cache_setup_misses,
                 "cache_setup_log": str(cache_setup_log) if cache_setup_log is not None else None,
                 "mutation": {
                     "path": str(mutation_path.relative_to(workspace)),
@@ -675,6 +1113,7 @@ def run_sample(
                     "restored_sha256": restored_hash,
                 },
                 "artifact": incremental_artifact,
+                "artifacts": incremental_artifacts,
             },
             "incremental_link": incremental_link_capture,
         }
@@ -719,12 +1158,39 @@ def comparison(runs: list[dict[str, Any]], workload: Workload) -> dict[str, Any]
     incremental_link_ratio = (
         medians["wild"]["incremental_link"] / medians["apple-ld64"]["incremental_link"]
     )
+    cache_hits: list[str] = []
+    cache_misses: list[str] = []
+    for run in runs:
+        incremental = run.get("incremental", {})
+        cache_hits.extend(incremental.get("stable_layout_cache_hits", []))
+        cache_misses.extend(incremental.get("stable_layout_cache_misses", []))
+        cache_hits.extend(incremental.get("cache_setup_hits", []))
+        cache_misses.extend(incremental.get("cache_setup_misses", []))
+        for sample in run.get("incremental_link", {}).get("samples", []):
+            cache_hits.extend(sample.get("stable_layout_cache_hits", []))
+            cache_misses.extend(sample.get("stable_layout_cache_misses", []))
+        cache_details = run.get("incremental_link", {}).get("cache", {})
+        cache_hits.extend(cache_details.get("baseline_hits", []))
+        cache_misses.extend(cache_details.get("baseline_misses", []))
+        cache_hits.extend(cache_details.get("capture_hits", []))
+        cache_misses.extend(cache_details.get("capture_misses", []))
+    cache_events = len(cache_hits) + len(cache_misses)
+    miss_reasons = {}
+    for miss in cache_misses:
+        reason = miss.removeprefix(STABLE_LAYOUT_CACHE_MISS_PREFIX).strip()
+        miss_reasons[reason] = miss_reasons.get(reason, 0) + 1
     return {
         "medians_ns": medians,
         "cold_wild_over_apple": cold_ratio,
         "incremental_cargo_wild_over_apple": cargo_incremental_ratio,
         "incremental_link_wild_over_apple": incremental_link_ratio,
         "thresholds": {"cold_max": workload.cold_max, "incremental_max": workload.incremental_max},
+        "cache": {
+            "hit_count": len(cache_hits),
+            "miss_count": len(cache_misses),
+            "hit_rate": len(cache_hits) / cache_events if cache_events else None,
+            "miss_reasons": miss_reasons,
+        },
         "goals_met": cold_ratio <= workload.cold_max
         and incremental_link_ratio <= workload.incremental_max,
     }
@@ -759,7 +1225,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--wild-timing-json",
         action="store_true",
-        help="Pass Wild --time=json and retain phase records in Wild Cargo logs",
+        help="Pass Wild --time=json and retain direct replay phase records in the result JSON",
     )
     parser.add_argument(
         "--wild-incremental-cache",
@@ -857,6 +1323,17 @@ def main(argv: list[str]) -> int:
                 "cargo_arguments": list(workload.cargo_arguments),
                 "artifact": workload.artifact,
                 "profile": workload.profile,
+                "artifacts": [
+                    {
+                        "path": spec.path,
+                        "macho_file_type": spec.macho_file_type,
+                        "runtime": asdict(spec.runtime) if spec.runtime is not None else None,
+                    }
+                    for spec in (
+                        workload.artifacts
+                        or (ArtifactSpec(workload.artifact, workload.macho_file_type, workload.runtime),)
+                    )
+                ],
             },
             "toolchain": {
                 "channel": channel,
@@ -877,6 +1354,7 @@ def main(argv: list[str]) -> int:
                     if wild_incremental_cache_root is not None
                     else None
                 ),
+                "wild_incremental_cache_diagnostics": wild_incremental_cache_root is not None,
                 "result_artifacts": str(result_root),
             },
             "runs": runs,

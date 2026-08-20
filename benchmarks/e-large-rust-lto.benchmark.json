@@ -1,12 +1,11 @@
 {
   "schema_version": "cargo-link-workload/v1",
-  "name": "e",
+  "name": "e-large-rust-lto",
   "target": "aarch64-apple-darwin",
   "profile": "release",
   "cargo_arguments": ["--bin", "e"],
   "artifact": "{target}/{profile}/e",
   "macho_file_type": 2,
-  "deployment_target": "11.0",
   "incremental_mutation": {
     "path": "src/main.rs",
     "replace_before": "size > 5_000_000",

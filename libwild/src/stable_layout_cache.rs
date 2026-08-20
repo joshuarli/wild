@@ -297,6 +297,19 @@ fn cache_miss(reason: &str) -> bool {
 /// caller will run the normal linker, which is both the correctness fallback and cache recovery
 /// path for interrupted writers or manually deleted cache data.
 pub(crate) fn try_apply(args: &MachOArgs) -> bool {
+    let hit = try_apply_inner(args);
+    if !hit {
+        // A normal link is the recovery path for every cache miss. Do not leave a previous
+        // image/state pair available for that link's next invocation: if staging the new
+        // baseline fails, retaining the old pair would let a later changed-object invocation
+        // patch an output from a different layout lineage. Removing only these exact sidecars
+        // is fail-closed and keeps the ordinary link authoritative.
+        discard_cache_sidecars(args);
+    }
+    hit
+}
+
+fn try_apply_inner(args: &MachOArgs) -> bool {
     let Some(cache_dir) = args.incremental_cache.as_deref() else {
         return false;
     };
@@ -344,6 +357,21 @@ pub(crate) fn try_apply(args: &MachOArgs) -> bool {
         || state.inputs.len() != manifest.input_count
     {
         return cache_miss("image state does not match the structural manifest");
+    }
+    // Cargo normally leaves the previous hash-bearing output in place until the linker replaces
+    // it. When it is present, it is the strongest available proof that this sidecar belongs to
+    // the current output lineage. A cache image can be internally self-consistent yet come from
+    // another output layout (for example, a stale save-temps replay); never patch over such an
+    // output. Cargo may retire the path before invoking the linker, so absence remains a valid
+    // cache candidate and the cache-owned image is verified below.
+    if let Some(matches) = existing_output_matches_baseline(
+        args.output(),
+        state.output_len,
+        &state.output_digest,
+    ) {
+        if !matches {
+            return cache_miss("current output does not match the cached baseline lineage");
+        }
     }
 
     let current_inputs = {
@@ -511,6 +539,41 @@ pub(crate) fn try_apply(args: &MachOArgs) -> bool {
         args.output().display()
     );
     true
+}
+
+fn existing_output_matches_baseline(
+    path: &Path,
+    output_len: u64,
+    output_digest: &[u8; HASH_SIZE],
+) -> Option<bool> {
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        // Cargo can retire the old hash-bearing output before invoking the linker. That is the
+        // one absence the owned baseline image is designed to cover; every other I/O error is an
+        // unverifiable existing lineage and must fall back to a normal link.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(_) => return Some(false),
+    };
+    if bytes.len() as u64 != output_len {
+        return Some(false);
+    }
+    Some(blake3::hash(&bytes).as_bytes() == output_digest)
+}
+
+fn discard_cache_sidecars(args: &MachOArgs) {
+    let Some(cache_dir) = args.incremental_cache.as_deref() else {
+        return;
+    };
+    for path in [
+        cache_path(cache_dir, args),
+        cache_image_path(cache_dir, args),
+        cache_state_path(cache_dir, args),
+        staged_cache_path(cache_dir, args),
+        staged_cache_image_path(cache_dir, args),
+        staged_cache_state_path(cache_dir, args),
+    ] {
+        let _ = fs::remove_file(path);
+    }
 }
 
 /// Persists a new baseline after a normal link. A failure is intentionally invisible to linking:
@@ -2174,6 +2237,7 @@ mod tests {
     use super::apply_patches;
     use super::cache_is_eligible;
     use super::cache_hit_input_path;
+    use super::existing_output_matches_baseline;
     #[cfg(target_os = "macos")]
     use super::clone_file;
     use super::input_digests;
@@ -2311,6 +2375,49 @@ mod tests {
 
         args.export_list_path = Some("/tmp/wild-stable-layout-cache-exports".into());
         assert!(!cache_is_eligible(&args));
+    }
+
+    #[test]
+    fn existing_output_lineage_mismatch_is_rejected() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "wild-stable-layout-cache-output-{unique}-{}",
+            std::process::id()
+        ));
+        let baseline = b"baseline";
+        std::fs::write(&path, baseline).unwrap();
+        let digest = *blake3::hash(baseline).as_bytes();
+
+        assert_eq!(
+            existing_output_matches_baseline(&path, baseline.len() as u64, &digest),
+            Some(true),
+        );
+        assert_eq!(
+            existing_output_matches_baseline(&path, baseline.len() as u64 - 1, &digest),
+            Some(false),
+        );
+        assert_eq!(
+            existing_output_matches_baseline(&path, baseline.len() as u64, &[0; 32]),
+            Some(false),
+        );
+
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            existing_output_matches_baseline(&path, baseline.len() as u64, &digest),
+            None,
+        );
+
+        // Cargo may retire the old output before a relink, but an existing path that cannot be
+        // read is not equivalent to that allowed absence: it cannot prove this cache lineage.
+        std::fs::create_dir(&path).unwrap();
+        assert_eq!(
+            existing_output_matches_baseline(&path, baseline.len() as u64, &digest),
+            Some(false),
+        );
+        std::fs::remove_dir(&path).unwrap();
     }
 
     #[cfg(target_os = "macos")]

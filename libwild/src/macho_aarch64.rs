@@ -162,10 +162,22 @@ impl crate::platform::Arch for MachOAArch64 {
     ) -> crate::error::Result<RelocationKindInfo> {
         let (kind, size, mask, range, alignment) = match rel.r_type {
             object::macho::ARM64_RELOC_UNSIGNED => {
-                validate_standalone_relocation(rel, "ARM64_RELOC_UNSIGNED", false, 3)?;
+                ensure!(
+                    rel.r_extern,
+                    "ARM64_RELOC_UNSIGNED requires an external-symbol relocation; section relocations are not represented by the Mach-O writer"
+                );
+                ensure!(
+                    !rel.r_pcrel,
+                    "ARM64_RELOC_UNSIGNED requires r_pcrel=0, got 1"
+                );
+                ensure!(
+                    matches!(rel.r_length, 2 | 3),
+                    "ARM64_RELOC_UNSIGNED requires r_length=2 or 3, got {}",
+                    rel.r_length
+                );
                 (
                     RelocationKind::Absolute,
-                    RelocationSize::ByteSize(8),
+                    RelocationSize::ByteSize(if rel.r_length == 2 { 4 } else { 8 }),
                     None,
                     AllowedRange::no_check(),
                     1,
@@ -452,6 +464,27 @@ mod tests {
         .unwrap();
         assert_eq!(absolute.kind, RelocationKind::Got);
         assert_eq!(absolute.size, RelocationSize::ByteSize(8));
+    }
+
+    #[test]
+    fn unsigned_absolute_relocations_accept_pointer_and_32_bit_storage() {
+        let word = MachOAArch64::relocation_from_raw(relocation(
+            object::macho::ARM64_RELOC_UNSIGNED,
+            false,
+            2,
+        ))
+        .unwrap();
+        assert_eq!(word.kind, RelocationKind::Absolute);
+        assert_eq!(word.size, RelocationSize::ByteSize(4));
+
+        let pointer = MachOAArch64::relocation_from_raw(relocation(
+            object::macho::ARM64_RELOC_UNSIGNED,
+            false,
+            3,
+        ))
+        .unwrap();
+        assert_eq!(pointer.kind, RelocationKind::Absolute);
+        assert_eq!(pointer.size, RelocationSize::ByteSize(8));
     }
 
     #[test]

@@ -4,6 +4,8 @@ members = [
     "dylib-producer",
     "macro-consumer",
     "macro-producer",
+    "rlib-consumer",
+    "rlib-producer",
 ]
 resolver = "2"
 
