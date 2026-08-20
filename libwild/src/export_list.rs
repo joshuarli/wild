@@ -191,4 +191,16 @@ mod tests {
         assert!(export_list.contains(&UnversionedSymbolName::prehashed(b"_$s4test3bar")));
         assert!(!export_list.contains(&UnversionedSymbolName::prehashed(b"_private")));
     }
+
+    #[test]
+    fn malformed_macho_symbol_list_reports_its_input_line() {
+        let error = ExportList::parse_macho(ScriptData {
+            raw: b"_valid\n\xff\n",
+        })
+        .expect_err("Mach-O export-list symbols must be UTF-8");
+
+        assert!(error
+            .to_string()
+            .contains("Invalid UTF-8 in Mach-O exported symbol list on line 2"));
+    }
 }
