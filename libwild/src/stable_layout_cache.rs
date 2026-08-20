@@ -22,6 +22,7 @@ use crate::platform::ObjectFile as _;
 use crate::resolution::SectionSlot;
 use crate::timing_phase;
 use object::macho::LC_UUID;
+use rayon::prelude::*;
 use std::collections::BTreeMap;
 #[cfg(target_os = "macos")]
 use std::ffi::CString;
@@ -966,10 +967,11 @@ fn input_digests_for_cache_hit(
     cache_approved_rustc_temporary_archives: &[u32],
 ) -> Option<Vec<InputDigest>> {
     (args.common().inputs.len() == cached_inputs.len()).then_some(())?;
-    args.common()
+    let input_digests = args
+        .common()
         .inputs
-        .iter()
-        .zip(cached_inputs)
+        .par_iter()
+        .zip(cached_inputs.par_iter())
         .enumerate()
         .map(|(index, (input, cached))| {
             let path = cache_hit_input_path(args, input, cached)?;
@@ -996,7 +998,8 @@ fn input_digests_for_cache_hit(
             }
             None
         })
-        .collect()
+        .collect::<Vec<_>>();
+    input_digests.into_iter().collect()
 }
 
 /// Finds precisely the Rustc-owned archive paths whose temporary-directory spelling is not
