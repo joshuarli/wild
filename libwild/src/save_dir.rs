@@ -638,6 +638,7 @@ fn shell_escape_string(value: &'_ str) -> Cow<'_, str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::platform::Args as _;
 
     fn test_make_relative_path(target: &Path, directory: &Path) {
         let relative = make_relative_path(target, directory).unwrap();
@@ -682,5 +683,38 @@ mod tests {
             test_make_relative_path(&a, &b);
             test_make_relative_path(&b, &a);
         }
+    }
+
+    #[test]
+    fn macho_export_list_is_copied_and_rewritten_for_replay() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let exported_symbols_list = temp_dir.path().join("rustc-generated/list");
+        std::fs::create_dir_all(exported_symbols_list.parent().unwrap()).unwrap();
+        std::fs::write(&exported_symbols_list, "_rust_cdylib_answer\n").unwrap();
+
+        let save_dir = temp_dir.path().join("save");
+        std::fs::create_dir(&save_dir).unwrap();
+        let option = format!("-exported_symbols_list={}", exported_symbols_list.display());
+        let mut args = crate::args::macho::MachOArgs::default();
+        args.common.save_dir = SaveDir(Some(SaveDirState::new(
+            save_dir,
+            vec![option.clone()],
+        )));
+
+        args.parse([option.as_str()].iter()).unwrap();
+
+        let state = args.common.save_dir.0.as_ref().unwrap();
+        let files_to_copy = state.files_to_copy.clone();
+        state.finish(files_to_copy.iter(), &args).unwrap();
+
+        let copied_path = state.output_path(&std::path::absolute(&exported_symbols_list).unwrap());
+        assert_eq!(std::fs::read_to_string(&copied_path).unwrap(), "_rust_cdylib_answer\n");
+
+        let run_with = std::fs::read_to_string(state.dir.join("run-with")).unwrap();
+        assert!(run_with.contains("-exported_symbols_list"));
+        assert!(run_with.contains(&format!(
+            "$D/{}",
+            to_output_relative_path(&std::path::absolute(&exported_symbols_list).unwrap()).display()
+        )));
     }
 }

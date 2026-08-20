@@ -467,6 +467,7 @@ fn setup_argument_parser() -> ArgumentParser<MachOArgs> {
         .help("Read the exported symbol list from a file")
         .execute(|args, _modifier_stack, value| {
             ensure!(!value.is_empty(), "-exported_symbols_list requires a filename");
+            args.common_mut().save_dir.handle_file(value);
             args.export_list_path = Some(PathBuf::from(value));
             Ok(())
         });

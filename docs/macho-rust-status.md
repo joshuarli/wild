@@ -111,7 +111,7 @@ passed wherever Wild is listed as failing.
 | --- | --- | --- |
 | Rust/C `Security` framework | links and runs | retain as a permanent integration fixture |
 | C local and dylib TLS | `macho/tls-dynamic` passes an imported descriptor two-thread independence smoke under `-dead_strip` and PIE/ASLR | broaden TLS/dylib coverage |
-| Rust `cdylib` consumed from C | retained Cargo workspace links and runs through Wild; the existing integration harness cannot replay rustc's generated export-list file | fix save-dir retention of `-exported_symbols_list`, then add a permanent C consumer |
+| Rust `cdylib` consumed from C | permanent `macho/rust-cdylib-consumer` replays rustc's `cdylib` link through Wild, exports a C ABI function, and runs from a C consumer | broaden Rust dylib/export and mixed-language coverage |
 | Rust `dylib` consumed from Rust | retained Cargo workspace links and runs through Wild | add Cargo crate-graph coverage outside the one-source integration harness |
 | Proc macro crate | retained Cargo workspace compiles, loads, and runs through Wild | add Cargo crate-graph coverage outside the one-source integration harness |
 | Rust `thread_local!` / `cargo test` | permanent `macho/rust-thread-local` two-thread fixture and default `cargo test` pass through Wild | exercise static/dylib TLS matrix |
@@ -180,17 +180,11 @@ it does not fall back to Apple ld.
 `wild/tests/integration_tests.rs` can compile a standalone `.rs` primary source, and its `Shared`
 input can invoke rustc with `--crate-type cdylib`. The permanent `macho/rust-thread-local` fixture
 uses the first path and verifies independent Rust TLS values in the parent and child threads.
-
-The `Shared` cdylib path is not yet a passing fixture: rustc's save-dir replay contains an
-`-exported_symbols_list` file under a generated `rustcwsAsIT` path, but Wild does not copy that
-file into the save directory. The exact current failure is:
-
-```text
-ld: -exported_symbols_list file '.../rustcwsAsIT/list' could not be opened, errno=2
-```
-
-The smallest implementation prerequisite for a permanent Rust cdylib/C consumer fixture is to
-retain that option's file in the save-dir input set; do not add a permanently failing fixture.
+`macho/rust-cdylib-consumer` uses the second path: its Rust producer's generated
+`-exported_symbols_list` is copied into `WILD_SAVE_DIR` and rewritten in `run-with`, so the replay
+links a cdylib through Wild and a C executable imports and calls `rust_cdylib_answer` at runtime.
+The save-dir registration is ordinary path-valued option handling, not a cdylib special case; the
+unit regression also covers the attached `-exported_symbols_list=path` spelling.
 
 Cargo Rust `dylib` consumption and proc-macro loading require multiple packages and distinct
 rustc invocations (producer, consumer, and proc-macro host). They therefore do not fit the
@@ -259,8 +253,9 @@ relaxation APIs; none removes the known correctness gaps listed above.
   with Wild rather than forcing lld, then executes the consumer successfully.
 * Mach-O `__cstring` now reuses the generic merge map correctly: symbol values use a
   section-relative input offset, merged bytes are emitted before code-signature hashing, and
-  Mach-O symtab entries retain the correct output section. This fixed an integration regression
-  exposed by enabling C-string merging.
+  Mach-O symtab entries retain the correct output section. `macho/cstring-merging` proves equal
+  literals from separate objects resolve to one address at runtime under `-dead_strip`. This fixed
+  an integration regression exposed by enabling C-string merging.
 * AArch64 relocation validation now rejects malformed standalone encodings deterministically,
   supports both `ARM64_RELOC_POINTER_TO_GOT` representations, local executable TLVP descriptors,
   dylib-imported TLVP descriptor pointers, and paired `ADDEND` forms. A dynamic TLVP is recorded
