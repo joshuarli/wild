@@ -492,7 +492,12 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
     {
         timing_phase!("Mach-O stable-layout cache: patch and sign");
         if !apply_patches_from_iter(output.bytes_mut(), current_object, object.patches())
-            || !refresh_uuid_and_signature(output.bytes_mut(), &manifest.signature, args)
+            || !refresh_uuid_and_signature(
+                output.bytes_mut(),
+                &manifest.signature,
+                args,
+                object.patches(),
+            )
         {
             output.discard();
             return cache_miss("patch mapping or signature refresh is not valid");
@@ -1504,6 +1509,7 @@ fn refresh_uuid_and_signature(
     output: &mut [u8],
     signature: &SignatureInfo,
     args: &MachOArgs,
+    changed_patches: impl Iterator<Item = PatchRange>,
 ) -> bool {
     let Some(code_limit) = usize::try_from(signature.code_limit).ok() else {
         return false;
@@ -1535,6 +1541,7 @@ fn refresh_uuid_and_signature(
     if code_limit > output.len()
         || hashes_end > output.len()
         || uuid_end > output.len()
+        || uuid_end > code_limit
         || identifier_end != hashes_offset
     {
         return false;
@@ -1556,29 +1563,101 @@ fn refresh_uuid_and_signature(
     // The normal writer hashes an LC_UUID command that still contains its initial zero bytes;
     // clear the previous UUID as well as the code hashes so the replacement is byte-identical
     // to a normal link of the same changed inputs.
+    // Every cache-owned baseline image is content-addressed before use, so these are the valid
+    // hash slots for all code pages before this one-object patch. Keep them while zeroing the
+    // slots for the UUID's whole-output hash, then recompute only pages changed by the patch and
+    // the UUID itself. This preserves byte-for-byte normal-link signing without rehashing static
+    // Rust archive pages on every cache hit.
+    let previous_hashes = output[hashes_offset..hashes_end].to_vec();
     output[hashes_offset..hashes_end].fill(0);
     output[uuid_offset..uuid_end].fill(0);
     let hash = blake3::hash(output);
     output[uuid_offset..uuid_end].copy_from_slice(&hash.as_bytes()[..16]);
     output[uuid_offset + 6] = (output[uuid_offset + 6] & 0x0f) | 0x30;
     output[uuid_offset + 8] = (output[uuid_offset + 8] & 0x3f) | 0x80;
+    output[hashes_offset..hashes_end].copy_from_slice(&previous_hashes);
 
-    let calculated_hashes = output[..code_limit]
-        .chunks(macho::CS_BLOCK_SIZE)
-        .map(<sha2::Sha256 as sha2::Digest>::digest)
-        .collect::<Vec<_>>();
-    let mut cursor = hashes_offset;
-    for digest in calculated_hashes {
-        let Some(next) = cursor.checked_add(digest.len()) else {
-            return false;
-        };
-        let Some(destination) = output.get_mut(cursor..next) else {
-            return false;
-        };
-        destination.copy_from_slice(&digest);
-        cursor = next;
+    refresh_changed_code_signature_hashes(
+        output,
+        code_limit,
+        hashes_offset,
+        usize::try_from(signature.hash_count).unwrap_or(usize::MAX),
+        uuid_offset,
+        changed_patches,
+    )
+}
+
+/// Rehashes the CodeDirectory pages changed by a cache patch and the page containing its fresh
+/// UUID. All remaining slots were validated as part of the cache-owned baseline image and remain
+/// valid because no cache patch is allowed to extend outside signed output bytes.
+fn refresh_changed_code_signature_hashes(
+    output: &mut [u8],
+    code_limit: usize,
+    hashes_offset: usize,
+    hash_count: usize,
+    uuid_offset: usize,
+    changed_patches: impl Iterator<Item = PatchRange>,
+) -> bool {
+    if hash_count != code_limit.div_ceil(macho::CS_BLOCK_SIZE) || uuid_offset >= code_limit {
+        return false;
     }
-    cursor == hashes_end
+    let hash_size = usize::from(macho::CS_HASH_SIZE);
+    let Some(hashes_len) = hash_count.checked_mul(hash_size) else {
+        return false;
+    };
+    let Some(hashes_end) = hashes_offset.checked_add(hashes_len) else {
+        return false;
+    };
+    if hashes_end > output.len() {
+        return false;
+    }
+
+    let mut changed_pages = vec![false; hash_count];
+    changed_pages[uuid_offset / macho::CS_BLOCK_SIZE] = true;
+    for patch in changed_patches {
+        let Some(start) = usize::try_from(patch.output_offset).ok() else {
+            return false;
+        };
+        let Some(len) = usize::try_from(patch.len).ok() else {
+            return false;
+        };
+        let Some(end) = start.checked_add(len) else {
+            return false;
+        };
+        if len == 0 || end > code_limit {
+            return false;
+        }
+        let first_page = start / macho::CS_BLOCK_SIZE;
+        let last_page = (end - 1) / macho::CS_BLOCK_SIZE;
+        for page in first_page..=last_page {
+            changed_pages[page] = true;
+        }
+    }
+
+    for (page, changed) in changed_pages.into_iter().enumerate() {
+        if !changed {
+            continue;
+        }
+        let Some(page_start) = page.checked_mul(macho::CS_BLOCK_SIZE) else {
+            return false;
+        };
+        let page_end = page_start.saturating_add(macho::CS_BLOCK_SIZE).min(code_limit);
+        let digest = <sha2::Sha256 as sha2::Digest>::digest(&output[page_start..page_end]);
+        let Some(slot_start) = page
+            .checked_mul(hash_size)
+            .and_then(|offset| hashes_offset.checked_add(offset))
+        else {
+            return false;
+        };
+        let Some(slot_end) = slot_start.checked_add(hash_size) else {
+            return false;
+        };
+        let Some(slot) = output.get_mut(slot_start..slot_end) else {
+            return false;
+        };
+        slot.copy_from_slice(&digest);
+    }
+    true
 }
 
 fn write_output_atomic(path: &Path, output: &[u8]) -> std::io::Result<()> {
@@ -2303,12 +2382,14 @@ mod tests {
     use super::input_metadata_snapshots_match;
     use super::masked_digest;
     use super::protected_ranges_match;
+    use super::refresh_changed_code_signature_hashes;
     use super::stable_output_basename;
     use super::arguments_digest;
     use crate::args::Input;
     use crate::args::InputSpec;
     use crate::args::Modifiers;
     use crate::args::macho::MachOArgs;
+    use crate::macho;
     use std::sync::Arc;
     use std::time::SystemTime;
     use std::mem::size_of;
@@ -2653,6 +2734,62 @@ mod tests {
         assert_eq!(
             masked_digest(b"abcdef", &patches),
             masked_digest(b"abcdef", &different_output_layout)
+        );
+    }
+
+    #[test]
+    fn cache_signature_rehashes_changed_pages_and_the_uuid_page() {
+        let code_limit = 3 * macho::CS_BLOCK_SIZE + 17;
+        let hash_count = code_limit.div_ceil(macho::CS_BLOCK_SIZE);
+        let hash_size = usize::from(macho::CS_HASH_SIZE);
+        let hashes_offset = code_limit + 64;
+        let uuid_offset = 12;
+        let mut output = (0..hashes_offset + hash_count * hash_size)
+            .map(|index| (index % 251) as u8)
+            .collect::<Vec<_>>();
+        let baseline_hashes = output[..code_limit]
+            .chunks(macho::CS_BLOCK_SIZE)
+            .map(<sha2::Sha256 as sha2::Digest>::digest)
+            .collect::<Vec<_>>();
+        for (index, digest) in baseline_hashes.into_iter().enumerate() {
+            let start = hashes_offset + index * hash_size;
+            output[start..start + hash_size].copy_from_slice(&digest);
+        }
+
+        // Page zero changes whenever a cache hit writes its new UUID. The two patch ranges cover
+        // the remaining changed pages; untouched hash slots must stay valid from the baseline.
+        output[uuid_offset] ^= 1;
+        output[macho::CS_BLOCK_SIZE + 3] ^= 1;
+        output[3 * macho::CS_BLOCK_SIZE + 7] ^= 1;
+        let patches = [
+            PatchRange {
+                input_offset: 0,
+                output_offset: (macho::CS_BLOCK_SIZE + 3) as u64,
+                len: 1,
+            },
+            PatchRange {
+                input_offset: 1,
+                output_offset: (3 * macho::CS_BLOCK_SIZE + 7) as u64,
+                len: 1,
+            },
+        ];
+
+        assert!(refresh_changed_code_signature_hashes(
+            &mut output,
+            code_limit,
+            hashes_offset,
+            hash_count,
+            uuid_offset,
+            patches.into_iter(),
+        ));
+
+        let expected = output[..code_limit]
+            .chunks(macho::CS_BLOCK_SIZE)
+            .flat_map(<sha2::Sha256 as sha2::Digest>::digest)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            &output[hashes_offset..hashes_offset + hash_count * hash_size],
+            expected
         );
     }
 
