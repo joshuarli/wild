@@ -38,7 +38,7 @@ use std::time::SystemTime;
 
 const MAGIC: &[u8; 16] = b"WILD-MACHO-INC\0\0";
 const STATE_MAGIC: &[u8; 16] = b"WILD-MACHO-STATE";
-const VERSION: u32 = 5;
+const VERSION: u32 = 6;
 const STATE_VERSION: u32 = 2;
 const HASH_SIZE: usize = 32;
 const MAX_RECORDS: usize = 100_000;
@@ -47,7 +47,7 @@ const DIAGNOSTICS_ENV: &str = "WILD_MACHO_INCREMENTAL_CACHE_DIAGNOSTICS";
 const STRUCTURE_DIGEST_DOMAIN: &[u8] = b"wild-macho-stable-layout-structure-v4\0";
 /// The sidecar is not an authenticated input, but random or torn sidecar corruption must become
 /// a conservative cache miss before any persisted patch mapping is used.
-const MANIFEST_CHECKSUM_DOMAIN: &[u8] = b"wild-macho-stable-layout-manifest-v5\0";
+const MANIFEST_CHECKSUM_DOMAIN: &[u8] = b"wild-macho-stable-layout-manifest-v6\0";
 const STATE_CHECKSUM_DOMAIN: &[u8] = b"wild-macho-stable-layout-state-v2\0";
 
 #[derive(Clone, Debug)]
@@ -151,6 +151,10 @@ struct Manifest {
     output_len: u64,
     signature: SignatureInfo,
     inputs: Vec<InputDigest>,
+    /// Rustc recreates these rlibs under a fresh temporary directory for every final link. An
+    /// index appears here only when the baseline image contains none of that input's exact path
+    /// bytes, proving the pathname is not an observable part of this cached executable.
+    cache_approved_rustc_temporary_archives: Vec<u32>,
     objects: Vec<ObjectRecord>,
 }
 
@@ -161,11 +165,12 @@ struct Manifest {
 /// input identities. Rebuilding 13k patch records and their protected-relocation byte vectors
 /// merely to inspect one rebuilt object showed up directly in the incremental-link profile.
 /// This view validates the on-disk shape and yields the selected object's serialized ranges
-/// without allocating them.
+/// without allocating patch records; it owns only the small path-approval index list.
 struct ManifestView<'a> {
     arguments_digest: [u8; HASH_SIZE],
     signature: SignatureInfo,
     input_count: usize,
+    cache_approved_rustc_temporary_archives: Vec<u32>,
     object_records: &'a [u8],
     object_count: usize,
 }
@@ -392,7 +397,11 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
 
     let current_inputs = {
         timing_phase!("Mach-O stable-layout cache: fingerprint inputs");
-        let Some(inputs) = input_digests_for_cache_hit(args, &state.inputs) else {
+        let Some(inputs) = input_digests_for_cache_hit(
+            args,
+            &state.inputs,
+            &manifest.cache_approved_rustc_temporary_archives,
+        ) else {
             return cache_miss("unable to read every link-visible input");
         };
         inputs
@@ -405,10 +414,17 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
         .zip(&state.inputs)
         .enumerate()
         .filter_map(|(index, (current, cached))| {
-            (current.path != cached.path
-                || current.metadata != cached.metadata
-                || current.digest != cached.digest)
-                .then_some(index)
+            input_identity_changed(
+                current,
+                cached,
+                u32::try_from(index).is_ok_and(|input_index| {
+                    manifest
+                        .cache_approved_rustc_temporary_archives
+                        .binary_search(&input_index)
+                        .is_ok()
+                }),
+            )
+            .then_some(index)
         })
         .collect::<Vec<_>>();
     let [changed_index] = changed.as_slice() else {
@@ -540,7 +556,10 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
 
     state.output_digest = output_digest;
     state.output_len = output_len;
-    state.inputs[*changed_index] = changed_input.clone();
+    // The direct object is the one patched input, but equal-content rlibs can move between
+    // rustc's per-link temporary directories. Retain every current physical identity so the
+    // metadata race guard checks the paths that produced this image on the next cache hit.
+    state.inputs = current_inputs;
     // Publish the owned image before its matching mutable state. An interrupted update can leave
     // an image and state with different digests, which is deliberately a cache miss rather than
     // a potentially stale patch source. The structural manifest is immutable on cache hits.
@@ -614,6 +633,8 @@ pub(crate) fn stage_after_link(layout: &Layout<'_, MachO>, output: &[u8]) {
     let Some(inputs) = input_digests(args) else {
         return;
     };
+    let cache_approved_rustc_temporary_archives =
+        cache_approved_rustc_temporary_archives(args, &inputs, output);
     let Some(signature) = signature_info(layout, output) else {
         return;
     };
@@ -634,6 +655,7 @@ pub(crate) fn stage_after_link(layout: &Layout<'_, MachO>, output: &[u8]) {
         output_len: output.len() as u64,
         signature,
         inputs,
+        cache_approved_rustc_temporary_archives,
         objects,
     };
     let state = ImageState {
@@ -845,6 +867,18 @@ fn arguments_digest(args: &MachOArgs) -> [u8; HASH_SIZE] {
                 path.to_string_lossy().as_ref(),
                 &format!("<direct-mach-object-{index}>"),
             );
+        } else if is_rustc_temporary_archive_path(path) {
+            // Rustc reconstructs rlibs in a fresh `rustcXXXXXX` directory for each final link.
+            // Retain the archive basename in the semantic key; the cache accepts the changed
+            // directory only when its immutable baseline image proves the original path is not
+            // emitted, then verifies the complete replacement bytes below.
+            semantic_arguments = semantic_arguments.replace(
+                path.to_string_lossy().as_ref(),
+                &format!(
+                    "<rustc-temporary-archive-{index}:{}>",
+                    path.file_name().unwrap().to_string_lossy()
+                ),
+            );
         }
     }
     semantic_arguments = semantic_arguments.replace(args.output().to_string_lossy().as_ref(), "<output>");
@@ -883,18 +917,22 @@ fn input_digests(args: &MachOArgs) -> Option<Vec<InputDigest>> {
 }
 
 /// Fingerprints only the changed direct object. Every path-identical input with unchanged stored
-/// metadata reuses its baseline BLAKE3 digest; a metadata change in any other input deliberately
-/// falls back to the normal linker rather than weakening input identity validation.
+/// metadata reuses its baseline BLAKE3 digest. A baseline image can additionally approve an
+/// equal-content rlib from rustc's per-link temporary directory when it proves the old path is
+/// absent from the image; that exceptional path is fully hashed before acceptance. All other
+/// non-direct changes remain normal-link fallbacks.
 fn input_digests_for_cache_hit(
     args: &MachOArgs,
     cached_inputs: &[InputDigest],
+    cache_approved_rustc_temporary_archives: &[u32],
 ) -> Option<Vec<InputDigest>> {
     (args.common().inputs.len() == cached_inputs.len()).then_some(())?;
     args.common()
         .inputs
         .iter()
         .zip(cached_inputs)
-        .map(|(input, cached)| {
+        .enumerate()
+        .map(|(index, (input, cached))| {
             let path = cache_hit_input_path(args, input, cached)?;
             let metadata = input_file_metadata(&path)?;
             if path == cached.path && metadata == cached.metadata {
@@ -905,12 +943,80 @@ fn input_digests_for_cache_hit(
                     metadata,
                 });
             }
-            if !is_mach_object_path(&path) || !is_mach_object_path(&cached.path) {
-                return None;
+            if is_mach_object_path(&path) && is_mach_object_path(&cached.path) {
+                return read_changed_direct_object(path, cached);
             }
-            read_changed_direct_object(path, cached)
+            let cache_approved = u32::try_from(index).is_ok_and(|input_index| {
+                cache_approved_rustc_temporary_archives
+                    .binary_search(&input_index)
+                    .is_ok()
+            });
+            if reusable_rustc_temporary_archive(&path, &cached.path, cache_approved) {
+                let current = read_hashed_input(path)?;
+                return (current.digest == cached.digest).then_some(current);
+            }
+            None
         })
         .collect()
+}
+
+/// Finds precisely the Rustc-owned archive paths that do not appear in the completed executable.
+/// A cache hit only retains an old image and patches one direct object, so the absence of these
+/// full path bytes proves that swapping the temporary-directory spelling cannot leave a stale
+/// path in the output. This is stronger than Cargo's `strip=symbols`: that profile flag does not
+/// necessarily request Mach-O debug stripping.
+fn cache_approved_rustc_temporary_archives(
+    args: &MachOArgs,
+    inputs: &[InputDigest],
+    output: &[u8],
+) -> Vec<u32> {
+    args.common()
+        .inputs
+        .iter()
+        .zip(inputs)
+        .enumerate()
+        .filter_map(|(index, (argument, input))| {
+            let InputSpec::File(argument_path) = &argument.spec else {
+                return None;
+            };
+            // The emitted `N_OSO` spelling comes from the link argument rather than its resolved
+            // filesystem identity. Do not treat a symlink's canonical target as proof about that
+            // distinct path string.
+            (argument_path.to_str().is_some_and(|path| path == input.path)
+                && is_rustc_temporary_archive_path(Path::new(&input.path))
+                && memchr::memmem::find(output, input.path.as_bytes()).is_none())
+            .then(|| u32::try_from(index).ok())
+            .flatten()
+        })
+        .collect()
+}
+
+/// Rustc writes final-link archive copies under `rustc` plus six random alphanumeric bytes. The
+/// directory changes on every link, while the archive's basename remains a real semantic input.
+/// Only accept that one compiler-owned spelling; arbitrary temporary directories must preserve
+/// the ordinary linker's pathname-sensitive behavior.
+fn is_rustc_temporary_archive_path(path: &Path) -> bool {
+    path.extension().is_some_and(|extension| extension == "rlib")
+        && path.parent().and_then(Path::file_name).and_then(std::ffi::OsStr::to_str).is_some_and(
+            |directory| {
+                directory.len() == "rustc".len() + 6
+                    && directory.starts_with("rustc")
+                    && directory["rustc".len()..].bytes().all(|byte| byte.is_ascii_alphanumeric())
+            },
+        )
+}
+
+fn reusable_rustc_temporary_archive(current: &str, cached: &str, cache_approved: bool) -> bool {
+    cache_approved
+        && is_rustc_temporary_archive_path(Path::new(current))
+        && is_rustc_temporary_archive_path(Path::new(cached))
+        && Path::new(current).file_name() == Path::new(cached).file_name()
+}
+
+fn input_identity_changed(current: &InputDigest, cached: &InputDigest, cache_approved: bool) -> bool {
+    current.digest != cached.digest
+        || (current.path != cached.path || current.metadata != cached.metadata)
+            && !reusable_rustc_temporary_archive(&current.path, &cached.path, cache_approved)
 }
 
 /// Return a canonical path only when the command's spelling cannot already identify the cached
@@ -1890,6 +1996,13 @@ impl Manifest {
             out.extend_from_slice(&input.digest);
             put_input_metadata(&mut out, &input.metadata);
         }
+        put_u32(
+            &mut out,
+            self.cache_approved_rustc_temporary_archives.len() as u32,
+        );
+        for index in &self.cache_approved_rustc_temporary_archives {
+            put_u32(&mut out, *index);
+        }
         put_u32(&mut out, self.objects.len() as u32);
         for object in &self.objects {
             put_u32(&mut out, object.input_index);
@@ -1944,6 +2057,8 @@ impl Manifest {
                 metadata: read_input_metadata(&mut reader)?,
             });
         }
+        let cache_approved_rustc_temporary_archives =
+            read_cache_approved_rustc_temporary_archives(&mut reader, input_count)?;
         let object_count = reader.count()?;
         let mut objects = Vec::with_capacity(object_count);
         for _ in 0..object_count {
@@ -1983,6 +2098,7 @@ impl Manifest {
             output_len,
             signature,
             inputs,
+            cache_approved_rustc_temporary_archives,
             objects,
         })
     }
@@ -2018,6 +2134,8 @@ impl<'a> ManifestView<'a> {
             let _ = reader.hash()?;
             reader.skip_input_metadata()?;
         }
+        let cache_approved_rustc_temporary_archives =
+            read_cache_approved_rustc_temporary_archives(&mut reader, input_count)?;
         let object_count = reader.count()?;
         let object_records_start = reader.offset;
         for _ in 0..object_count {
@@ -2028,6 +2146,7 @@ impl<'a> ManifestView<'a> {
             arguments_digest,
             signature,
             input_count,
+            cache_approved_rustc_temporary_archives,
             object_records: &body[object_records_start..reader.offset],
             object_count,
         })
@@ -2047,6 +2166,23 @@ impl<'a> ManifestView<'a> {
         anyhow::ensure!(reader.offset == self.object_records.len(), "truncated object record list");
         Ok(None)
     }
+}
+
+fn read_cache_approved_rustc_temporary_archives(
+    reader: &mut Reader<'_>,
+    input_count: usize,
+) -> anyhow::Result<Vec<u32>> {
+    let count = reader.count()?;
+    let mut indices = Vec::with_capacity(count);
+    let mut previous = None;
+    for _ in 0..count {
+        let index = reader.u32()?;
+        anyhow::ensure!(usize::try_from(index).is_ok_and(|index| index < input_count), "cache-approved input index is out of bounds");
+        anyhow::ensure!(previous.is_none_or(|previous| previous < index), "cache-approved input indices are not strictly ordered");
+        indices.push(index);
+        previous = Some(index);
+    }
+    Ok(indices)
 }
 
 impl<'a> ObjectRecordView<'a> {
@@ -2371,6 +2507,7 @@ mod tests {
     use super::add_patch_ranges_excluding_protected;
     use super::apply_patches;
     use super::cache_is_eligible;
+    use super::cache_approved_rustc_temporary_archives;
     use super::cache_hit_input_path;
     use super::existing_output_matches_baseline;
     #[cfg(target_os = "macos")]
@@ -2415,6 +2552,7 @@ mod tests {
                 direct_object_bytes: None,
                 metadata: test_input_metadata(),
             }],
+            cache_approved_rustc_temporary_archives: vec![0],
             objects: vec![ObjectRecord {
                 input_index: 0,
                 structure_digest: [3; 32],
@@ -2434,6 +2572,10 @@ mod tests {
         let view = ManifestView::decode(&encoded).unwrap();
         assert_eq!(view.arguments_digest, manifest.arguments_digest);
         assert_eq!(view.input_count, manifest.inputs.len());
+        assert_eq!(
+            view.cache_approved_rustc_temporary_archives,
+            manifest.cache_approved_rustc_temporary_archives
+        );
         let object = view.object_for_input(0).unwrap().unwrap();
         assert_eq!(object.structure_digest, [3; 32]);
         assert_eq!(object.patches().collect::<Vec<_>>(), manifest.objects[0].patches);
@@ -2655,18 +2797,81 @@ mod tests {
             cache_hit_input_path(&args, &args.common.inputs[0], &inputs[0]),
             Some(inputs[0].path.clone())
         );
-        let unchanged = input_digests_for_cache_hit(&args, &inputs).unwrap();
+        let unchanged = input_digests_for_cache_hit(&args, &inputs, &[]).unwrap();
         assert_eq!(unchanged, inputs);
         assert!(unchanged[0].direct_object_bytes.is_none());
 
         std::fs::write(&path, b"after-with-a-different-length").unwrap();
         assert!(!input_metadata_snapshots_match(&args, &inputs));
-        let changed = input_digests_for_cache_hit(&args, &inputs).unwrap();
+        let changed = input_digests_for_cache_hit(&args, &inputs, &[]).unwrap();
         assert_ne!(changed[0].metadata, inputs[0].metadata);
         // A direct cache candidate detects this by metadata rather than a second full digest.
         assert_eq!(changed[0].digest, inputs[0].digest);
         assert!(changed[0].direct_object_bytes.is_some());
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn cache_approved_rustc_temporary_archives_reuse_identical_contents() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "wild-stable-layout-cache-rustc-temporary-{unique}-{}",
+            std::process::id()
+        ));
+        let previous_directory = directory.join("rustcAb12Cd");
+        let current_directory = directory.join("rustcEf34Gh");
+        std::fs::create_dir_all(&previous_directory).unwrap();
+        std::fs::create_dir(&current_directory).unwrap();
+        let previous_archive = previous_directory.join("libexample.rlib");
+        let current_archive = current_directory.join("libexample.rlib");
+        std::fs::write(&previous_archive, b"the cached archive bytes").unwrap();
+        std::fs::write(&current_archive, b"the cached archive bytes").unwrap();
+
+        let mut previous_args = MachOArgs::default();
+        previous_args.common.inputs.push(Input {
+            spec: InputSpec::File(Box::from(previous_archive.as_path())),
+            search_first: None,
+            modifiers: Modifiers::default(),
+        });
+        let cached = input_digests(&previous_args).unwrap();
+        previous_args.common.inputs[0].spec =
+            InputSpec::File(Box::from(std::path::Path::new(&cached[0].path)));
+
+        let mut current_args = MachOArgs::default();
+        current_args.common.inputs.push(Input {
+            spec: InputSpec::File(Box::from(current_archive.as_path())),
+            search_first: None,
+            modifiers: Modifiers::default(),
+        });
+        let current_input_path = input_digests(&current_args).unwrap()[0].path.clone();
+        current_args.common.inputs[0].spec = InputSpec::File(Box::from(std::path::Path::new(&current_input_path)));
+
+        assert_eq!(arguments_digest(&previous_args), arguments_digest(&current_args));
+        assert_eq!(
+            cache_approved_rustc_temporary_archives(
+                &previous_args,
+                &cached,
+                b"an executable without input paths"
+            ),
+            vec![0]
+        );
+        assert!(cache_approved_rustc_temporary_archives(
+            &previous_args,
+            &cached,
+            cached[0].path.as_bytes()
+        )
+        .is_empty());
+        let current = input_digests_for_cache_hit(&current_args, &cached, &[0]).unwrap();
+        assert_eq!(current[0].digest, cached[0].digest);
+        assert_ne!(current[0].path, cached[0].path);
+        assert!(input_metadata_snapshots_match(&current_args, &current));
+
+        std::fs::write(&current_archive, b"a different archive payload").unwrap();
+        assert!(input_digests_for_cache_hit(&current_args, &cached, &[0]).is_none());
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     fn test_input_metadata() -> InputFileMetadata {
