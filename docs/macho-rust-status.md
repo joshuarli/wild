@@ -262,6 +262,13 @@ Its second transcript again requires both producer and consumer final ARM64 link
 snapshot asserts that every retained fixture Rust source is unchanged. This coverage deliberately
 does not use `WILD_SAVE_DIR` or the `cdylib` replay path above.
 
+The same workspace was also rebuilt in a fresh target directory with the recorded stable
+`1.97.1` toolchain, `clang --ld-path=<Wild> -v`, and `-C prefer-dynamic`. The proc-macro
+consumer's ordinary `cargo run` completed its non-identity expansion, and the Rust-dylib
+consumer's ordinary `cargo test` completed its two-thread TLS assertion. Their printed final
+Clang commands named Wild and `-arch arm64`; this is an additional compatibility confirmation,
+while the permanent harness continues to pin the requested dated nightly.
+
 The separate ARM64-only `macho/aarch64/cargo-staticlib-native/default` trial builds
 `wild/tests/cargo_macho_staticlib` with the fixture's exact `nightly-2026-07-24` toolchain and
 uses that toolchain's `llvm-nm` for the archive export check. It then final-links native C++
