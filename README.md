@@ -86,6 +86,28 @@ Or:
 rustflags = ["-Clink-arg=-fuse-ld=wild"]
 ```
 
+### Rust on macOS ARM64
+
+Wild's qualified macOS path is Apple Silicon (`aarch64-apple-darwin`) through Clang's explicit
+linker path. Use an absolute path so Cargo cannot accidentally select a different `wild` binary:
+
+```toml
+[target.aarch64-apple-darwin]
+linker = "clang"
+rustflags = ["-Clink-arg=--ld-path=/absolute/path/to/wild"]
+```
+
+The same selection can be used for a one-off command:
+
+```sh
+RUSTFLAGS="-C linker=clang -C link-arg=--ld-path=/absolute/path/to/wild" cargo test
+```
+
+The ARM64 qualification covers normal executables and tests, proc macros, Rust dylibs/cdylibs and
+staticlibs, native C/C++, TLS, unwind, SDK frameworks, debug maps, and signed rebuilds. It does
+not claim x86_64 or other Apple platforms; see the [macOS compatibility ledger](docs/macho-rust-status.md)
+for the exact tested toolchains, fixtures, diagnostics, and remaining bounded limitations.
+
 ### CMake
 
 CMake 4.4 or later supports Wild directly when used with Clang or GCC 16 or later. You can select
@@ -173,7 +195,7 @@ Here are some of the larger things that aren't yet done, roughly sorted by curre
 
 * Incremental linking
 * More complex linker scripts
-* Mach-O support
+* Mach-O targets other than qualified macOS ARM64
 * Windows support
 
 ### How can I verify that Wild was used to link a binary?
