@@ -644,6 +644,42 @@ def replay_incremental_link(
     return samples
 
 
+def establish_cache_direct_baseline(
+    *,
+    command: list[str],
+    environment: dict[str, str],
+    output_dir: Path,
+    linker: Linker,
+    expected_file_type: int,
+    runtime: RuntimeCheck | None,
+    runtime_cwd: Path,
+    baseline_output: Path,
+) -> dict[str, Any]:
+    """Rebuilds the cache's raw direct-link baseline after Cargo has post-processed it.
+
+    A Cargo profile can run an external post-link transformation such as `strip = true` after
+    Wild has staged its cache image. That leaves the ordinary Cargo artifact valid, but it no
+    longer matches the cache-owned image. Replay the exact baseline linker argv once before
+    snapshotting it, so the restored output and sidecars always describe the same raw Mach-O.
+    This setup link is deliberately unmeasured and may miss: an exact-input cache invocation must
+    fall back to a normal link rather than reuse an unchanged output.
+    """
+    samples = replay_incremental_link(
+        command=command,
+        environment=environment,
+        output_dir=output_dir,
+        linker=linker,
+        repetitions=1,
+        expected_file_type=expected_file_type,
+        runtime=runtime,
+        runtime_cwd=runtime_cwd,
+        fixed_output=baseline_output,
+    )
+    if len(samples) != 1:
+        raise RuntimeError("Cache baseline setup did not produce exactly one direct-link result")
+    return samples[0]
+
+
 def stable_layout_cache_hit_evidence(log_path: Path) -> list[str]:
     """Returns cache hits, including records Cargo indents in a linker-stderr warning."""
     return [
@@ -1012,6 +1048,16 @@ def run_sample(
                 output=primary_artifact_path(direct_target, workload, baseline_log, linker),
             )
             baseline_output = Path(baseline_command[baseline_command.index("-o") + 1])
+            baseline_rebuild = establish_cache_direct_baseline(
+                command=baseline_command,
+                environment=capture_environment,
+                output_dir=logs_dir / f"{linker.name}-{sample_index}-cache-baseline-direct",
+                linker=linker,
+                expected_file_type=workload.macho_file_type,
+                runtime=workload.runtime,
+                runtime_cwd=workspace,
+                baseline_output=baseline_output,
+            )
             baseline_output_snapshot = logs_dir / f"{linker.name}-{sample_index}-cache-baseline-output"
             shutil.copy2(baseline_output, baseline_output_snapshot)
             cache_snapshot = logs_dir / f"{linker.name}-{sample_index}-cache-baseline-sidecars"
@@ -1078,6 +1124,7 @@ def run_sample(
                     "baseline_sidecars": str(cache_snapshot),
                     "baseline_hits": stable_layout_cache_hit_evidence(baseline_log),
                     "baseline_misses": stable_layout_cache_miss_evidence(baseline_log),
+                    "baseline_rebuild": baseline_rebuild,
                     "capture_hits": capture_hits,
                     "capture_misses": stable_layout_cache_miss_evidence(capture_log),
                     "capture_artifact": capture_artifact,
@@ -1172,6 +1219,9 @@ def comparison(runs: list[dict[str, Any]], workload: Workload) -> dict[str, Any]
         cache_details = run.get("incremental_link", {}).get("cache", {})
         cache_hits.extend(cache_details.get("baseline_hits", []))
         cache_misses.extend(cache_details.get("baseline_misses", []))
+        baseline_rebuild = cache_details.get("baseline_rebuild", {})
+        cache_hits.extend(baseline_rebuild.get("stable_layout_cache_hits", []))
+        cache_misses.extend(baseline_rebuild.get("stable_layout_cache_misses", []))
         cache_hits.extend(cache_details.get("capture_hits", []))
         cache_misses.extend(cache_details.get("capture_misses", []))
     cache_events = len(cache_hits) + len(cache_misses)

@@ -81,7 +81,10 @@ python3 benchmarks/cargo_link_benchmark.py \
 To measure Wild's opt-in stable-layout incremental path, supply a new, empty cache directory.
 The runner still measures cold Wild without the cache so the cold comparison stays comparable; it
 then creates an unmeasured cache baseline and requires a verified cache hit for each changed-source
-Wild Cargo/direct-link sample. The Apple ld64 run is unchanged.
+Wild Cargo/direct-link sample. The direct baseline is replayed once after Cargo's capture before
+it is snapshotted: a Cargo profile may run a post-link transform such as `strip = true`, so the
+cache-owned raw signed Mach-O must never be paired with that transformed artifact. Every hit still
+passes the ARM64 header, strict signature, and runtime checks. The Apple ld64 run is unchanged.
 
 ```sh
 python3 benchmarks/cargo_link_benchmark.py \

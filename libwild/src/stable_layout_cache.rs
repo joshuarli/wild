@@ -250,6 +250,22 @@ impl MutableOutput {
         }
     }
 
+    /// Match the ordinary Mach-O writer's final `MS_INVALIDATE` after updating an embedded code
+    /// signature. Without it, a clonefile-backed mapping can retain stale kernel signature state
+    /// for its inode: `codesign` accepts the final bytes, yet `exec` receives SIGKILL.
+    fn invalidate_code_signature_cache(&mut self) {
+        #[cfg(target_os = "macos")]
+        if let Self::Cloned { mapping, .. } = self {
+            unsafe {
+                libc::msync(
+                    mapping.as_mut_ptr().cast(),
+                    mapping.len(),
+                    libc::MS_INVALIDATE,
+                );
+            }
+        }
+    }
+
     fn discard(self) {
         #[cfg(target_os = "macos")]
         if let Self::Cloned { staged_path, .. } = self {
@@ -481,6 +497,7 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
             output.discard();
             return cache_miss("patch mapping or signature refresh is not valid");
         }
+        output.invalidate_code_signature_cache();
     }
 
     // Recheck the filesystem identity captured around the initial full input hash immediately
@@ -506,7 +523,9 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
         let write_result = match &output {
             PreparedOutput::InMemory(bytes) => write_output_atomic(args.output(), bytes),
             #[cfg(target_os = "macos")]
-            PreparedOutput::Cloned(staged_path) => fs::rename(staged_path, args.output()),
+            PreparedOutput::Cloned(staged_path) => {
+                replace_output_after_detaching_previous(staged_path, args.output())
+            }
         };
         if write_result.is_err() {
             output.discard();
@@ -1580,7 +1599,44 @@ fn write_output_atomic(path: &Path, output: &[u8]) -> std::io::Result<()> {
     // storage. Closing this replacement before its rename gives the same successful-link
     // contract while avoiding an unnecessary APFS durability barrier on every cache hit.
     drop(file);
-    fs::rename(temporary, path)
+    replace_output_after_detaching_previous(&temporary, path)
+}
+
+/// Publishes a cache-hit output through a fresh pathname rather than replacing an already
+/// executable file in place. macOS caches code-signature state by vnode, and a direct `rename`
+/// over an executed Cargo artifact can still leave that path unable to execute even when the
+/// replacement's bytes and embedded signature are valid. This is the same detach-before-create
+/// contract as the ordinary Mach-O writer's `UnlinkAndReplace` mode.
+fn replace_output_after_detaching_previous(staged: &Path, output: &Path) -> std::io::Result<()> {
+    let parent = output.parent().unwrap_or_else(|| Path::new("."));
+    let name = output
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("output");
+    let unique = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let previous = parent.join(format!(
+        ".{name}.wild-incremental-previous.{}.{}",
+        std::process::id(),
+        unique
+    ));
+    let detached_previous = match fs::rename(output, &previous) {
+        Ok(()) => Some(previous),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    if let Err(error) = fs::rename(staged, output) {
+        if let Some(previous) = detached_previous {
+            let _ = fs::rename(previous, output);
+        }
+        return Err(error);
+    }
+    if let Some(previous) = detached_previous {
+        let _ = fs::remove_file(previous);
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -2240,6 +2296,8 @@ mod tests {
     use super::existing_output_matches_baseline;
     #[cfg(target_os = "macos")]
     use super::clone_file;
+    #[cfg(target_os = "macos")]
+    use super::replace_output_after_detaching_previous;
     use super::input_digests;
     use super::input_digests_for_cache_hit;
     use super::input_metadata_snapshots_match;
@@ -2440,6 +2498,35 @@ mod tests {
         assert_eq!(std::fs::read(&destination).unwrap(), b"baseline");
         std::fs::remove_file(source).unwrap();
         std::fs::remove_file(destination).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn cache_publication_detaches_a_previous_output_inode() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "wild-stable-layout-cache-publication-{unique}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let output = directory.join("output");
+        let staged = directory.join("staged");
+        std::fs::write(&output, b"previous executable").unwrap();
+        std::fs::write(&staged, b"new executable").unwrap();
+        let previous_inode = std::fs::metadata(&output).unwrap().ino();
+
+        replace_output_after_detaching_previous(&staged, &output).unwrap();
+
+        assert_eq!(std::fs::read(&output).unwrap(), b"new executable");
+        assert_ne!(std::fs::metadata(&output).unwrap().ino(), previous_inode);
+        assert!(!staged.exists());
+        std::fs::remove_file(output).unwrap();
         std::fs::remove_dir(directory).unwrap();
     }
 

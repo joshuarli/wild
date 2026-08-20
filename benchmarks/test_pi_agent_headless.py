@@ -197,6 +197,35 @@ class PiAgentBenchmarkTests(unittest.TestCase):
                 ["wild: Mach-O stable-layout cache miss: image state is absent"],
             )
 
+    def test_cache_baseline_replays_the_raw_linker_output_after_cargo_postprocessing(self) -> None:
+        """The direct cache image must match Wild's raw output, not Cargo's stripped artifact."""
+        baseline_output = Path("/tmp/e-raw-link")
+        baseline = {"elapsed_ns": 123}
+        with patch.object(BENCHMARK, "replay_incremental_link", return_value=[baseline]) as replay:
+            result = BENCHMARK.establish_cache_direct_baseline(
+                command=["/tmp/wild", "-o", str(baseline_output), "/tmp/e.o"],
+                environment={"RUSTFLAGS": "-C linker=/tmp/clang"},
+                output_dir=Path("/tmp/cache-baseline-log"),
+                linker=BENCHMARK.Linker("wild", Path("/tmp/wild")),
+                expected_file_type=BENCHMARK.MH_EXECUTE,
+                runtime=BENCHMARK.RuntimeCheck(arguments=("--version",), stdout_contains="e "),
+                runtime_cwd=Path("/tmp"),
+                baseline_output=baseline_output,
+            )
+
+        self.assertIs(result, baseline)
+        replay.assert_called_once_with(
+            command=["/tmp/wild", "-o", str(baseline_output), "/tmp/e.o"],
+            environment={"RUSTFLAGS": "-C linker=/tmp/clang"},
+            output_dir=Path("/tmp/cache-baseline-log"),
+            linker=BENCHMARK.Linker("wild", Path("/tmp/wild")),
+            repetitions=1,
+            expected_file_type=BENCHMARK.MH_EXECUTE,
+            runtime=BENCHMARK.RuntimeCheck(arguments=("--version",), stdout_contains="e "),
+            runtime_cwd=Path("/tmp"),
+            fixed_output=baseline_output,
+        )
+
     def test_cargo_driver_can_be_pinned_independently_of_path(self) -> None:
         args = BENCHMARK.parse_args(
             [
