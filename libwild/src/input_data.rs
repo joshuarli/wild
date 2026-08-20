@@ -50,6 +50,8 @@ pub(crate) struct FileLoader<'data, F: FileSystem> {
 
     inputs_arena: &'data Arena<InputFile<F::Input>>,
 
+    generated_symbol_names: &'data Arena<String>,
+
     // File system used for reading and writing of the data.
     file_system: Arc<F>,
 }
@@ -176,6 +178,8 @@ struct TemporaryState<'data, P: Platform, F: FileSystem> {
 
     inputs_arena: &'data Arena<InputFile<F::Input>>,
 
+    generated_symbol_names: &'data Arena<String>,
+
     file_system: Arc<F>,
 }
 
@@ -280,11 +284,13 @@ impl<'data> AuxiliaryFiles<'data> {
 impl<'data, F: FileSystem> FileLoader<'data, F> {
     pub(crate) fn new(
         inputs_arena: &'data Arena<InputFile<F::Input>>,
+        generated_symbol_names: &'data Arena<String>,
         file_system: Arc<F>,
     ) -> Self {
         Self {
             loaded_files: Vec::new(),
             inputs_arena,
+            generated_symbol_names,
             file_system,
             has_dynamic: false,
         }
@@ -325,6 +331,7 @@ impl<'data, F: FileSystem> FileLoader<'data, F> {
             next_file_load_index: AtomicUsize::new(initial_work.len()),
             files: SegQueue::new(),
             inputs_arena: self.inputs_arena,
+            generated_symbol_names: self.generated_symbol_names,
             file_system: Arc::clone(&self.file_system),
         };
 
@@ -776,7 +783,7 @@ impl<'data, P: Platform, F: FileSystem> TemporaryState<'data, P, F> {
             }
             FileKind::MachOStubLibrary => {
                 let mut external_reexport_files = Vec::new();
-                let defined_library = parse_defined_library_with_external_reexports(
+                let mut defined_library = parse_defined_library_with_external_reexports(
                     str::from_utf8(input_file.data())?,
                     |install_name| {
                         let reexport_path = find_external_macho_stub_library(
@@ -810,6 +817,7 @@ impl<'data, P: Platform, F: FileSystem> TemporaryState<'data, P, F> {
                     },
                 )
                 .with_context(|| format!("Failed to process `{}`", absolute_path.display()))?;
+                defined_library.materialize_objc_class_symbols(self.generated_symbol_names);
                 tracing::debug!(file = ?input_file.filename, symbols = defined_library.symbols.len(),
                     weak_symbols = defined_library.weak_symbols.len(), "loaded TBD library");
                 Ok(LoadedFileState::StubLibrary(

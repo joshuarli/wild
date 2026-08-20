@@ -197,7 +197,11 @@ impl platform::Args for MachOArgs {
     }
 
     fn should_export_dynamic(&self, _lib_name: &[u8]) -> bool {
-        todo!()
+        // Mach-O does not implement ELF's `--exclude-libs` policy. Once ld64 extracts an archive
+        // member while producing a dylib, its externally visible definitions participate in the
+        // dylib's public interface just like definitions from a direct object input. An explicit
+        // `-exported_symbols_list` is applied separately by `export_symbols_mode`.
+        true
     }
 
     fn loadable_segment_alignment(&self) -> crate::alignment::Alignment {
@@ -764,5 +768,13 @@ mod tests {
 
         assert!(args.should_strip_debug());
         assert!(args.should_strip_all());
+    }
+
+    #[test]
+    fn dylib_exports_extracted_archive_members_without_an_elf_exclude_libs_policy() {
+        let mut args = MachOArgs::new().unwrap();
+        args.parse(["-dylib"].iter()).unwrap();
+
+        assert!(args.should_export_dynamic(b"libarchive-member.a"));
     }
 }

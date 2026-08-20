@@ -7,7 +7,7 @@ implemented behavior from planned behavior: an unchecked item is not a claim of 
 
 | Item | Value |
 | --- | --- |
-| Source commit | `563ec0ba7336a7700c00423435f4297b44231274` (`plan`; one commit ahead of upstream `82abac93d8436601c27fae33295b84a67bc70e8b`) |
+| Source baseline | Current checked-out tree; every command below names its exact toolchain and is reproduced from the committed CI configuration |
 | Host | Apple Silicon macOS 26.5.2 (25F84) |
 | Xcode / SDK | Xcode 26.6 (17F113), macOS SDK 26.5 |
 | SDK path | `/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk` |
@@ -33,7 +33,7 @@ Baseline checks completed on this host:
   (185 `libwild` tests, 35 Mach-O integration tests, recorder tests, and remaining workspace/doc
   tests).
 * `WILD_TEST_IGNORE_FORMAT=1 cargo +nightly-2026-07-24 test --profile ci --workspace --features
-  macho` — pass (all workspace unit tests and doctests, including 204 `libwild` tests and 63
+  macho` — pass (all workspace unit tests and doctests, including 208 `libwild` tests and 67
   ARM64 Mach-O integrations). This is the reproducible dated-nightly gate; it is run with the
   installed `rust-src` and `llvm-tools` components, not by falling back to stable Rust.
 * Without `WILD_TEST_IGNORE_FORMAT=1`, only tidy tests fail because this host lacks `taplo` and
@@ -51,11 +51,11 @@ than supported facilities:
 | Facility | Evidence | Status |
 | --- | --- | --- |
 | Mach-O argument semantics | Models ARM64, dylib/executable, install names, rpaths, export lists, framework paths, strip options, and input-local `-force_load`. | partial |
-| Section/symbol classification | Handles data access, debug/non-alloc, `__DATA_CONST`, TLV storage, no-dead-strip, C strings, and Mach-O-specific no-op hooks. | partial |
+| Section/symbol classification | Carries section-derived function/TLS facts beside raw nlists, handles data access, debug/non-alloc, `__DATA_CONST`, TLV storage, no-dead-strip, C strings, and Mach-O-specific no-op hooks. `__thread_bss` extends its containing `__DATA` segment, unlike ELF's `PT_TLS`-only zero-fill convention. | partial |
 | ABI-level symbols | Bounded ARM64 fixtures cover tentative/common `N_UNDF` definitions (size and `n_desc` alignment in `__DATA,__common`), direct `N_INDR` aliases, `N_PEXT` visibility, hidden synthetic `___dso_handle`, C++ initialization/`atexit`/destruction, and Rust calling a native C function. Weak dylib imports retain `N_WEAK_REF` separately from weak definitions: all-weak dependencies use `LC_LOAD_WEAK_DYLIB` and the chained-import weak bit, while an unprovided weak import remains an undefined-symbol error. Absolute symbols, alias chains, and broad mixed-language qualification remain outside this bounded result. | partial; focused Apple controls and Wild runtime/structural fixtures green |
 | ARM64 relocations / thunks | Validates supported standalone forms, `POINTER_TO_GOT`, local and dylib-imported TLVP descriptors, paired `ADDEND`, bounded ordinary-data `SUBTRACTOR`/`UNSIGNED` expressions, and out-of-range `BRANCH26` via nearby text islands. Authenticated paths remain explicitly diagnosed or absent. | partial; unqualified |
 | Chained fixups | Plans address-ordered imported binds and local rebases per segment; gaps, leading local slots, 16 KiB pages, and malformed encodings are handled. `macho/chained-fixups-multipage` executes 2300 imported `__got` binds across two pages, while `macho/chained-fixups-tlvp` executes two imported descriptor binds in `__thread_ptrs`. Wider pointer-format/arm64e qualification remains. | partial; bounded ARM64 runtime green |
-| Dylib output / rpaths / exports | Emits `MH_DYLIB`, `LC_ID_DYLIB`, requested `LC_RPATH`, and omits executable-only commands. C and bounded Rust `dylib` producer/consumer runtime controls pass. Dependency ordinals and weak/reexport behavior remain. | partial; bounded C/Rust dylib runtime green |
+| Dylib output / rpaths / exports | Emits `MH_DYLIB`, `LC_ID_DYLIB`, requested `LC_RPATH`, and omits executable-only commands. Undefined nlists owned by input dylibs remain dyld imports rather than being recursively rejected by the static link. C and bounded Rust `dylib` producer/consumer runtime controls pass. Dependency ordinals and weak/reexport behavior remain. | partial; bounded C/Rust dylib runtime green |
 | Dead strip / atoms | `MH_SUBSECTIONS_VIA_SYMBOLS` inputs are split into live symbol-delimited spans under `-dead_strip`; whole-section behavior is retained otherwise. | partial; differential smoke green |
 | TLS, compact unwind, DWARF, string merging | A local C TLS descriptor fixture executes successfully. ARM64 compact frame/frameless rows, personality pointers, and LSDAs are synthesized and a C++ throw/catch fixture passes. Bounded ARM64 DWARF-mode rows now serialize their live `__eh_frame` CIE/FDE records and pass a Rust `panic=unwind` / `catch_unwind` smoke under `-dead_strip`. Ordinary C debug data is represented only by a bounded `dsymutil` debug map; final executables intentionally do not copy `__DWARF`. | partial; bounded unwind and C debug-map smoke green |
 
@@ -68,6 +68,7 @@ than supported facilities:
 | dylib | `trivial-dynamic` now links its `foo.c` dylib with Wild and consumes it at runtime; `macho/dylib-install-name-consumer` consumes an Apple-built physical-name mismatch through its `LC_ID_DYLIB` | Apple control, Wild load-command assertion, and C runtime pass | retained Cargo Rust `dylib` producer/consumer links each final artifact through Wild and loads through `@loader_path` rpath | n/a | bounded C/Rust dylib runtime green |
 | proc macro | `cargo_macho_macro_producer` expands through `TokenStream::from_str` into `40 + 2` | Apple control builds the producer/consumer pair | retained Cargo producer and consumer final links select Wild; the consumer runs the non-identity expansion | n/a | bounded ARM64 Cargo proc-macro runtime green |
 | framework | `macho/framework-security` calls `SecRandomCopyBytes` through `-framework Security` | Apple control and Wild output both carry the current SDK Security framework load command; both run successfully | C framework consumer runs through Wild | n/a | bounded ARM64 framework runtime/structural green |
+| Objective-C selector dispatch | `macho/objc-runtime`, `objc-multi-selector`, and `objc-dead-selector` compile normal ARC calls without compiler workarounds | Apple ld establishes one 32-byte `__objc_stubs` veneer and one chained-rebase `__objc_selrefs` slot per live selector | n/a | repeated selectors deduplicate lexically; a dead selector atom emits neither synthetic section | bounded ARM64 Objective-C runtime green |
 | dead strip | `macho/dead-strip` | code/data/export parity pass | C runtime pass | pending | atom smoke green |
 | ABI-level symbols | `macho/common-symbols`, `symbol-aliases`, `weak-symbols`, `weak-undefined`, `cxx-init-teardown` | Apple controls establish common/alias/weak behavior | `macho/rust-native-ffi` calls C through Wild | pending | bounded C/C++/Rust smoke green |
 | TLS | `macho/tls-local`, `macho/tls-dynamic`, `macho/rust-thread-local` | Apple ld binds the imported descriptor through `__got`; ld64.lld uses `__thread_ptrs` | C and Rust two-thread runtime passes under Wild; Rust static/dylib TLS qualification remains external | pending | bounded C/Rust local/dylib smoke green |
@@ -249,6 +250,26 @@ WILD_TEST_IGNORE_FORMAT=1 cargo +nightly-2026-07-24 test --profile ci -p wild-li
   --features macho --test integration_tests -- 'macho/aarch64/cargo-staticlib-native/default'
 ```
 
+### Objective-C selector dispatch
+
+Modern ARM64 Clang leaves an undefined `_objc_msgSend$selector` branch at an ordinary Objective-C
+message send. That spelling is linker protocol, not a libobjc export. `MachO::raw_symbol_name`
+resolves it through the real dynamic `_objc_msgSend` import while
+`MachO::create_finalise_sizes_ext` retains each live selector branch and allocates one lexical
+`__TEXT,__objc_stubs` entry plus one `__DATA,__objc_selrefs` slot per distinct selector.
+`macho_writer::write_objc_message_stubs` emits ld64's fixed
+`ADRP/LDR x1; ADRP/LDR x16; BR; BRK*3` veneer and adds the selector slot to the local chained
+rebase plan. The selector is found through the final merged `__objc_methname` map, so identical
+strings from different objects cannot retain stale input addresses.
+
+`macho/objc-runtime` proves normal ARC dispatch through `NSObject` with the current SDK TAPI
+`objc-classes` field materialized as class and metaclass symbols. `objc-multi-selector` proves
+the 32-byte/8-byte-per-selector layout, lexical deduplication, and runtime dispatch; the minimal
+assembler `objc-dead-selector` proves dead selector branches do not create output sections.
+This is deliberately limited to Clang's `_objc_msgSend$<nonempty-selector>` ARM64 form. It does
+not claim a generic Objective-C metadata linker, `-const_selrefs`, selector-stub branch islands,
+or Objective-C dSYM support.
+
 ### Bounded C `dsymutil` debug map
 
 `macho/debug-dwarf` is the permanent ARM64 C control: clang compiles one loose `-g` object and
@@ -303,6 +324,13 @@ relaxation APIs; none removes the known correctness gaps listed above.
   chained local rebases; `macho/dylib-local-rebase` calls through a local function pointer after
   dyld loads the dylib. The retained Cargo workspace additionally verifies a Rust `dylib`
   producer/consumer through its final `@loader_path` rpath.
+* Mach-O nlists are now wrapped with immutable facts from their defining section. This preserves
+  the fixed 16-byte output nlist ABI while allowing `File::is_func` and `File::is_tls` to classify
+  data, code, and TLS precisely. A dylib's own unresolved nlists are left to dyld, matching an
+  Apple `-undefined dynamic_lookup` control; regular-object undefined references remain normal
+  link-time obligations. `macho/dylib-undefined` covers that boundary. Zero-fill TLS remains in
+  the Mach-O `__DATA` segment and extends its VM size, which is required for Rust proc-macro
+  dylibs to load.
 * Mach-O `__cstring` uses the generic merge map with section-relative symbol offsets; merged bytes
   are emitted before code-signature hashing into the minimum-alignment part reserved by layout,
   without overwriting a preceding higher-alignment section with the same Mach-O identity.
@@ -418,6 +446,8 @@ workload evidence—not a speed or general-performance claim.
 * Incremental linking.
 * x86_64 Mach-O is outside the agreed scope for this effort.
 * C++/Objective-C/Rust/archived/split-DWARF dSYM debug maps and generic output-DWARF relocation.
+* Objective-C selector forms other than ARM64 `_objc_msgSend$<selector>`, including selector-stub
+  range-extension islands and `-const_selrefs` output placement.
 
 ## Next work items
 

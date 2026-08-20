@@ -86,6 +86,7 @@ use object::read::macho::Nlist;
 use object::read::macho::Section;
 use object::read::macho::Segment;
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::num::NonZeroU8;
 use std::num::NonZeroU64;
@@ -121,6 +122,12 @@ enum SinglePartSectionId {
     /// descriptor selected by dyld for each image, not a normal symbol address.
     Tlvp,
     PltGot,
+    /// Selector-reference slots synthesized for Clang's modern ARM64 Objective-C message
+    /// dispatch ABI. dyld rebases each slot and libobjc canonicalises it during image setup.
+    ObjcSelectorReferences,
+    /// Linker-synthesized ARM64 stubs for undefined `_objc_msgSend$selector` references.
+    /// They load the selector reference into x1 before branching through `_objc_msgSend`'s GOT.
+    ObjcMessageStubs,
     SymtabGlobal,
     LinkEditSegment,
     LoadCommands,
@@ -148,6 +155,9 @@ pub(crate) mod part_id {
     pub(crate) const GOT: PartId = SinglePartSectionId::Got.part_id();
     pub(crate) const TLVP: PartId = SinglePartSectionId::Tlvp.part_id();
     pub(crate) const PLT_GOT: PartId = SinglePartSectionId::PltGot.part_id();
+    pub(crate) const OBJC_SELECTOR_REFERENCES: PartId =
+        SinglePartSectionId::ObjcSelectorReferences.part_id();
+    pub(crate) const OBJC_MESSAGE_STUBS: PartId = SinglePartSectionId::ObjcMessageStubs.part_id();
     pub(crate) const SYMTAB_GLOBAL: PartId = SinglePartSectionId::SymtabGlobal.part_id();
     pub(crate) const LOAD_COMMANDS: PartId = SinglePartSectionId::LoadCommands.part_id();
     pub(crate) const CODE_SIGNATURE: PartId = SinglePartSectionId::CodeSignature.part_id();
@@ -166,6 +176,10 @@ pub(crate) mod output_section_id {
     pub(crate) const GOT: OutputSectionId = SinglePartSectionId::Got.output_section_id();
     pub(crate) const TLVP: OutputSectionId = SinglePartSectionId::Tlvp.output_section_id();
     pub(crate) const PLT_GOT: OutputSectionId = SinglePartSectionId::PltGot.output_section_id();
+    pub(crate) const OBJC_SELECTOR_REFERENCES: OutputSectionId =
+        SinglePartSectionId::ObjcSelectorReferences.output_section_id();
+    pub(crate) const OBJC_MESSAGE_STUBS: OutputSectionId =
+        SinglePartSectionId::ObjcMessageStubs.output_section_id();
     pub(crate) const SYMTAB_GLOBAL: OutputSectionId =
         SinglePartSectionId::SymtabGlobal.output_section_id();
     pub(crate) const LINK_EDIT_SEGMENT: OutputSectionId =
@@ -224,6 +238,20 @@ pub(crate) const CHAINED_FIXUP_IMPORT_SIZE: u64 = size_of::<u32>() as u64;
 pub(crate) const CHAINED_FIXUP_PAGE_START_SIZE: u64 = size_of::<u16>() as u64;
 pub(crate) const GOT_ENTRY_SIZE: u64 = 8;
 pub(crate) const PLT_ENTRY_SIZE: u64 = 12;
+/// Apple emits a six-instruction-and-padding selector dispatch stub for every modern Objective-C
+/// selector symbol. Keep this separate from a normal 12-byte dyld symbol stub: it must first
+/// materialize the selector into x1.
+pub(crate) const OBJC_MESSAGE_STUB_SIZE: u64 = 32;
+pub(crate) const OBJC_SELECTOR_REFERENCE_SIZE: u64 = 8;
+
+/// Returns the selector suffix of Clang's ARM64 modern-message-dispatch undefined symbol.
+///
+/// `_objc_msgSend$selector` is not a dynamic-library symbol. ld64 binds `_objc_msgSend` and
+/// emits a local veneer which sets x1 to a selector reference. Empty suffixes are intentionally
+/// not accepted: they are neither emitted by Clang nor a meaningful Objective-C selector.
+pub(crate) fn objc_message_selector(name: &[u8]) -> Option<&[u8]> {
+    name.strip_prefix(b"_objc_msgSend$").filter(|selector| !selector.is_empty())
+}
 
 /// `compact_unwind_entry` records in `__LD,__compact_unwind` are fixed-width. They are only an
 /// object-file representation: final Mach-O images contain the indexed `__unwind_info` encoding
@@ -267,8 +295,47 @@ pub(crate) fn eh_frame_capacity(input_size: usize) -> Result<usize> {
 type SectionHeader = Section64<crate::macho::Endianness>;
 type SectionTable<'data> = &'data [Section64<crate::macho::Endianness>];
 type SymbolTable<'data> = object::read::macho::SymbolTable<'data, macho::MachHeader64<Endianness>>;
-type SymtabEntry = object::macho::Nlist64<Endianness>;
+type RawSymtabEntry = object::macho::Nlist64<Endianness>;
 type Relocation = object::macho::Relocation<Endianness>;
+
+/// The raw Mach-O nlist does not record a symbol kind. Its `n_sect` field names the section that
+/// provides that information, so retain the section-derived facts beside each entry while parsing
+/// the file. In particular, treating every dynamic `N_SECT` entry as a function would create PLT
+/// entries for data exports, and treating none as a function would do the opposite for code.
+#[derive(Debug, Copy, Clone, Default)]
+struct SymbolSectionProperties {
+    is_tls: bool,
+    is_func: bool,
+}
+
+#[derive(Debug, Copy, Clone)]
+pub(crate) struct SymtabEntry {
+    raw: RawSymtabEntry,
+    section_properties: SymbolSectionProperties,
+}
+
+impl std::ops::Deref for SymtabEntry {
+    type Target = RawSymtabEntry;
+
+    fn deref(&self) -> &Self::Target {
+        &self.raw
+    }
+}
+
+impl std::ops::DerefMut for SymtabEntry {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.raw
+    }
+}
+
+impl SymtabEntry {
+    fn from_raw(raw: RawSymtabEntry, section_properties: SymbolSectionProperties) -> Self {
+        Self {
+            raw,
+            section_properties,
+        }
+    }
+}
 
 /// A relocation after preserving its Mach-O ARM64 companion records at the format boundary.
 ///
@@ -806,13 +873,18 @@ impl std::fmt::Display for SegmentName {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct LayoutExt {
+pub(crate) struct LayoutExt<'data> {
     /// Imported symbols, sorted by their runtime-bound pointer slot.
     pub(crate) imported_symbols: Vec<ImportedSymbolWithResolution>,
+    /// Modern Objective-C selector-dispatch stubs, in their allocated output order.
+    pub(crate) objc_message_stubs: Vec<ObjcMessageStub<'data>>,
+    /// Every synthetic input undefined symbol is remapped to the unique, lexically ordered
+    /// selector stub that owns its spelling.
+    pub(crate) objc_message_stub_indexes: BTreeMap<ObjcMessageSymbol, usize>,
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct FinaliseSizesExt {
+pub(crate) struct FinaliseSizesExt<'data> {
     imported_libraries: Vec<FileId>,
     imported_symbols: Vec<SymbolId>,
     /// Reserved upper bound for the post-layout `__unwind_info` serialization. The epilogue owns
@@ -820,6 +892,29 @@ pub(crate) struct FinaliseSizesExt {
     unwind_info_size: u64,
     /// Reserved upper bound for selected CIE/FDE records and their one final terminator.
     eh_frame_size: u64,
+    objc_message_stubs: Vec<ObjcMessageStub<'data>>,
+    objc_message_stub_indexes: BTreeMap<ObjcMessageSymbol, usize>,
+}
+
+/// One Clang-generated `_objc_msgSend$selector` reference whose ARM64 ABI requires linker
+/// synthesis. `message_symbol` remains the input symbol index so relocation writing can replace
+/// exactly that branch; `selector_symbol` names the corresponding string in `__objc_methname`.
+/// Keeping both input identities avoids conflating equal selector spellings from different
+/// objects before string merging has assigned their final address.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct ObjcMessageSymbol {
+    pub(crate) file_id: FileId,
+    pub(crate) symbol: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ObjcMessageStub<'data> {
+    /// Selector spelling, retained only so final output order matches ld64's lexical order.
+    pub(crate) selector: &'data [u8],
+    /// One input special symbol that resolves to the shared `_objc_msgSend` GOT slot.
+    pub(crate) message_symbol: ObjcMessageSymbol,
+    /// One input method-name symbol whose merged output address backs the synthetic selref.
+    pub(crate) selector_symbol: ObjcMessageSymbol,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -870,6 +965,9 @@ pub(crate) struct File<'data> {
     pub(crate) data: &'data [u8],
     #[debug(skip)]
     pub(crate) symbols: SymbolTable<'data>,
+    /// nlists enriched with the section facts that Mach-O stores outside the nlist itself.
+    #[debug(skip)]
+    symbol_entries: Vec<SymtabEntry>,
     #[allow(unused)]
     pub(crate) flags: object::macho::FileFlags,
     kind: ObjectKind<'data>,
@@ -947,6 +1045,13 @@ fn parse_dylib_version(value: &str) -> Result<macho::Version> {
 }
 
 impl<'data> File<'data> {
+    /// Returns the exact input spelling for a symbol. Most Mach-O names are passed directly to
+    /// the symbol database, but Objective-C selector dispatch keeps a synthetic input spelling
+    /// while resolving its dynamic target under a different name.
+    pub(crate) fn raw_symbol_name(&self, symbol_index: SymbolIndex) -> Result<&'data [u8]> {
+        self.symbol_name(self.symbol(symbol_index)?)
+    }
+
     fn dylib_metadata(&self) -> Option<DylibMetadata<'data>> {
         match self.kind {
             ObjectKind::Regular(_) => None,
@@ -1027,6 +1132,7 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
 
         let mut symbols = None;
         let mut sections = None;
+        let mut symbol_section_properties = Vec::new();
         let mut dylib_metadata = None;
 
         while let Some(command) = commands.next()? {
@@ -1046,14 +1152,37 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
                         compatibility: dylib_command.dylib.compatibility_version.get(LE),
                     },
                 });
-            } else if !is_dynamic
-                && let Some((segment_command, segment_data)) = command.segment_64()?
-            {
-                ensure!(sections.is_none(), "At most one segment command expected");
+            } else if let Some((segment_command, segment_data)) = command.segment_64()? {
                 let section_list = segment_command.sections(LE, segment_data)?;
-                sections = Some(section_list);
+                symbol_section_properties.extend(
+                    section_list
+                        .iter()
+                        .map(symbol_section_properties_from_section),
+                );
+                if !is_dynamic {
+                    ensure!(sections.is_none(), "At most one segment command expected");
+                    sections = Some(section_list);
+                }
             }
         }
+
+        let symbols = symbols.ok_or("Missing symbol table")?;
+        let symbol_entries = symbols
+            .iter()
+            .map(|raw| {
+                let properties = if !raw.n_type.is_stab()
+                    && raw.n_type.typ() == N_SECT
+                    && raw.n_sect != 0
+                {
+                    *symbol_section_properties
+                        .get(usize::from(raw.n_sect - 1))
+                        .context("Mach-O symbol section index is out of range")?
+                } else {
+                    SymbolSectionProperties::default()
+                };
+                Ok(SymtabEntry::from_raw(*raw, properties))
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         let kind = if is_dynamic {
             ObjectKind::Dylib(dylib_metadata.ok_or("Missing LC_ID_DYLIB command")?)
@@ -1066,7 +1195,8 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
 
         let mut file = File {
             data: input,
-            symbols: symbols.ok_or("Missing symbol table")?,
+            symbols,
+            symbol_entries,
             flags: header.flags(LE),
             kind,
         };
@@ -1090,15 +1220,18 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
     }
 
     fn num_symbols(&self) -> usize {
-        self.symbols.len()
+        self.symbol_entries.len()
     }
 
     fn symbols_iter(&self) -> impl Iterator<Item = &SymtabEntry> {
-        self.symbols.iter()
+        self.symbol_entries.iter()
     }
 
     fn symbol(&self, index: object::SymbolIndex) -> Result<&SymtabEntry> {
-        Ok(self.symbols.symbol(index)?)
+        Ok(self
+            .symbol_entries
+            .get(index.0)
+            .context("Mach-O symbol index out of range")?)
     }
 
     fn section_size(&self, header: &SectionHeader) -> Result<u64> {
@@ -1289,8 +1422,14 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
         _local_index: usize,
         _version_names: &(),
     ) -> Result<RawSymbolName<'data>> {
+        let name = self.symbol_name(symbol)?;
+        // Clang's modern ARM64 Objective-C ABI represents a selector send as a synthetic
+        // undefined `_objc_msgSend$selector` name. ld64 resolves the actual imported function
+        // as `_objc_msgSend` and later creates a selector-loading veneer for the original input
+        // symbol. Keep that synthetic spelling for the Mach-O writer's exact relocation lookup,
+        // but canonicalise symbol resolution to the real libobjc entry point.
         Ok(RawSymbolName {
-            name: self.symbol_name(symbol)?,
+            name: objc_message_selector(name).map_or(name, |_| b"_objc_msgSend"),
         })
     }
 
@@ -1298,7 +1437,11 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
         &self,
         _resources: &crate::layout::GraphResources<'data, '_, Self::Platform>,
     ) -> bool {
-        todo!()
+        // Undefined nlists in a Mach-O dylib are imports for dyld, not obligations of this link.
+        // The static linker validates undefined references from regular objects while it resolves
+        // their relocations. Recursively auditing the loaded dylib's dependency graph here would
+        // reject valid two-level-namespace inputs that the dynamic loader is responsible for.
+        false
     }
 
     fn verneed_table(&self) -> Result<VerneedTable<'data>> {
@@ -1334,6 +1477,14 @@ fn is_non_alloc_section(flags: SectionFlags, segment_name: &[u8]) -> bool {
 
 fn is_tls_section_type(section_type: macho::SectionType) -> bool {
     matches!(section_type, S_THREAD_LOCAL_REGULAR | S_THREAD_LOCAL_ZEROFILL)
+}
+
+fn symbol_section_properties_from_section(section: &SectionHeader) -> SymbolSectionProperties {
+    let flags = section.flags.get(LE);
+    SymbolSectionProperties {
+        is_tls: is_tls_section_type(flags.typ()),
+        is_func: flags.intersects(S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS),
+    }
 }
 
 /// `S_THREAD_LOCAL_VARIABLES` holds three pointer-sized fields (`__tlv_bootstrap`, a key, and
@@ -1494,7 +1645,7 @@ impl platform::Symbol for SymtabEntry {
     }
 
     fn is_undefined(&self) -> bool {
-        Nlist::is_undefined(self) && self.as_common().is_none()
+        Nlist::is_undefined(&self.raw) && self.as_common().is_none()
     }
 
     fn is_local(&self) -> bool {
@@ -1541,13 +1692,11 @@ impl platform::Symbol for SymtabEntry {
     }
 
     fn debug_string(&self) -> String {
-        // TODO
-        String::new()
+        MachOSymDebug(self).to_string()
     }
 
     fn is_tls(&self) -> bool {
-        // TODO: derive from section name
-        false
+        self.section_properties.is_tls
     }
 
     fn is_interposable(&self) -> bool {
@@ -1555,8 +1704,7 @@ impl platform::Symbol for SymtabEntry {
     }
 
     fn is_func(&self) -> bool {
-        // TODO: derive from section name
-        false
+        self.section_properties.is_func
     }
 
     fn is_ifunc(&self) -> bool {
@@ -1578,6 +1726,40 @@ impl platform::Symbol for SymtabEntry {
             self.n_type.remove(N_PEXT);
         }
         self
+    }
+}
+
+struct MachOSymDebug<'a>(&'a SymtabEntry);
+
+impl std::fmt::Display for MachOSymDebug<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let symbol = self.0;
+        let binding = if symbol.is_local() {
+            "Local"
+        } else if symbol.is_weak() {
+            "Weak"
+        } else {
+            "Global"
+        };
+
+        let kind = if symbol.n_type.is_stab() {
+            "Stab"
+        } else if symbol.as_common().is_some() {
+            "Common"
+        } else if symbol.is_undefined() {
+            "Undefined"
+        } else {
+            match symbol.n_type.typ() {
+                N_ABS => "Absolute",
+                N_SECT if symbol.is_tls() => "Tls",
+                N_SECT if symbol.is_func() => "Func",
+                N_SECT => "Data",
+                N_INDR => "Indirect",
+                _ => "Unknown",
+            }
+        };
+
+        write!(f, "{binding} {kind}")
     }
 }
 
@@ -1636,7 +1818,7 @@ impl platform::SectionAttributes for SectionAttributes {
     }
 
     fn is_tls(&self) -> bool {
-        false
+        is_tls_section_type(self.ty)
     }
 
     fn is_writable(&self) -> bool {
@@ -1882,8 +2064,8 @@ impl platform::Platform for MachO {
     type ResolutionExt = ResolutionExt;
     type SymtabShndxEntry = ();
     type SymbolVersionIndex = ();
-    type FinaliseSizesExt<'data> = FinaliseSizesExt;
-    type LayoutExt<'data> = LayoutExt;
+    type FinaliseSizesExt<'data> = FinaliseSizesExt<'data>;
+    type LayoutExt<'data> = LayoutExt<'data>;
     type GdbIndexScanResult<'data> = ();
     type SectionIterator<'a> = Iter<'a, SectionHeader>;
     type DynamicTagValues<'data> = DynamicTagValues<'data>;
@@ -2341,6 +2523,8 @@ impl platform::Platform for MachO {
         let mut imported_symbols = Vec::new();
         let mut compact_unwind_entry_count = 0usize;
         let mut eh_frame_input_size = 0usize;
+        let mut objc_message_stubs_by_selector = BTreeMap::new();
+        let mut objc_message_selectors = BTreeMap::new();
 
         // Mach-O bind ordinals name load commands, whose identity is their install name rather
         // than the input pathname. For example, the macOS SDK's `libSystem`, `libc`, and `libm`
@@ -2359,6 +2543,18 @@ impl platform::Platform for MachO {
             for file in &group.files {
                 match file {
                     layout::FileLayoutState::Object(object) => {
+                        for (message_symbol, selector, selector_symbol) in
+                            objc_message_references_for_object(object)?
+                        {
+                            objc_message_stubs_by_selector
+                                .entry(selector)
+                                .or_insert(ObjcMessageStub {
+                                    selector,
+                                    message_symbol,
+                                    selector_symbol,
+                                });
+                            objc_message_selectors.insert(message_symbol, selector);
+                        }
                         for slot in &object.sections {
                             let resolution::SectionSlot::FrameData(section_index) = slot else {
                                 continue;
@@ -2425,6 +2621,38 @@ impl platform::Platform for MachO {
                 .common
                 .allocate(part_id::EH_FRAME, eh_frame_size as u64);
         }
+        let objc_message_stubs = objc_message_stubs_by_selector
+            .into_values()
+            .collect::<Vec<_>>();
+        let objc_message_stub_indexes = objc_message_selectors
+            .into_iter()
+            .map(|(message_symbol, selector)| {
+                let index = objc_message_stubs
+                    .binary_search_by_key(&selector, |stub| stub.selector)
+                    .expect("Objective-C selector was just inserted into the stub plan");
+                (message_symbol, index)
+            })
+            .collect();
+
+        if !objc_message_stubs.is_empty() {
+            let epilogue_group = groups
+                .last_mut()
+                .context("missing Mach-O epilogue group for Objective-C message stubs")?;
+            let count = u64::try_from(objc_message_stubs.len())
+                .context("too many Mach-O Objective-C message stubs")?;
+            epilogue_group.common.allocate(
+                part_id::OBJC_MESSAGE_STUBS,
+                count
+                    .checked_mul(OBJC_MESSAGE_STUB_SIZE)
+                    .context("Mach-O Objective-C message-stub size overflows")?,
+            );
+            epilogue_group.common.allocate(
+                part_id::OBJC_SELECTOR_REFERENCES,
+                count
+                    .checked_mul(OBJC_SELECTOR_REFERENCE_SIZE)
+                    .context("Mach-O Objective-C selector-reference size overflows")?,
+            );
+        }
 
         Ok(FinaliseSizesExt {
             imported_libraries,
@@ -2433,6 +2661,8 @@ impl platform::Platform for MachO {
             eh_frame_size: (eh_frame_input_size > 0)
                 .then_some(eh_frame_size as u64)
                 .unwrap_or(0),
+            objc_message_stubs,
+            objc_message_stub_indexes,
         })
     }
 
@@ -2479,6 +2709,8 @@ impl platform::Platform for MachO {
             .into_iter()
             .sorted_by_key(|symbol| symbol.binding.address())
             .collect();
+        layout_ext.objc_message_stubs = finalise_sizes_ext.objc_message_stubs;
+        layout_ext.objc_message_stub_indexes = finalise_sizes_ext.objc_message_stub_indexes;
 
         Ok(layout_ext)
     }
@@ -2697,6 +2929,20 @@ impl platform::Platform for MachO {
     ) -> Result {
         memory_offsets.increment(part_id::EH_FRAME, format_specific.eh_frame_size);
         memory_offsets.increment(part_id::UNWIND_INFO, format_specific.unwind_info_size);
+        let objc_stub_count = u64::try_from(format_specific.objc_message_stubs.len())
+            .context("too many Mach-O Objective-C message stubs")?;
+        memory_offsets.increment(
+            part_id::OBJC_MESSAGE_STUBS,
+            objc_stub_count
+                .checked_mul(OBJC_MESSAGE_STUB_SIZE)
+                .context("Mach-O Objective-C message-stub size overflows")?,
+        );
+        memory_offsets.increment(
+            part_id::OBJC_SELECTOR_REFERENCES,
+            objc_stub_count
+                .checked_mul(OBJC_SELECTOR_REFERENCE_SIZE)
+                .context("Mach-O Objective-C selector-reference size overflows")?,
+        );
         Ok(())
     }
 
@@ -2893,7 +3139,7 @@ impl platform::Platform for MachO {
                     .sum::<usize>();
             }
         }
-        let entry_size = size_of::<SymtabEntry>() as u64;
+        let entry_size = size_of::<RawSymtabEntry>() as u64;
         common.allocate(part_id::SYMTAB_GLOBAL, num_globals * entry_size);
         common.allocate(part_id::STRTAB, strings_size as u64);
 
@@ -2979,7 +3225,9 @@ impl platform::Platform for MachO {
         _verneed_table: &Self::VerneedTable<'data>,
         _symbol_index: object::SymbolIndex,
     ) -> Self::RawSymbolName<'data> {
-        RawSymbolName { name: name_bytes }
+        RawSymbolName {
+            name: objc_message_selector(name_bytes).map_or(name_bytes, |_| b"_objc_msgSend"),
+        }
     }
 
     fn default_layout_rules(_args: &Self::Args) -> Vec<crate::layout_rules::SectionRule<'static>> {
@@ -3056,6 +3304,9 @@ impl platform::Platform for MachO {
         );
 
         builder.add_section(output_section_id::PLT_GOT);
+        // Clang's modern Objective-C dispatch veneer is executable code, but it is distinct from
+        // dyld's ordinary 12-byte `__stubs`: every entry first loads a selector into x1.
+        builder.add_section(output_section_id::OBJC_MESSAGE_STUBS);
         add_sections_in_segment(&mut builder, output_sections, &custom.ro, SegmentName::TEXT);
         // Apple places the compact-unwind index before the coalesced DWARF table. The DWARF
         // rows' rewritten pcrel fields are independent of this order, but preserving the native
@@ -3078,8 +3329,34 @@ impl platform::Platform for MachO {
         for segment in [SegmentName::DATA] {
             add_sections_in_segment(&mut builder, output_sections, &custom.exec, segment);
             add_sections_in_segment(&mut builder, output_sections, &custom.ro, segment);
-            add_sections_in_segment(&mut builder, output_sections, &custom.data, segment);
+            // Objective-C object metadata is conventionally a writable `__DATA,__objc_const`
+            // input section despite its name. Emit that one named section before synthetic
+            // selector references, matching ld64's image-registration layout.
+            add_named_sections_in_segment(
+                &mut builder,
+                output_sections,
+                &custom.data,
+                segment,
+                b"__objc_const",
+            );
+            // libobjc scans this literal-pointer section during image registration and replaces
+            // its rebased method-name addresses with canonical selector values. ld64 keeps it
+            // after read-only Objective-C metadata such as `__objc_const`, before mutable data.
+            builder.add_section(output_section_id::OBJC_SELECTOR_REFERENCES);
+            add_sections_in_segment_except(
+                &mut builder,
+                output_sections,
+                &custom.data,
+                segment,
+                b"__objc_const",
+            );
+            // Thread-local payloads are ordinary Mach-O `__DATA` sections, even though the
+            // generic layout keeps them separate so it can preserve TLS-specific liveness and
+            // zero-fill semantics. Keep the data/zero-fill ordering adjacent to their ordinary
+            // counterparts; dyld's TLS descriptor points into these final addresses.
+            add_sections_in_segment(&mut builder, output_sections, &custom.tdata, segment);
             add_sections_in_segment(&mut builder, output_sections, &custom.bss, segment);
+            add_sections_in_segment(&mut builder, output_sections, &custom.tbss, segment);
         }
         builder.add_section(output_section_id::COMMON);
 
@@ -3114,13 +3391,24 @@ impl platform::Platform for MachO {
     }
 
     fn default_symtab_entry() -> Self::SymtabEntry {
-        Self::SymtabEntry {
-            n_strx: Default::default(),
-            n_type: Default::default(),
-            n_sect: Default::default(),
-            n_desc: Default::default(),
-            n_value: Default::default(),
-        }
+        SymtabEntry::from_raw(
+            RawSymtabEntry {
+                n_strx: Default::default(),
+                n_type: Default::default(),
+                n_sect: Default::default(),
+                n_desc: Default::default(),
+                n_value: Default::default(),
+            },
+            SymbolSectionProperties::default(),
+        )
+    }
+
+    fn output_symtab_entry_size() -> usize {
+        size_of::<RawSymtabEntry>()
+    }
+
+    fn tls_nobits_extend_load_segment() -> bool {
+        true
     }
 
     fn last_part_size_to_extend(
@@ -3389,6 +3677,29 @@ const SECTION_DEFINITIONS: [BuiltInSectionDetails; NUM_BUILT_IN_SECTIONS] = {
         min_alignment: Alignment { exponent: 2 },
         ..DEFAULT_DEFS
     };
+    defs[output_section_id::OBJC_MESSAGE_STUBS.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionIdentity::new(
+            SectionName(b"__objc_stubs"),
+            Some(SegmentName::TEXT),
+        )),
+        section_flags: macho::S_REGULAR
+            .to_flags()
+            .with(macho::S_ATTR_PURE_INSTRUCTIONS)
+            .with(macho::S_ATTR_SOME_INSTRUCTIONS),
+        min_alignment: Alignment { exponent: 5 },
+        ..DEFAULT_DEFS
+    };
+    defs[output_section_id::OBJC_SELECTOR_REFERENCES.as_usize()] = BuiltInSectionDetails {
+        kind: SectionKind::Primary(SectionIdentity::new(
+            SectionName(b"__objc_selrefs"),
+            Some(SegmentName::DATA),
+        )),
+        section_flags: macho::S_LITERAL_POINTERS
+            .to_flags()
+            .with(S_ATTR_NO_DEAD_STRIP),
+        min_alignment: alignment::USIZE,
+        ..DEFAULT_DEFS
+    };
     defs[output_section_id::EH_FRAME.as_usize()] = BuiltInSectionDetails {
         kind: SectionKind::Primary(SectionIdentity::new(
             SectionName(b"__eh_frame"),
@@ -3566,6 +3877,40 @@ fn add_sections_in_segment<'data>(
     }
 }
 
+fn add_named_sections_in_segment<'data>(
+    builder: &mut OutputOrderBuilder<'_, 'data, MachO>,
+    output_sections: &crate::output_section_id::OutputSections<'data, MachO>,
+    sections: &[OutputSectionId],
+    segment: SegmentName,
+    section_name: &[u8],
+) {
+    for &section_id in sections {
+        if output_sections.identity(section_id).is_some_and(|identity| {
+            identity.format_specific() == Some(segment)
+                && identity.section_name().0 == section_name
+        }) {
+            builder.add_section(section_id);
+        }
+    }
+}
+
+fn add_sections_in_segment_except<'data>(
+    builder: &mut OutputOrderBuilder<'_, 'data, MachO>,
+    output_sections: &crate::output_section_id::OutputSections<'data, MachO>,
+    sections: &[OutputSectionId],
+    segment: SegmentName,
+    excluded_section_name: &[u8],
+) {
+    for &section_id in sections {
+        if output_sections.identity(section_id).is_some_and(|identity| {
+            identity.format_specific() == Some(segment)
+                && identity.section_name().0 != excluded_section_name
+        }) {
+            builder.add_section(section_id);
+        }
+    }
+}
+
 #[inline(always)]
 fn process_relocation<'data, 'scope, A: platform::Arch<Platform = MachO>>(
     object: &layout::ObjectLayoutState<'data, MachO>,
@@ -3583,6 +3928,10 @@ fn process_relocation<'data, 'scope, A: platform::Arch<Platform = MachO>>(
         let local_symbol = object.object.symbol(local_sym_index)?;
         let symbol_id = symbol_db.definition(local_symbol_id);
         let target_is_dynamic = is_dynamic_library(&symbol_db.file(symbol_db.file_id_for_symbol(symbol_id)));
+        let objc_selector_dispatch = objc_message_selector(
+            object.object.raw_symbol_name(local_sym_index)?,
+        )
+        .is_some();
 
         let mut flags = resources.local_flags_for_symbol(symbol_id);
         flags.merge(resources.local_flags_for_symbol(local_symbol_id));
@@ -3591,13 +3940,15 @@ fn process_relocation<'data, 'scope, A: platform::Arch<Platform = MachO>>(
         // Record range-limited calls while the graph still knows their source section. The
         // generic thunk planner decides after GC whether this particular call can remain direct
         // and, if not, assigns a nearby `__TEXT,__text` island to its owning object.
-        crate::thunks::handle_thunk_extensions_for_relocation::<A>(
-            object.section_part_id(section_index, &resources.symbol_db.section_part_ids),
-            resources,
-            local_symbol_id,
-            symbol_id,
-            rel_info,
-        );
+        if !objc_selector_dispatch {
+            crate::thunks::handle_thunk_extensions_for_relocation::<A>(
+                object.section_part_id(section_index, &resources.symbol_db.section_part_ids),
+                resources,
+                local_symbol_id,
+                symbol_id,
+                rel_info,
+            );
+        }
         let mut flags_to_add = layout::resolution_flags(relocation.kind);
         if target_is_dynamic {
             flags_to_add |= if local_symbol.is_weak_reference() {
@@ -3620,7 +3971,7 @@ fn process_relocation<'data, 'scope, A: platform::Arch<Platform = MachO>>(
             }
             // TODO: classify symbols more reliably, likely by checking whether their section is
             // __text.
-            if rel_info.r_type == object::macho::ARM64_RELOC_BRANCH26
+            if (rel_info.r_type == object::macho::ARM64_RELOC_BRANCH26 && !objc_selector_dispatch)
                 // A local TLS descriptor stores this libSystem function pointer directly. Make
                 // it point at the normal PLT stub so its chained GOT bind remains callable.
                 || (rel_info.r_type == object::macho::ARM64_RELOC_UNSIGNED
@@ -3802,6 +4153,90 @@ fn is_dynamic_library(file: &SequencedInput<MachO>) -> bool {
         SequencedInput::Object(obj) => obj.is_dynamic(),
         _ => false,
     }
+}
+
+/// Finds the live Clang ARM64 selector-send references in one object after graph loading.
+///
+/// The input's synthetic `_objc_msgSend$selector` symbol is deliberately not put in the final
+/// symbol database: it aliases `_objc_msgSend` for ordinary dylib resolution. Preserve its input
+/// identity here so the writer can replace precisely its `BRANCH26` relocation with the local
+/// selector-loading stub. `__objc_methname` owns the selector spelling that the companion
+/// `__objc_selrefs` slot must point at.
+fn objc_message_references_for_object<'data>(
+    object: &layout::ObjectLayoutState<'data, MachO>,
+) -> Result<Vec<(ObjcMessageSymbol, &'data [u8], ObjcMessageSymbol)>> {
+    let mut references = Vec::new();
+
+    for (section_index, slot) in object.sections.iter().enumerate() {
+        if !matches!(slot, resolution::SectionSlot::Loaded(_)) {
+            continue;
+        }
+        let section_index = object::SectionIndex(section_index);
+        for relocation in paired_relocations(object.relocations(section_index)?.relocations) {
+            let relocation = relocation?;
+            let info = relocation.info;
+            if !info.r_extern
+                || info.r_type != macho::ARM64_RELOC_BRANCH26
+                || !object.input_offset_is_live(section_index, u64::from(info.r_address))
+            {
+                continue;
+            }
+
+            let message_symbol = ObjcMessageSymbol {
+                file_id: object.file_id,
+                symbol: info.r_symbolnum as usize,
+            };
+            let Some(selector) = objc_message_selector(
+                object.object.raw_symbol_name(SymbolIndex(message_symbol.symbol))?,
+            )
+            else {
+                continue;
+            };
+            let selector_symbol = objc_selector_symbol(object.object, selector)?.with_context(|| {
+                format!(
+                    "Mach-O Objective-C selector {} has no matching symbol in __objc_methname for {}",
+                    String::from_utf8_lossy(selector),
+                    object.input
+                )
+            })?;
+            let selector_symbol = ObjcMessageSymbol {
+                file_id: object.file_id,
+                symbol: selector_symbol.0,
+            };
+            let reference = (message_symbol, selector, selector_symbol);
+            if !references.contains(&reference) {
+                references.push(reference);
+            }
+        }
+    }
+
+    Ok(references)
+}
+
+/// Finds the named `__objc_methname` string that backs one synthetic selector-send symbol.
+/// A selector slot must refer to the same input string as Objective-C method metadata; accepting
+/// a substring would produce a valid-looking pointer that libobjc cannot canonicalise.
+fn objc_selector_symbol(file: &File<'_>, selector: &[u8]) -> Result<Option<SymbolIndex>> {
+    for (symbol_index, symbol) in file.enumerate_symbols() {
+        let Some(section_index) = file.symbol_section(symbol, symbol_index)? else {
+            continue;
+        };
+        let section = file.section(section_index)?;
+        if section.name() != b"__objc_methname" {
+            continue;
+        }
+        let offset = usize::try_from(file.symbol_offset_in_section(symbol, section_index)?)
+            .context("Mach-O Objective-C selector offset does not fit usize")?;
+        let data = file.raw_section_data(section)?;
+        let Some(end) = data.get(offset..).and_then(|tail| tail.iter().position(|&byte| byte == 0))
+        else {
+            continue;
+        };
+        if data[offset..offset + end] == *selector {
+            return Ok(Some(symbol_index));
+        }
+    }
+    Ok(None)
 }
 
 impl<'data> File<'data> {
@@ -4343,6 +4778,68 @@ mod tests {
         assert!(!is_tls_section_type(macho::S_THREAD_LOCAL_VARIABLES));
         assert!(!is_tls_section_type(macho::S_THREAD_LOCAL_VARIABLE_POINTERS));
         assert!(!is_tls_section_type(macho::S_REGULAR));
+    }
+
+    fn test_symbol(section_properties: SymbolSectionProperties) -> SymtabEntry {
+        let mut raw = RawSymtabEntry {
+            n_strx: Default::default(),
+            n_type: Default::default(),
+            n_sect: Default::default(),
+            n_desc: Default::default(),
+            n_value: Default::default(),
+        };
+        raw.n_type = raw.n_type.with_type(N_SECT);
+        raw.n_type.insert(N_EXT);
+        SymtabEntry::from_raw(raw, section_properties)
+    }
+
+    fn test_undefined_symbol() -> SymtabEntry {
+        let mut raw = RawSymtabEntry {
+            n_strx: Default::default(),
+            n_type: Default::default(),
+            n_sect: Default::default(),
+            n_desc: Default::default(),
+            n_value: Default::default(),
+        };
+        raw.n_type = raw.n_type.with_type(N_UNDF);
+        raw.n_type.insert(N_EXT);
+        SymtabEntry::from_raw(raw, SymbolSectionProperties::default())
+    }
+
+    #[test]
+    fn symbol_properties_follow_the_defining_section() {
+        let function = test_symbol(
+            SymbolSectionProperties {
+                is_tls: false,
+                is_func: true,
+            },
+        );
+        assert!(function.is_func());
+        assert!(!function.is_tls());
+        assert_eq!(function.debug_string(), "Global Func");
+
+        let tls = test_symbol(
+            SymbolSectionProperties {
+                is_tls: true,
+                is_func: false,
+            },
+        );
+        assert!(tls.is_tls());
+        assert!(!tls.is_func());
+        assert_eq!(tls.debug_string(), "Global Tls");
+
+        let undefined = test_undefined_symbol();
+        assert_eq!(undefined.debug_string(), "Global Undefined");
+    }
+
+    #[test]
+    fn section_attributes_keep_macho_tls_section_types() {
+        let tls = SectionAttributes::new(S_THREAD_LOCAL_REGULAR.to_flags(), Some(SegmentName::DATA));
+        assert!(platform::SectionAttributes::is_tls(&tls));
+
+        let descriptor =
+            SectionAttributes::new(S_THREAD_LOCAL_VARIABLES.to_flags(), Some(SegmentName::DATA));
+        assert!(!platform::SectionAttributes::is_tls(&descriptor));
     }
 
     #[test]

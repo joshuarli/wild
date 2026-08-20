@@ -91,6 +91,26 @@ Import { library: "/usr/lib/libSystem.B.dylib", name: "dyld_stub_binder" }
 ...
 ```
 
+`S_THREAD_LOCAL_REGULAR` and `S_THREAD_LOCAL_ZEROFILL` are TLS payload sections. The latter has
+no file bytes, but Mach-O places it in `__DATA`, so it still extends the containing segment's
+virtual-memory size. This differs from ELF, where `.tbss` is described by a dedicated `PT_TLS`
+program header and does not extend a normal `PT_LOAD`. `S_THREAD_LOCAL_VARIABLES` and
+`S_THREAD_LOCAL_VARIABLE_POINTERS` are descriptor/pointer sections, not payload storage.
+
+## Modern ARM64 Objective-C selector dispatch
+
+Clang's default ARM64 message-send ABI leaves an undefined
+`_objc_msgSend$<nonempty-selector>` branch in an object. This is a linker protocol spelling, not
+an exported libobjc symbol. Wild resolves its dynamic target as `_objc_msgSend`, then synthesizes
+one lexical 32-byte `__TEXT,__objc_stubs` veneer and one 8-byte rebased
+`__DATA,__objc_selrefs` slot per live selector. The stub loads the selector into `x1`, loads the
+real `_objc_msgSend` from its GOT slot, and branches to it. The selector slot points to the final
+merged `__objc_methname` string and therefore participates in the chained local-rebase plan.
+
+Only Clang's default ARM64 `_objc_msgSend$selector` form is implemented. `-const_selrefs`, other
+selector message forms, generic Objective-C metadata linking, Objective-C dSYM maps, and
+range-extension islands for selector veneers remain outside this bounded support.
+
 - generally speaking the mach-O format is pretty close to the ELF container
 
 ## - `__compact_unwind` format

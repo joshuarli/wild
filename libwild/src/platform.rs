@@ -943,6 +943,23 @@ pub(crate) trait Platform:
     /// from an input file.
     fn default_symtab_entry() -> Self::SymtabEntry;
 
+    /// Size of one entry in the output symbol table.
+    ///
+    /// Most formats use their input symbol representation unchanged. Mach-O additionally keeps
+    /// section-derived classification beside each input nlist, while the output still serializes
+    /// the ABI's fixed-width raw nlist record.
+    fn output_symtab_entry_size() -> usize {
+        std::mem::size_of::<Self::SymtabEntry>()
+    }
+
+    /// Whether a thread-local zero-fill input section extends its containing ordinary load
+    /// segment. ELF keeps this storage exclusively in `PT_TLS`, so its normal `PT_LOAD` extent
+    /// must omit it. Mach-O instead has no TLS program segment: `__thread_bss` resides within
+    /// `__DATA` and therefore must extend that segment's virtual-memory size.
+    fn tls_nobits_extend_load_segment() -> bool {
+        false
+    }
+
     fn lookup_for_partial_link(
         _section_name: &[u8],
         _section: &Self::SectionHeader,

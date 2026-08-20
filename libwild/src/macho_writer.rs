@@ -44,6 +44,8 @@ use crate::macho::FileHeader;
 use crate::macho::GOT_ENTRY_SIZE;
 use crate::macho::ImportedSymbolBinding;
 use crate::macho::MACHO_COMMAND_ALIGNMENT;
+use crate::macho::OBJC_MESSAGE_STUB_SIZE;
+use crate::macho::OBJC_SELECTOR_REFERENCE_SIZE;
 #[cfg(test)]
 use crate::macho::MACHO_START_MEM_ADDRESS;
 use crate::macho::MAX_SEGMENT_COUNT;
@@ -66,6 +68,7 @@ use crate::macho::output_section_id;
 use crate::macho::output_section_id::LOAD_COMMANDS;
 use crate::macho::part_id;
 use crate::macho::parse_eh_frame_records;
+use crate::macho::objc_message_selector;
 use crate::output_section_id::OrderEvent;
 use crate::output_section_id::OutputSectionId;
 use crate::output_section_id::SectionName;
@@ -84,8 +87,9 @@ use crate::timing_phase;
 use crate::value_flags::ValueFlags;
 use crate::verbose_timing_phase;
 use itertools::Itertools;
-#[cfg(test)]
 use linker_utils::elf::AArch64Instruction;
+use linker_utils::elf::PAGE_MASK_4KB;
+use linker_utils::elf::SIZE_4KB;
 use linker_utils::elf::RelocationKind;
 use linker_utils::utils::slice_from_all_bytes_mut;
 use object::BigEndian;
@@ -187,6 +191,15 @@ pub(crate) fn write<'data, A: Arch<Platform = MachO>>(
 
     let mut section_buffers = split_output_into_sections(layout, &mut sized_output.out).0;
     write_plt_entries::<A>(layout, section_buffers.get_mut(output_section_id::PLT_GOT))?;
+    let objc_selector_rebases = write_objc_message_stubs(
+        layout,
+        section_buffers.get_mut(output_section_id::OBJC_MESSAGE_STUBS),
+    )?;
+    write_objc_selector_references(
+        layout,
+        &objc_selector_rebases,
+        section_buffers.get_mut(output_section_id::OBJC_SELECTOR_REFERENCES),
+    )?;
     let mut merged_string_buffers = split_buffers_by_alignment(&mut section_buffers, layout);
     write_merged_strings(layout, &mut merged_string_buffers);
     drop(merged_string_buffers);
@@ -207,6 +220,7 @@ pub(crate) fn write<'data, A: Arch<Platform = MachO>>(
         layout,
         &sized_output.out,
         &eh_frame_plan.personality_got_rebases,
+        &objc_selector_rebases,
     )?;
     let mut section_buffers = split_output_into_sections(layout, &mut sized_output.out).0;
     write_chained_fixup_table(
@@ -1482,9 +1496,14 @@ fn write_file<'data, A: Arch<Platform = MachO>>(
         }
         FileLayout::Prelude(s) => write_prelude(s, buffers, layout, exports_trie)?,
         FileLayout::Epilogue(s) => write_epilogue(s, buffers, layout, exports_trie)?,
-        _ => {
-            // TODO
-        }
+        // These layout records contribute symbol resolution or load-command metadata, but no
+        // input bytes. Mach-O writes their dynamic metadata from the prelude/epilogue instead of
+        // silently falling through a wildcard here.
+        FileLayout::Dynamic(_)
+        | FileLayout::StubLibrary(_)
+        | FileLayout::SyntheticSymbols(_)
+        | FileLayout::LinkerScript(_)
+        | FileLayout::NotLoaded => {}
     }
     Ok(())
 }
@@ -2272,6 +2291,7 @@ fn chained_fixups(
     layout: &MachOLayout<'_>,
     output: &[u8],
     eh_frame_personality_rebases: &BTreeMap<u64, u64>,
+    objc_selector_rebases: &BTreeMap<u64, u64>,
 ) -> Result<ChainedFixups> {
     let symbols = &layout.format_specific.imported_symbols;
     let got_layout = layout.section_layouts.get(output_section_id::GOT);
@@ -2321,6 +2341,14 @@ fn chained_fixups(
     for fixup in local_got_rebase_fixups(layout, eh_frame_personality_rebases)? {
         let (segment_index, _) = segment_for_address(layout, fixup.address, GOT_ENTRY_SIZE)?;
         fixups_by_segment[segment_index].push(fixup);
+    }
+
+    for (&address, &target) in objc_selector_rebases {
+        let (segment_index, _) = segment_for_address(layout, address, GOT_ENTRY_SIZE)?;
+        fixups_by_segment[segment_index].push(ChainedFixup {
+            address,
+            kind: ChainedFixupKind::Rebase { target },
+        });
     }
 
     let mut segments = Vec::new();
@@ -2428,6 +2456,206 @@ fn write_plt_entries<A: Arch<Platform = MachO>>(
     }
 
     Ok(())
+}
+
+// `ADRP x1; LDR x1, [x1, #low12]; ADRP x16; LDR x16, [x16, #low12]; BR x16; BRK #1 * 3`.
+// This is ld64's fixed ARM64 modern Objective-C message veneer. A normal 12-byte dyld stub
+// cannot replace it because Clang deliberately leaves x1 uninitialised at the branch site.
+const OBJC_MESSAGE_STUB_TEMPLATE: [u8; OBJC_MESSAGE_STUB_SIZE as usize] = [
+    0x01, 0x00, 0x00, 0x90, // ADRP x1, page(__objc_selrefs)
+    0x21, 0x00, 0x40, 0xf9, // LDR  x1, [x1, #selector-ref-low12]
+    0x10, 0x00, 0x00, 0x90, // ADRP x16, page(_objc_msgSend@GOT)
+    0x10, 0x02, 0x40, 0xf9, // LDR  x16, [x16, #got-low12]
+    0x00, 0x02, 0x1f, 0xd6, // BR   x16
+    0x20, 0x00, 0x20, 0xd4, // BRK  #1
+    0x20, 0x00, 0x20, 0xd4, // BRK  #1
+    0x20, 0x00, 0x20, 0xd4, // BRK  #1
+];
+
+/// Writes the code half of ld64's modern Objective-C selector dispatch ABI and returns the
+/// selector-reference rebases that dyld must own. The references themselves are serialized
+/// separately so `OutputSectionPartMap` never has to yield two mutable section slices at once.
+fn write_objc_message_stubs(
+    layout: &MachOLayout<'_>,
+    stubs: &mut [u8],
+) -> Result<BTreeMap<u64, u64>> {
+    if layout.format_specific.objc_message_stubs.is_empty() {
+        ensure!(
+            stubs.is_empty(),
+            "Mach-O allocated __objc_stubs without a selector-dispatch plan"
+        );
+        return Ok(BTreeMap::new());
+    }
+
+    let stubs_layout = layout.section_layouts.get(output_section_id::OBJC_MESSAGE_STUBS);
+    let selrefs_layout = layout
+        .section_layouts
+        .get(output_section_id::OBJC_SELECTOR_REFERENCES);
+    let expected_stub_size = layout
+        .format_specific
+        .objc_message_stubs
+        .len()
+        .checked_mul(OBJC_MESSAGE_STUB_SIZE as usize)
+        .context("Mach-O Objective-C stub size overflows usize")?;
+    ensure!(
+        stubs.len() >= expected_stub_size,
+        "Mach-O __objc_stubs allocation is smaller than the selector-dispatch plan"
+    );
+    let mut selector_rebases = BTreeMap::new();
+
+    for (index, plan) in layout.format_specific.objc_message_stubs.iter().enumerate() {
+        let offset = index
+            .checked_mul(OBJC_MESSAGE_STUB_SIZE as usize)
+            .context("Mach-O Objective-C stub offset overflows usize")?;
+        let stub = stubs
+            .get_mut(offset..offset + OBJC_MESSAGE_STUB_SIZE as usize)
+            .context("Mach-O __objc_stubs allocation ended inside a selector stub")?;
+        let stub_address = stubs_layout
+            .mem_offset
+            .checked_add(offset as u64)
+            .context("Mach-O Objective-C stub address overflows")?;
+        let selector_ref_address = selrefs_layout
+            .mem_offset
+            .checked_add(
+                u64::try_from(index)
+                    .context("Mach-O Objective-C selector index overflows u64")?
+                    .checked_mul(OBJC_SELECTOR_REFERENCE_SIZE)
+                    .context("Mach-O Objective-C selector-reference offset overflows")?,
+            )
+            .context("Mach-O Objective-C selector-reference address overflows")?;
+        let selector_address = objc_selector_address(layout, plan.selector_symbol)?;
+
+        let FileLayout::Object(message_object) = layout.file_layout(plan.message_symbol.file_id)
+        else {
+            bail!("Mach-O Objective-C message symbol belongs to a non-object input");
+        };
+        let local_symbol_id = message_object
+            .symbol_id_range
+            .input_to_id(SymbolIndex(plan.message_symbol.symbol));
+        let symbol_id = layout.symbol_db.definition(local_symbol_id);
+        let got_address = layout
+            .symbol_resolutions
+            .get(symbol_id)
+            .and_then(|resolution| resolution.format_specific.got_address)
+            .context("Mach-O Objective-C message target has no _objc_msgSend GOT slot")?
+            .get();
+
+        stub.copy_from_slice(&OBJC_MESSAGE_STUB_TEMPLATE);
+        let (selector_adrp, rest) = stub.split_at_mut(4);
+        let (selector_ldr, rest) = rest.split_at_mut(4);
+        let (got_adrp, rest) = rest.split_at_mut(4);
+        let (got_ldr, _) = rest.split_at_mut(4);
+        write_objc_stub_address(
+            stub_address,
+            selector_ref_address,
+            selector_adrp,
+            selector_ldr,
+        )?;
+        write_objc_stub_address(stub_address, got_address, got_adrp, got_ldr)?;
+
+        if let Some(previous) = selector_rebases.insert(selector_ref_address, selector_address) {
+            ensure!(
+                previous == selector_address,
+                "conflicting Mach-O Objective-C selector references at {selector_ref_address:#x}"
+            );
+        }
+    }
+
+    Ok(selector_rebases)
+}
+
+/// Serializes the data half of the selector ABI before chained-fixup encoding replaces these raw
+/// image pointers with slide-aware rebases.
+fn write_objc_selector_references(
+    layout: &MachOLayout<'_>,
+    selector_rebases: &BTreeMap<u64, u64>,
+    references: &mut [u8],
+) -> Result {
+    let refs_layout = layout
+        .section_layouts
+        .get(output_section_id::OBJC_SELECTOR_REFERENCES);
+    for (&address, &target) in selector_rebases {
+        let offset = usize::try_from(
+            address
+                .checked_sub(refs_layout.mem_offset)
+                .context("Mach-O Objective-C selector reference precedes __objc_selrefs")?,
+        )
+        .context("Mach-O Objective-C selector-reference offset does not fit usize")?;
+        let out = references
+            .get_mut(offset..offset + OBJC_SELECTOR_REFERENCE_SIZE as usize)
+            .context("Mach-O __objc_selrefs allocation ended inside a selector reference")?;
+        out.copy_from_slice(&target.to_le_bytes());
+    }
+    Ok(())
+}
+
+/// Patches an ADRP/LDR pair to a forward synthetic address. Objective-C selector references and
+/// `_objc_msgSend`'s GOT both live after `__objc_stubs` in the default Mach-O output order.
+fn write_objc_stub_address(
+    stub_address: u64,
+    target_address: u64,
+    adrp: &mut [u8],
+    ldr: &mut [u8],
+) -> Result {
+    let page_address = stub_address & !PAGE_MASK_4KB;
+    let offset = target_address
+        .checked_sub(page_address)
+        .context("Mach-O Objective-C stub target precedes its page")?;
+    ensure!(
+        offset < (1 << 32),
+        "Mach-O Objective-C stub target is more than 4GiB away"
+    );
+    AArch64Instruction::Adr.write_to_value(offset / SIZE_4KB, false, adrp);
+    AArch64Instruction::MachOLow12.write_to_value(offset & PAGE_MASK_4KB, false, ldr);
+    Ok(())
+}
+
+/// Resolves a selector's exact input method-name symbol through the regular merge-string map.
+/// The `__objc_selrefs` value must be the canonical final C string, not a pre-merge source
+/// address or a coincidentally equal offset from another object.
+fn objc_selector_address(
+    layout: &MachOLayout<'_>,
+    selector_symbol: crate::macho::ObjcMessageSymbol,
+) -> Result<u64> {
+    let FileLayout::Object(object) = layout.file_layout(selector_symbol.file_id) else {
+        bail!("Mach-O Objective-C selector belongs to a non-object input");
+    };
+    let selector_symbol_index = SymbolIndex(selector_symbol.symbol);
+    let symbol = object.object.symbol(selector_symbol_index)?;
+    let section_index = object
+        .object
+        .symbol_section(symbol, selector_symbol_index)?
+        .context("Mach-O Objective-C selector is not section-defined")?;
+
+    if matches!(object.sections[section_index.0], SectionSlot::MergeStrings(_)) {
+        return crate::string_merging::get_merged_string_output_address::<MachO>(
+            selector_symbol_index,
+            0,
+            object.object,
+            &object.sections,
+            &layout.symbol_db.section_part_ids,
+            object.section_id_range,
+            &layout.merged_strings,
+            &layout.merged_string_start_addresses,
+            false,
+        )?
+        .context("Mach-O Objective-C selector was not present in merged __objc_methname output");
+    }
+
+    let section_address = object.section_resolutions[section_index.0]
+        .address()
+        .context("Mach-O Objective-C selector section has no output address")?;
+    let offset = object
+        .output_offset_for_input(
+            section_index,
+            object
+                .object
+                .symbol_offset_in_section(symbol, section_index)?,
+        )
+        .context("Mach-O Objective-C selector is in a dead atom")?;
+    section_address
+        .checked_add(offset)
+        .context("Mach-O Objective-C selector address overflows")
 }
 
 fn populate_file_header(
@@ -2766,13 +2994,55 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
     let (resolution, symbol_index, local_symbol_id) = get_resolution(rel, object_layout, layout)?;
     let flags = layout.flags_for_symbol(local_symbol_id);
 
+    let objc_stub_address = objc_message_selector(
+        object_layout
+            .object
+            .raw_symbol_name(symbol_index)?,
+    )
+    .map(|_| {
+        ensure!(
+            rel.r_type == object::macho::ARM64_RELOC_BRANCH26 && addend == 0 && subtractor.is_none(),
+            "Mach-O Objective-C selector dispatch requires a plain ARM64_RELOC_BRANCH26"
+        );
+        let message_symbol = crate::macho::ObjcMessageSymbol {
+            file_id: object_layout.file_id,
+            symbol: symbol_index.0,
+        };
+        let index = *layout
+            .format_specific
+            .objc_message_stub_indexes
+            .get(&message_symbol)
+            .with_context(|| {
+                format!(
+                    "Mach-O Objective-C selector branch {} has no synthesized stub",
+                    String::from_utf8_lossy(
+                        object_layout.object.raw_symbol_name(symbol_index).unwrap_or(b"<invalid>"),
+                    )
+                )
+            })?;
+        layout
+            .section_layouts
+            .get(output_section_id::OBJC_MESSAGE_STUBS)
+            .mem_offset
+            .checked_add(
+                u64::try_from(index)
+                    .context("Mach-O Objective-C stub index overflows u64")?
+                    .checked_mul(OBJC_MESSAGE_STUB_SIZE)
+                    .context("Mach-O Objective-C stub offset overflows")?,
+            )
+            .context("Mach-O Objective-C stub address overflows")
+    })
+    .transpose()?;
+
     let mask = get_page_mask(rel_info.mask);
     // A definition can have both direct references and a local GOT use. `create_resolution`
     // rewrites `raw_value` to the GOT slot for the latter, but an ordinary relocation still
     // needs the definition address. Rust's proc-macro bridge stores a local callback in TLS;
     // writing that pointer as the GOT address jumps into non-executable __DATA_CONST when the
     // callback is invoked. Dynamic definitions and PLT calls retain their existing indirection.
-    let symbol_value = if matches!(rel_info.kind, RelocationKind::Got | RelocationKind::GotRelative)
+    let symbol_value = if let Some(address) = objc_stub_address {
+        address
+    } else if matches!(rel_info.kind, RelocationKind::Got | RelocationKind::GotRelative)
     {
         resolution
             .format_specific

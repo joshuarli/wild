@@ -96,7 +96,6 @@ use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::fmt::Display;
 use std::mem::replace;
-use std::mem::size_of;
 use std::mem::swap;
 use std::mem::take;
 use std::num::NonZeroU32;
@@ -2015,6 +2014,7 @@ fn compute_segment_layout<'data, P: Platform>(
                         if section_info.section_attributes.is_tls()
                             && section_info.section_attributes.is_no_bits()
                             && !program_segments.is_tls_segment(rec.segment_id)
+                            && !P::tls_nobits_extend_load_segment()
                         {
                             continue;
                         }
@@ -2540,7 +2540,7 @@ impl<'data, P: Platform> GroupState<'data, P> {
             .map(|file| file.finalise_layout(memory_offsets, resolutions_out, resources))
             .collect::<Result<Vec<_>>>()?;
 
-        let entry_size = size_of::<P::SymtabEntry>() as u64;
+        let entry_size = P::output_symtab_entry_size() as u64;
         let symtab_local_start_index = P::SYMTAB_LOCAL_SECTION_ID
             .and_then(|section_id| {
                 P::single_part_id(section_id).map(|part_id| (section_id, part_id))
@@ -3309,7 +3309,7 @@ impl<'data, P: Platform> PreludeLayoutState<'data, P> {
             &mut extra_sizes,
         )?;
 
-        let entry_size = size_of::<P::SymtabEntry>() as u64;
+        let entry_size = P::output_symtab_entry_size() as u64;
 
         if resources.symbol_db.args.should_output_partial_object() {
             let mut num_section_syms = 0;
@@ -4033,7 +4033,7 @@ impl<'data, P: Platform> EpilogueLayoutState<P> {
             .map(|(section_id, part_id)| {
                 ((memory_offsets.get(part_id)
                     - resources.section_layouts.get(section_id).mem_offset)
-                    / size_of::<P::SymtabEntry>() as u64)
+                    / P::output_symtab_entry_size() as u64)
                     .try_into()
                     .context("Too many dynamic symbols")
             })

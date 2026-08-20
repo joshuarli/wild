@@ -92,6 +92,7 @@
 //!
 //! ExpectSection:{section_name} [properties] Checks that the specified section exists in the
 //! output binary. Optional properties:
+//!   size=N: Asserts the exact serialized section size in bytes.
 //!   max_entries=N: Asserts the section has at most N entries (uses the section's sh_entsize,
 //!   or 1 if sh_entsize is 0).
 //!   flags=WAX: Asserts the section has the specified section flags.
@@ -2503,6 +2504,8 @@ struct ExpectedSection {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct SectionAssertions {
+    size: Option<u64>,
+
     max_entries: Option<u64>,
 
     #[serde(deserialize_with = "SectionFlags::deserialize", default)]
@@ -4553,6 +4556,12 @@ fn compiler_for_file(
             get_c_compiler(&config.compiler, CLanguage::C, cross_arch)?,
             CompilerKind::C,
         ),
+        // Clang chooses Objective-C from the source suffix; it otherwise uses the same driver
+        // and target arguments as a C Mach-O source.
+        "m" => (
+            get_c_compiler(&config.compiler, CLanguage::C, cross_arch)?,
+            CompilerKind::C,
+        ),
         "s" => (
             get_c_compiler(&config.compiler, CLanguage::C, cross_arch)?,
             CompilerKind::C,
@@ -5836,6 +5845,15 @@ impl Assertions {
                 .with_context(|| {
                     format!("Expected section `{}` not found", expected.section_name)
                 })?;
+
+            if let Some(expected_size) = expected.assertions.size {
+                ensure!(
+                    section.size() == expected_size,
+                    "Section `{}` size mismatch: expected {expected_size:#x}, got {:#x}",
+                    expected.section_name,
+                    section.size()
+                );
+            }
 
             if let Some(expected_flags) = expected.assertions.flags {
                 let flags = match section.flags() {
@@ -8109,7 +8127,7 @@ fn run_integration_test(
 
 /// Determine the name of the primary source file for a test source directory.
 fn identify_primary_source(test_src_dir: &Path, test_name: &str) -> Result<PathBuf> {
-    let extensions = &["rs", "c", "cc", "s", "wat"];
+    let extensions = &["rs", "c", "cc", "m", "s", "wat"];
 
     for ext in extensions {
         let path = test_src_dir.join(format!("{test_name}.{ext}"));

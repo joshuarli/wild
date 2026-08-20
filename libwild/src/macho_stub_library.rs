@@ -18,6 +18,7 @@ use crate::error::Result;
 use crate::macho::DylibMetadata;
 use crate::macho::DylibVersions;
 use serde::Deserialize;
+use colosseum::sync::Arena;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
@@ -81,6 +82,9 @@ struct Exports<'a> {
     #[serde(default)]
     #[serde(borrow)]
     weak_symbols: Vec<&'a str>,
+    #[serde(default)]
+    #[serde(borrow)]
+    objc_classes: Vec<&'a str>,
 }
 // TODO: remove
 #[allow(unused)]
@@ -92,11 +96,30 @@ pub(crate) struct DefinedStubLibrary<'a> {
     pub(crate) symbols: Vec<&'a str>,
     /// Weak symbols defined by the library or by any reexported child library.
     pub(crate) weak_symbols: Vec<&'a str>,
+    /// TAPI keeps Objective-C class names separate from ordinary Mach-O symbols. These are
+    /// materialized into `symbols` once the input loader has an arena whose lifetime reaches the
+    /// symbol database.
+    objc_classes: Vec<&'a str>,
 }
 
 impl DefinedStubLibrary<'_> {
     pub(crate) fn total_symbols(&self) -> usize {
         self.symbols.len() + self.weak_symbols.len()
+    }
+}
+
+impl<'data> DefinedStubLibrary<'data> {
+    pub(crate) fn materialize_objc_class_symbols(
+        &mut self,
+        generated_symbol_names: &'data Arena<String>,
+    ) {
+        for class_name in &self.objc_classes {
+            let class_symbol = generated_symbol_names.alloc(format!("_OBJC_CLASS_$_{class_name}"));
+            let metaclass_symbol =
+                generated_symbol_names.alloc(format!("_OBJC_METACLASS_$_{class_name}"));
+            self.symbols.push(class_symbol.as_str());
+            self.symbols.push(metaclass_symbol.as_str());
+        }
     }
 }
 
@@ -137,6 +160,7 @@ pub fn parse_defined_library_with_external_reexports<'data>(
         },
         symbols: Vec::new(),
         weak_symbols: Vec::new(),
+        objc_classes: Vec::new(),
     };
 
     let mut libraries_by_install_name = HashMap::new();
@@ -171,6 +195,7 @@ pub fn parse_defined_library_with_external_reexports<'data>(
                 defined_library
                     .weak_symbols
                     .extend(export.weak_symbols.iter());
+                defined_library.objc_classes.extend(export.objc_classes.iter());
             }
         }
 
@@ -357,5 +382,24 @@ exports:
 
         assert_eq!(stub_library.dylib.install_name, b"/usr/lib/libRoot.dylib");
         assert_eq!(stub_library.symbols, ["_root", "_child"]);
+    }
+
+    #[test]
+    fn exposes_objc_class_and_metaclass_symbols() {
+        let mut stub_library = parse_defined_library(
+            r"--- !tapi-tbd
+tbd-version: 4
+targets: [ arm64e-macos ]
+install-name: '/usr/lib/libobjc.A.dylib'
+exports:
+  - targets: [ arm64e-macos ]
+    objc-classes: [ NSObject ]
+",
+        )
+        .expect("definition should parse");
+
+        let arena = Arena::new();
+        stub_library.materialize_objc_class_symbols(&arena);
+        assert_eq!(stub_library.symbols, ["_OBJC_CLASS_$_NSObject", "_OBJC_METACLASS_$_NSObject"]);
     }
 }
