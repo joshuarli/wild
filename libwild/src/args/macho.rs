@@ -801,4 +801,12 @@ mod tests {
 
         assert!(args.const_selrefs);
     }
+
+    #[test]
+    fn rejects_namespace_modes_that_would_make_macho_symbols_interposable() {
+        for option in ["-flat_namespace", "-force_flat_namespace", "-interposable"] {
+            let mut args = MachOArgs::new().unwrap();
+            assert!(args.parse([option].iter()).is_err(), "accepted {option}");
+        }
+    }
 }

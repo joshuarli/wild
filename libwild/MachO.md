@@ -74,6 +74,12 @@ Import { library: "/usr/lib/libSystem.B.dylib", name: "_printf" }
 Import { library: "/usr/lib/libSystem.B.dylib", name: "dyld_stub_binder" }
 ```
 
+Wild emits `MH_TWOLEVEL` for every supported ARM64 Mach-O output. It deliberately rejects
+`-flat_namespace`, `-force_flat_namespace`, and `-interposable`, rather than pretending to
+support symbol interposition modes whose lookup rules it does not implement. A dylib's ordinary
+self-references therefore remain bound to that dylib's own definition; see
+`macho/twolevel-self-binding` for the Apple differential.
+
 - clang -static -> unsupported
 
 - `-fPIC` and `-fno-PIC` are supported

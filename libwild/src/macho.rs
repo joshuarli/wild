@@ -2984,7 +2984,12 @@ impl platform::Platform for MachO {
         _archive_semantics: bool,
         _is_undefined: bool,
     ) -> bool {
-        // TODO
+        // Wild supports only Mach-O's default two-level namespace: the argument parser does not
+        // accept `-flat_namespace`, `-force_flat_namespace`, or `-interposable`, and
+        // `macho_writer::populate_file_header` always emits `MH_TWOLEVEL`. A reference is thus
+        // bound by the static linker to its chosen dylib ordinal (or to this image's definition),
+        // rather than being rebound by flat-namespace lookup. That makes both selected imports
+        // and ordinary dylib self-references non-interposable for every supported ARM64 mode.
         true
     }
 
