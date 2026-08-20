@@ -89,6 +89,7 @@ use object::read::macho::Segment;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::num::NonZeroU8;
 use std::num::NonZeroU64;
 use std::ops::Range;
@@ -4456,7 +4457,15 @@ fn is_dynamic_library(file: &SequencedInput<MachO>) -> bool {
 fn objc_message_references_for_object<'data>(
     object: &layout::ObjectLayoutState<'data, MachO>,
 ) -> Result<Vec<(ObjcMessageSymbol, &'data [u8], ObjcMessageSymbol)>> {
+    // `raw_symbol_name` borrows the input's Mach-O string table, so an object without this byte
+    // sequence cannot contain a synthetic selector-send symbol. Avoid walking every live
+    // relocation in the overwhelmingly common non-Objective-C case.
+    if memchr::memmem::find(object.object.data, b"_objc_msgSend$").is_none() {
+        return Ok(Vec::new());
+    }
+
     let mut references = Vec::new();
+    let mut selector_symbols = None;
 
     for (section_index, slot) in object.sections.iter().enumerate() {
         if !matches!(slot, resolution::SectionSlot::Loaded(_)) {
@@ -4483,13 +4492,24 @@ fn objc_message_references_for_object<'data>(
             else {
                 continue;
             };
-            let selector_symbol = objc_selector_symbol(object.object, selector)?.with_context(|| {
-                format!(
-                    "Mach-O Objective-C selector {} has no matching symbol in __objc_methname for {}",
-                    String::from_utf8_lossy(selector),
-                    object.input
-                )
-            })?;
+            // Selector sends are sparse in most inputs. Build the per-object map only once the
+            // first live send needs it; scanning every symbol again for each send dominates
+            // final layout in Objective-C-heavy links.
+            if selector_symbols.is_none() {
+                selector_symbols = Some(objc_selector_symbols(object.object)?);
+            }
+            let selector_symbol = selector_symbols
+                .as_ref()
+                .expect("Objective-C selector-symbol map was just initialized")
+                .get(selector)
+                .copied()
+                .with_context(|| {
+                    format!(
+                        "Mach-O Objective-C selector {} has no matching symbol in __objc_methname for {}",
+                        String::from_utf8_lossy(selector),
+                        object.input
+                    )
+                })?;
             let selector_symbol = ObjcMessageSymbol {
                 file_id: object.file_id,
                 symbol: selector_symbol.0,
@@ -4504,10 +4524,13 @@ fn objc_message_references_for_object<'data>(
     Ok(references)
 }
 
-/// Finds the named `__objc_methname` string that backs one synthetic selector-send symbol.
+/// Maps each exact `__objc_methname` string to its first input symbol.
+///
 /// A selector slot must refer to the same input string as Objective-C method metadata; accepting
-/// a substring would produce a valid-looking pointer that libobjc cannot canonicalise.
-fn objc_selector_symbol(file: &File<'_>, selector: &[u8]) -> Result<Option<SymbolIndex>> {
+/// a substring would produce a valid-looking pointer that libobjc cannot canonicalise. Preserve
+/// the first symbol in input order so duplicate strings keep the prior lookup behavior.
+fn objc_selector_symbols<'data>(file: &File<'data>) -> Result<HashMap<&'data [u8], SymbolIndex>> {
+    let mut selector_symbols = HashMap::new();
     for (symbol_index, symbol) in file.enumerate_symbols() {
         let Some(section_index) = file.symbol_section(symbol, symbol_index)? else {
             continue;
@@ -4523,11 +4546,11 @@ fn objc_selector_symbol(file: &File<'_>, selector: &[u8]) -> Result<Option<Symbo
         else {
             continue;
         };
-        if data[offset..offset + end] == *selector {
-            return Ok(Some(symbol_index));
-        }
+        selector_symbols
+            .entry(&data[offset..offset + end])
+            .or_insert(symbol_index);
     }
-    Ok(None)
+    Ok(selector_symbols)
 }
 
 impl<'data> File<'data> {
