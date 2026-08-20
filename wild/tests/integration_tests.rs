@@ -141,6 +141,9 @@
 //!
 //! RunEnabled:{bool} Defaults to true. Set to false to disable execution of the resulting binary.
 //!
+//! ExpectedExit:{integer} Defaults to 42. The status code expected from a normally executed
+//! binary. Rust sources compiled with `--test` use the standard test-harness status of 0.
+//!
 //! RunDynSym:{string} If set and RunEnabled:true, then, instead of executing the binary normally,
 //! the binary is loaded as a shared library and the function specified by the string is called. The
 //! function must return an integer to indicate status (status != 42 is an error). Such run is
@@ -439,8 +442,151 @@ fn main() -> Result<std::process::ExitCode> {
     #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
     collect_cargo_macho_staticlib_qualification(&mut tests, &filter)?;
     #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+    collect_real_cargo_macho_corpus(&mut tests, &filter)?;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
     collect_macho_dylib_dependency_qualification(&mut tests, &filter)?;
     Ok(libtest_mimic::run(&args, tests).exit_code())
+}
+
+/// The pinned Cargo corpus deliberately stays out of the per-PR runtime budget. The manually
+/// dispatched macOS qualification workflow opts in with this environment variable, where the
+/// test proves clean/build/test for both the supported stable compiler and the dated nightly.
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+fn collect_real_cargo_macho_corpus(tests: &mut Vec<Trial>, filter: &Filter) -> Result {
+    const NAME: &str = "macho/aarch64/real-cargo-corpus/default";
+    if filter.excludes(NAME) || env::var_os("WILD_RUN_MACHO_REAL_CARGO_CORPUS").is_none() {
+        return Ok(());
+    }
+
+    tests.push(Trial::test(NAME, || {
+        run_real_cargo_macho_corpus().map_err(|e| libtest_mimic::Failed::from(e.to_string()))
+    }));
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+fn run_real_cargo_macho_corpus() -> Result {
+    let manifest = base_dir()
+        .join("tests")
+        .join("cargo_macho_real_corpus")
+        .join("Cargo.toml");
+    ensure!(
+        manifest.is_file(),
+        "missing pinned real Cargo corpus manifest {}",
+        manifest.display()
+    );
+
+    let wild = wild_path()
+        .canonicalize()
+        .with_context(|| format!("failed to resolve Wild linker {}", wild_path().display()))?;
+    let rustflags = format!(
+        "-C linker=clang -C link-arg=--ld-path={} -C link-arg=-v",
+        wild.display()
+    );
+
+    for toolchain in ["stable", "nightly-2026-07-24"] {
+        let target_guard = tempfile::Builder::new()
+            .prefix(&format!("wild-real-cargo-corpus-{toolchain}-"))
+            .tempdir_in("/tmp")
+            .context("failed to create temporary real Cargo corpus target")?;
+        let target_dir = target_guard.path();
+
+        run_cargo_corpus_command(toolchain, "clean", &manifest, target_dir, &rustflags, &wild)?;
+        for command in ["build", "test"] {
+            let transcript = run_cargo_corpus_command(
+                toolchain,
+                command,
+                &manifest,
+                target_dir,
+                &rustflags,
+                &wild,
+            )?;
+            verify_real_cargo_corpus_transcript(&transcript, &wild, toolchain, command)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+fn run_cargo_corpus_command(
+    toolchain: &str,
+    operation: &str,
+    manifest: &Path,
+    target_dir: &Path,
+    rustflags: &str,
+    wild: &Path,
+) -> Result<String> {
+    let mut command = Command::new("cargo");
+    command
+        .arg(format!("+{toolchain}"))
+        .arg(operation)
+        .arg("--manifest-path")
+        .arg(manifest)
+        .arg("--workspace")
+        .arg("--locked")
+        .arg("-vv")
+        .env("CARGO_TARGET_DIR", target_dir)
+        .env("RUSTFLAGS", rustflags);
+    let output = command
+        .output()
+        .with_context(|| format!("failed to run real Cargo corpus command {command:?}"))?;
+    let transcript = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    ensure!(
+        output.status.success(),
+        "real Cargo corpus {toolchain} {operation} failed with {} while selecting Wild {}:\n{transcript}",
+        output.status,
+        wild.display()
+    );
+    Ok(transcript)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+fn verify_real_cargo_corpus_transcript(
+    transcript: &str,
+    wild: &Path,
+    toolchain: &str,
+    operation: &str,
+) -> Result {
+    let wild = wild.to_string_lossy();
+    let linker_lines = transcript
+        .lines()
+        .filter(|line| line.contains(wild.as_ref()) && line.contains(" -o "))
+        .collect_vec();
+    ensure!(
+        !linker_lines.is_empty(),
+        "real Cargo corpus {toolchain} {operation} printed no final Wild link:\n{transcript}"
+    );
+    ensure!(
+        linker_lines.iter().all(|line| line.contains("-arch arm64")),
+        "real Cargo corpus {toolchain} {operation} selected a non-ARM64 final link:\n{}",
+        linker_lines.join("\n")
+    );
+    ensure!(
+        linker_lines.iter().all(|line| !line.contains("x86_64")),
+        "real Cargo corpus {toolchain} {operation} selected an x86_64 final link:\n{}",
+        linker_lines.join("\n")
+    );
+    for package in [
+        "cargo-macho-corpus-cli-regex",
+        "cargo-macho-corpus-async-network",
+        "cargo-macho-corpus-git2-cli",
+        "cargo-macho-corpus-native-cpp",
+    ] {
+        let crate_name = package.replace('-', "_");
+        ensure!(
+            linker_lines
+                .iter()
+                .any(|line| line.contains(package) || line.contains(&crate_name)),
+            "real Cargo corpus {toolchain} {operation} did not link {package} through Wild {}:\n{}",
+            wild,
+            linker_lines.join("\n")
+        );
+    }
+    Ok(())
 }
 
 /// Cargo normally hides the final linker command behind rustc, so this fixture runs with `-vv`
@@ -509,6 +655,32 @@ fn run_cargo_macho_qualification() -> Result {
         "proc macro expanded and ran",
     )?;
 
+    // Rebuilding the proc-macro *consumer* is distinct from merely loading a proc macro during
+    // the first build. Keep the public program contract intact while forcing Cargo to replace its
+    // same-path executable through Wild.
+    let macro_consumer_source = workspace_dir.join("macro-consumer").join("src").join("main.rs");
+    replace_copied_cargo_qualification_file(
+        &macro_consumer_source,
+        "proc macro expanded and ran",
+        "proc macro consumer rebuilt and ran",
+    )?;
+    cargo_build_with_wild(
+        &manifest,
+        &target_dir,
+        None,
+        &rustflags,
+        &wild,
+        "cargo-macho-macro-consumer",
+        &[
+            "libcargo_macho_macro_producer",
+            "cargo_macho_macro_consumer-",
+        ],
+    )?;
+    run_cargo_macho_binary(
+        &target_debug.join("cargo-macho-macro-consumer"),
+        "proc macro consumer rebuilt and ran",
+    )?;
+
     cargo_build_with_wild(
         &manifest,
         &target_dir,
@@ -516,7 +688,11 @@ fn run_cargo_macho_qualification() -> Result {
         &rustflags,
         &wild,
         "cargo-macho-dylib-consumer",
-        &["libcargo_macho_dylib_producer", "cargo_macho_dylib_consumer-"],
+        &[
+            "build_script_build-",
+            "libcargo_macho_dylib_producer",
+            "cargo_macho_dylib_consumer-",
+        ],
     )?;
     let dylib_consumer = target_debug.join("cargo-macho-dylib-consumer");
     run_cargo_macho_binary(
@@ -535,37 +711,47 @@ fn run_cargo_macho_qualification() -> Result {
         &wild,
         "cargo-macho-dylib-consumer",
         &[
+            "build_script_build-",
             "libcargo_macho_dylib_producer",
             "cargo_macho_dylib_consumer-",
         ],
     )?;
 
+    // Cargo's build-script dependency tracking is a different incremental boundary from a Rust
+    // source edit. Changing this copied input must rerun `build.rs`, rebuild the dylib, and
+    // replace its native consumer through Wild. The fixture stays read-only outside its temp copy.
+    let build_marker = workspace_dir
+        .join("dylib-producer")
+        .join("build-marker.txt");
+    replace_copied_cargo_qualification_file(&build_marker, "initial", "rebuild")?;
+    cargo_build_with_wild(
+        &manifest,
+        &target_dir,
+        None,
+        &rustflags,
+        &wild,
+        "cargo-macho-dylib-consumer",
+        &[
+            "build_script_build-",
+            "libcargo_macho_dylib_producer",
+            "cargo_macho_dylib_consumer-",
+        ],
+    )?;
+    run_cargo_macho_binary(
+        &dylib_consumer,
+        "dylib consumer loaded through its Mach-O rpath",
+    )?;
+    verify_cargo_dylib_rpath(&dylib_consumer)?;
+
     // Cargo must re-link the changed Rust dylib and its final consumer. Retain the public API and
     // return value so a successful launch isolates the rebuild/link path rather than testing a
     // different application contract.
     let producer_source = workspace_dir.join("dylib-producer").join("src").join("lib.rs");
-    let producer_contents = std::fs::read_to_string(&producer_source).with_context(|| {
-        format!(
-            "failed to read copied Cargo dylib producer source {}",
-            producer_source.display()
-        )
-    })?;
-    let rebuilt_producer_contents = producer_contents.replacen(
+    replace_copied_cargo_qualification_file(
+        &producer_source,
         "    42\n",
         "    let rebuilt_answer = 42;\n    rebuilt_answer\n",
-        1,
-    );
-    ensure!(
-        rebuilt_producer_contents != producer_contents,
-        "copied Cargo dylib producer {} no longer has the expected answer body",
-        producer_source.display()
-    );
-    std::fs::write(&producer_source, rebuilt_producer_contents).with_context(|| {
-        format!(
-            "failed to update copied Cargo dylib producer source {}",
-            producer_source.display()
-        )
-    })?;
+    )?;
 
     cargo_build_with_wild(
         &manifest,
@@ -575,6 +761,7 @@ fn run_cargo_macho_qualification() -> Result {
         &wild,
         "cargo-macho-dylib-consumer",
         &[
+            "build_script_build-",
             "libcargo_macho_dylib_producer",
             "cargo_macho_dylib_consumer-",
         ],
@@ -585,8 +772,23 @@ fn run_cargo_macho_qualification() -> Result {
     )?;
     verify_cargo_dylib_rpath(&dylib_consumer)?;
     ensure_cargo_macho_qualification_sources_unchanged(&fixture_dir, &fixture_sources)?;
+    ensure_cargo_macho_qualification_build_marker_unchanged(&fixture_dir)?;
 
     Ok(())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+fn replace_copied_cargo_qualification_file(path: &Path, from: &str, to: &str) -> Result {
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read copied Cargo qualification file {}", path.display()))?;
+    let replacement = contents.replacen(from, to, 1);
+    ensure!(
+        replacement != contents,
+        "copied Cargo qualification file {} no longer contains expected input `{from}`",
+        path.display()
+    );
+    std::fs::write(path, replacement)
+        .with_context(|| format!("failed to update copied Cargo qualification file {}", path.display()))
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
@@ -680,6 +882,19 @@ fn ensure_cargo_macho_qualification_sources_unchanged(
             source_path.display()
         );
     }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+fn ensure_cargo_macho_qualification_build_marker_unchanged(fixture_dir: &Path) -> Result {
+    let marker = fixture_dir.join("dylib-producer").join("build-marker.txt");
+    let marker_contents = std::fs::read_to_string(&marker)
+        .with_context(|| format!("failed to re-read retained Cargo qualification input {}", marker.display()))?;
+    ensure!(
+        marker_contents == "initial\n",
+        "Cargo qualification build-script input {} changed while its temporary copy rebuilt",
+        marker.display()
+    );
     Ok(())
 }
 
@@ -2161,6 +2376,7 @@ struct Config {
     should_diff: bool,
     diff_match_any: bool,
     should_run: bool,
+    expected_exit: i32,
     run_dyn_sym: Option<String>,
     should_error: bool,
     expect_stderr: Vec<ErrorMatcher>,
@@ -2974,6 +3190,7 @@ impl Config {
             compiler: platform.default_c_compiler().to_owned(),
             should_diff: platform.diff_supported(),
             should_run: platform.can_execute_on_host(),
+            expected_exit: EXIT_SUCCESS,
             diff_match_any: false,
             run_dyn_sym: None,
             should_error: false,
@@ -3450,6 +3667,9 @@ fn process_directive(
             config.diff_match_any = arg.parse().context("Invalid bool for DiffMatchAny")?
         }
         "RunEnabled" => config.should_run = arg.parse().context("Invalid bool for RunEnabled")?,
+        "ExpectedExit" => {
+            config.expected_exit = arg.parse().context("Invalid ExpectedExit status code")?
+        }
         "RunDynSym" => {
             config.run_dyn_sym = Some(arg.parse().context("Invalid string for RunDynSym")?)
         }
@@ -4150,8 +4370,11 @@ impl LinkOutput {
 
         let output = String::from_utf8_lossy(&output);
 
-        if status.code() != Some(EXIT_SUCCESS) {
-            bail!("Binary exited with unexpected {status}: {output}\nCommand:\n  {command:?}");
+        if status.code() != Some(self.command.config.expected_exit) {
+            bail!(
+                "Binary exited with unexpected {status}, expected {}: {output}\nCommand:\n  {command:?}",
+                self.command.config.expected_exit
+            );
         }
 
         Ok(())

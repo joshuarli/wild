@@ -1,0 +1,23 @@
+# ARM64 macOS link-only benchmark manifest.
+#
+# Each key names one directory directly beneath the external --saves directory. That directory
+# must be a Wild save-dir containing a `run-with` script and copied link inputs. The inputs are
+# intentionally not committed: they are large, toolchain-specific build artifacts. See
+# `benchmarks/macos-arm64.md` for how to create and verify a capture before running this manifest.
+name = "macos-arm64"
+
+# Required by plan.md §30. Do not mark a linker as skipped merely to fill a missing cell: a
+# published comparison needs Apple ld64, ld64.lld, and Wild to verify and measure the same replay.
+[bench.tiny-rust-binary]
+
+[bench.medium-rust-project]
+
+[bench.proc-macro-heavy-workspace]
+
+[bench.native-dependency-workspace]
+
+[bench.large-rust-application]
+
+[bench.wild]
+
+[bench.librustc-driver]

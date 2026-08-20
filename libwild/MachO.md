@@ -80,6 +80,12 @@ support symbol interposition modes whose lookup rules it does not implement. A d
 self-references therefore remain bound to that dylib's own definition; see
 `macho/twolevel-self-binding` for the Apple differential.
 
+An `MH_OBJECT` that already contains an `LC_DYSYMTAB` indirect-symbol section is rejected after
+its table is structurally validated. Those `S_*_SYMBOL_POINTERS`, `S_SYMBOL_STUBS`, and
+`S_THREAD_LOCAL_VARIABLE_POINTERS` sections describe a pre-bound dyld image; Wild writes the
+ARM64 equivalent from relocations with chained fixups and does not serialize legacy lazy-bind or
+indirect-symbol tables. Link the original relocatable object rather than a pre-bound intermediate.
+
 - clang -static -> unsupported
 
 - `-fPIC` and `-fno-PIC` are supported

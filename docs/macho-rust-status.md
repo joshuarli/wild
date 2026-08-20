@@ -20,21 +20,26 @@ implemented behavior from planned behavior: an unchecked item is not a claim of 
 
 ## Current phase
 
-The ARM64 macOS production milestone is complete for the declared Rust/Apple-Silicon contract.
+The bounded ARM64 production qualification is complete. It includes the fast regression suite,
+a disposable stable/nightly real-Cargo corpus, a self-host build, a bounded stage1 Rust bootstrap,
+one contemporary Darwin run-make link, and a seven-workload Apple-ld64/LLD/Wild replay matrix.
+The matrix is a correctness-qualified performance baseline, not a speed claim: Wild currently
+loses substantially on the large Rust links, which identifies the next optimization work without
+weakening the completed format contract.
 The repository's ARM64 macOS CI job installs `nightly-2026-07-24` with `rust-src` and
 `llvm-tools`, then explicitly runs `cargo +nightly-2026-07-24 build/test --profile ci --workspace
---features macho`. Stable coverage remains in the Linux jobs. This is the fast permanent
-regression entry point; the larger corpus, self-host, bootstrap, and performance evidence below
-remain reproducible qualification records.
+--features macho`. Stable coverage remains in the Linux jobs. The separate manual/scheduled
+qualification workflow runs the larger corpus and self-host path without making ordinary pull
+requests wait for them.
 
 Baseline checks completed on this host:
 
 * `cargo build --profile ci --workspace --no-default-features` — pass.
-* `WILD_TEST_IGNORE_FORMAT=1 cargo test --profile ci --workspace --features macho` — pass
-  (185 `libwild` tests, 35 Mach-O integration tests, recorder tests, and remaining workspace/doc
-  tests).
+* `WILD_TEST_IGNORE_FORMAT=1 cargo +1.97.1-aarch64-apple-darwin test --profile ci --workspace
+  --features macho` — pass (all workspace unit tests and doctests, including 224 `libwild` tests
+  and 97 ARM64 Mach-O integrations).
 * `WILD_TEST_IGNORE_FORMAT=1 cargo +nightly-2026-07-24 test --profile ci --workspace --features
-  macho` — pass (all workspace unit tests and doctests, including 215 `libwild` tests and 95
+  macho` — pass (all workspace unit tests and doctests, including 224 `libwild` tests and 97
   ARM64 Mach-O integrations). This is the reproducible dated-nightly gate; it is run with the
   installed `rust-src` and `llvm-tools` components, not by falling back to stable Rust.
 * Without `WILD_TEST_IGNORE_FORMAT=1`, only tidy tests fail because this host lacks `taplo` and
@@ -130,6 +135,7 @@ passed wherever Wild is listed as failing.
 | Rust `staticlib` consumed from C++ | ARM64-only `macho/aarch64/cargo-staticlib-native/default` builds with `nightly-2026-07-24`, checks C ABI exports, and links/runs native C++ consumers through Apple and explicitly through Wild; one control throws in C++, crosses Rust `extern "C-unwind"`, and catches in C++ | broaden the ABI and exception-stress matrix; x86_64 remains out of scope |
 | Rust `dylib` consumed from Rust | `macho/aarch64/cargo-workspace-qualification/default` links the producer and consumer through Wild, runs the consumer via its Mach-O rpath, and verifies state in the producer's `thread_local!` is initialized independently in a child thread | broaden dependency and TLS matrix |
 | Proc macro crate | `macho/aarch64/cargo-workspace-qualification/default` links the proc-macro producer and consumer through Wild, loads the macro during compilation, and executes its non-identity expansion | broaden macro/crate stress coverage |
+| Ordinary Cargo rebuilds | The same isolated workspace mutates a proc-macro consumer Rust source, a `build.rs`-tracked marker, and the Rust-dylib producer body in turn. Each transition must relink the expected ARM64 artifacts through Wild, replace the same output paths, and rerun successfully without `DYLD_*` search-path overrides. The retained fixture is checked unchanged afterward. | broaden dependency and build-script matrix |
 | Rust `thread_local!` / `cargo test` | permanent `macho/rust-thread-local` and the Cargo Rust-`dylib` two-thread control pass through Wild; the latter is also invoked by `cargo test` | exercise staticlib and broader dylib TLS matrix |
 | Rust optimized executable | exact-nightly `macho/rust-release` links and runs with `-O -C codegen-units=16`, while `macho/rust-lto` separately runs ThinLTO and fat LTO | broaden crate-scale and profile coverage |
 | C++ throw/catch and cleanup | `macho/exception` catches, while `cxx-exception-cleanup` verifies a destructor runs through its LSDA landing pad; both emit `__TEXT,__unwind_info` and run | broaden compact-unwind differential coverage |
@@ -161,8 +167,10 @@ passed wherever Wild is listed as failing.
 * Cargo proc-macro and Rust-dylib qualification: `WILD_TEST_IGNORE_FORMAT=1 cargo test -p
   wild-linker --features macho --test integration_tests --
   'macho/aarch64/cargo-workspace-qualification/default'`. This retains the multi-package Cargo
-  workspace and audits each final ARM64 Clang invocation printed by `cargo -vv` for Wild's
-  `--ld-path`; it rejects any x86_64 final link.
+  workspace, executes its initial `build` and `test`, then mutates a proc-macro consumer, a
+  `build.rs` input, and the dylib producer in a temporary copy. It audits every final ARM64 Clang
+  invocation printed by `cargo -vv` for Wild's `--ld-path`, rejects x86_64 links, runs the
+  rebuilt binaries without `DYLD_*` overrides, and confirms the retained fixture did not change.
 * Focused C debug-map fixture: `WILD_TEST_IGNORE_FORMAT=1 cargo test --profile ci -p wild-linker
   --test integration_tests --features macho -- 'macho/aarch64/debug-dwarf/default'`. Its output
   can be checked with `dsymutil --dump-debug-map <binary>`, `dsymutil <binary>`, and
@@ -245,10 +253,13 @@ therefore registers a separate ARM64-only trial,
 single-source fixture. Its retained workspace is `wild/tests/cargo_macho_qualification` and has a
 path-dependent Rust `dylib` producer/consumer plus a `proc-macro = true` producer/consumer.
 
-For every package the trial creates a fresh short `/tmp` Cargo target directory and invokes
-`cargo +nightly-2026-07-24 build -vv` with `clang --ld-path=<Wild>`, `-v`, and
-`-C prefer-dynamic`. The explicit selector is necessary because rustup chooses Cargo before it
-opens a nested workspace's `rust-toolchain.toml`. The trial parses every final Clang link
+The trial creates one fresh short `/tmp` Cargo target directory for the copied workspace, then
+invokes each package operation with `cargo +nightly-2026-07-24 build -vv` and
+`cargo +nightly-2026-07-24 test -vv` using `clang --ld-path=<Wild>`, `-v`, and
+`-C prefer-dynamic`. The fresh workspace target forces the initial producer, consumer, and test
+links; later invocations deliberately exercise Cargo rebuild behavior. The explicit selector is
+necessary because rustup chooses Cargo before it opens a nested workspace's `rust-toolchain.toml`.
+The trial parses every final Clang link
 transcript, requires that each expected producer and consumer artifact selected Wild, requires
 `-arch arm64`, and rejects `x86_64`. The proc macro uses
 `TokenStream::from_str("40 + 2")`, so the consumer proves that a loaded macro performed a
@@ -469,12 +480,20 @@ framework client both build and run. The previous regex failure became the perma
 permanent `macho/sdk-libiconv-external-reexport` regression. Corpus directories are intentionally
 ephemeral because Cargo fingerprints and absolute paths are not durable test inputs.
 
+The corpus also contains a deterministic `git2` CLI. Its `libgit2-sys` dependency compiles a
+vendored archive from 260 native C sources before the final Rust link, then creates, indexes,
+commits, and reads a local repository at runtime. Together with the existing Tokio TCP loopback,
+Clap/Serde/regex derive graph, and `cc`-built C++ client, this gives the stable and
+`nightly-2026-07-24` clean/build/test corpus real asynchronous, macro/codegen, native C, native
+C++, framework, and substantial dependency-graph coverage. `CORPUS.md` beside the fixture
+records the pinned/offline-refresh contract.
+
 Self-hosting was also run in an isolated temporary target directory. A dated-nightly baseline
 Wild built a fresh Wild with `clang --ld-path=<baseline Wild> -v`; Clang's final child command
 named the baseline ARM64 Wild binary. The resulting `MH_EXECUTE` carries `LC_MAIN`, chained
 fixups, and a valid strict ad-hoc code signature. The integration test executable compiled in the
-self-host target embeds that self-hosted Wild path and passed all 61 ARM64 Mach-O integrations.
-This is a strong regression check, not a Rust compiler-bootstrap result.
+self-host target embeds that self-hosted Wild path and passed all 97 ARM64 Mach-O integrations.
+This is a strong regression check, distinct from the bootstrap result below.
 
 An isolated Rust bootstrap used the exact source commit behind the requested toolchain,
 `89c61a7545da48b06116675b888398d02a4064c7`, with ARM64 host/target, Xcode Clang, and a Wild
@@ -498,17 +517,72 @@ non-PLT definitions; `macho/dylib-export-local-got` proves a `dlsym` call reache
 function also has a live GOT use. This remains a bounded stage1 bootstrap qualification, not a
 full Rust distribution or compiler-test-suite claim.
 
-One link-only performance replay used the same dated nightly and a saved `sizable-cli` Cargo
-final link (Clap derive, regex, Serde, and serde_json): 48 replay files / 50.1 MiB and 46
+One contemporary Darwin run-make recipe was also exercised through the requested nightly. The
+nightly's installed source commit (`89c61a754`) is not currently fetchable from the upstream Rust
+repository, so this used current Rust main (`f7d782a3`, 2026-08-19) only for
+`tests/run-make/apple-c-available-links`, while `rustc 1.99.0-nightly (89c61a754 2026-07-23)`
+remained the compiler and link driver. A disposable harness built the current recipe and its
+`run-make-support` dependency, then ran its Apple control and an otherwise identical wrapper
+that adds `-C linker=<Xcode clang> -C link-arg=--ld-path=<Wild>`. Both produced and executed an
+ARM64 `main`; the Wild save-dir replay contains `-arch arm64`, the exact nightly `libstd`, and
+the recipe's `foo.o`. This is one current Darwin run-make/link result, not an `x.py test` claim
+for the unavailable dated source revision.
+
+One historical link-only replay used the same dated nightly and a saved `sizable-cli` Cargo final
+link (Clap derive, regex, Serde, and serde_json): 48 replay files / 50.1 MiB and 46
 object-or-archive arguments. On this M1 Pro (10 cores, 32 GiB, macOS 26.5.2), rotating 15-sample
 wall-clock measurements had min/median/mean/max milliseconds of Apple ld64 1267:
 135.368/145.258/155.662/212.253; ld64.lld 22.1.8:
 99.108/109.214/113.753/153.635; and Wild:
 127.857/142.855/149.300/193.012. Each ARM64 output passed the same runtime JSON/regex check;
-sizes were 2,771,312 / 2,794,720 / 3,636,348 bytes respectively. The replay is retained under
-`/tmp/wild-macho-performance.EnGAT0`. Earlier grouped repetitions had substantial ordering
-sensitivity, `/tmp` is APFS, and thermal state was uncontrolled, so this is preliminary one-
-workload evidence—not a speed or general-performance claim.
+sizes were 2,771,312 / 2,794,720 / 3,636,348 bytes respectively. Its inputs lived under the
+ephemeral `/tmp/wild-macho-performance.EnGAT0`, the capture did not retain the complete
+user/system CPU and peak-RSS series, and earlier grouped repetitions had substantial ordering
+sensitivity on APFS with uncontrolled thermal state. It is therefore a historical, preliminary
+one-workload observation—not a speed or general-performance claim.
+
+### Durable ARM64 link replay matrix
+
+`benchmarks/macos-arm64.toml` and `benchmarks/macos-arm64.md` define the ARM64 link-only
+capture/replay matrix. The provenance-refreshed run retained seven `run-with` saves, complete
+copied-link-input manifests, all-3-linker verification output, a 15-sample warm wall series, and
+a separate 15-sample resource series under
+`/Users/josh/d/wild-benchmark-data/macos-arm64-2026-08-19/`. Every saved replay linked and its
+output validated with Apple ld64 1267, Homebrew ld64.lld 22.1.8, and Wild `b24e8447` (the measured
+worktree was dirty) before timing.
+
+| Final-link replay | Apple ld64 median (ms) | LLD median (ms) | Wild median (ms) |
+| --- | ---: | ---: | ---: |
+| tiny Rust binary | 99.570 | 78.065 | 410.525 |
+| medium Rust project | 113.256 | 95.359 | 475.042 |
+| proc-macro-heavy workspace | 107.568 | 97.850 | 714.065 |
+| native-dependency workspace | 109.905 | 82.200 | 397.822 |
+| large Rust application | 272.657 | 393.646 | 7,598.271 |
+| Wild self link | 277.757 | 446.270 | 27,108.415 |
+| `librustc_driver` | 316.497 | 496.913 | 53,272.239 |
+
+Wild's median user CPU / peak RSS for those rows was respectively 595.974 ms / 34.438 MiB,
+795.555 / 43.719, 2,035.611 / 54.906, 596.730 / 35.828, 35,505.334 / 291.938,
+72,176.532 / 1,413.609, and 217,191.976 / 468.219. The full per-linker resource TSV remains
+beside the result files. This is an honest optimization baseline: Wild is currently materially
+slower on every measured replay, particularly large Rust links; no speedup is claimed.
+
+The baseline prompted a profile-driven Mach-O optimization before this status was closed. The
+same retained `librustc_driver` replay took 86.14 seconds before and 56.52 seconds after caching
+normalized relocation pairs once per input section during atom-GC traversal (34.4% end-to-end;
+the `Traverse reference graph` phase fell from 49.85 to 22.72 seconds). The optimized output had
+the same SHA-256 (`7d3e…3ced6`). This preserves a concrete before/after result without pretending
+that one optimization erases the remaining large-link gap.
+
+The provenance-refreshed artifacts are
+`macos-arm64-{verification,wall,resources}-provenance-refreshed.{bench-results,log}` and their
+corresponding `medians.tsv` files. The host was an M1 Pro with 32 GiB on macOS 26.5.2, on AC power
+with Low Power Mode disabled; APFS was used with explicit `--allow-non-tmpfs`. Every save now has
+an immutable source revision, command/toolchain/host notes, and a passing `tree.sha256` manifest.
+The freshly promoted tiny/medium/proc-macro/native captures retain their original recorder details.
+The large-app, Wild-self, and Rust-driver source/build provenance was recovered from retained
+logs, but their original recorder executable/path/hash, delegate settings, and invocation status
+were not recoverable; that limitation is recorded in their sidecars rather than guessed.
 
 ## Deferred / deliberately unsupported today
 
@@ -525,6 +599,11 @@ workload evidence—not a speed or general-performance claim.
 * ARM64 Mach-O linker-plugin LTO (`-C linker-plugin-lto` and Rust's `-plugin-opt` arguments).
   Ordinary Rust `-C lto=thin` and `-C lto=fat` links, which hand Wild native ARM64 Mach-O objects,
   are separate supported workflows.
+* Pre-bound `MH_OBJECT` inputs carrying `LC_DYSYMTAB` indirect-symbol sections
+  (`S_NON_LAZY_SYMBOL_POINTERS`, lazy-pointer/stub variants, or
+  `S_THREAD_LOCAL_VARIABLE_POINTERS`). Wild validates their table bounds and then rejects them:
+  its ARM64 writer represents bindings through chained fixups and does not serialize the legacy
+  indirect-symbol/lazy-bind contract. Supply the original relocatable producer input instead.
 
 ## Follow-up expansion work
 

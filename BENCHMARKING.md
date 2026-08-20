@@ -12,6 +12,11 @@ particular:
 
 ## How to benchmark
 
+For the ARM64 macOS Apple-ld64/ld64.lld/Wild replay protocol, including the required workload
+manifest and separate wall-time versus resource measurements, see
+[`benchmarks/macos-arm64.md`](benchmarks/macos-arm64.md). It intentionally records no benchmark
+values until durable capture inputs and complete measurements exist.
+
 ### Preparing the "run-with" files
 
 For benchmarking the linker, it's preferable to run just the linker, not the whole build process.

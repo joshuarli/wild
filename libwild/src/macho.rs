@@ -391,6 +391,41 @@ pub(crate) fn paired_relocations(relocations: &[Relocation]) -> PairedRelocation
     }
 }
 
+/// Normalized relocation records cached for each section of one Mach-O object.
+///
+/// Atom-level dead stripping loads one atom at a time, while Mach-O stores relocations for the
+/// whole section. Re-parsing the full relocation list for every live atom turns a section with
+/// many Rust functions into quadratic work. The input bytes cannot change while linking, so the
+/// first atom can validate and normalize the records for every later atom in the same section.
+#[derive(Default)]
+pub(crate) struct MachORelocationCache {
+    sections: Vec<Option<Vec<NormalizedRelocation>>>,
+}
+
+impl MachORelocationCache {
+    fn cache(
+        &mut self,
+        section_index: object::SectionIndex,
+        relocations: &[Relocation],
+    ) -> Result {
+        let section = section_index.0;
+        if self.sections.len() <= section {
+            self.sections.resize_with(section + 1, || None);
+        }
+        if self.sections[section].is_none() {
+            self.sections[section] = Some(paired_relocations(relocations).collect::<Result<_>>()?);
+        }
+        Ok(())
+    }
+
+    fn for_section(&self, section_index: object::SectionIndex) -> &[NormalizedRelocation] {
+        self.sections
+            .get(section_index.0)
+            .and_then(Option::as_deref)
+            .expect("Mach-O relocation cache must be populated before use")
+    }
+}
+
 impl<'data> Iterator for PairedRelocations<'data> {
     type Item = Result<NormalizedRelocation>;
 
@@ -1160,6 +1195,7 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
 
         let mut symbols = None;
         let mut sections = None;
+        let mut indirect_symbols = None;
         let mut symbol_section_properties = Vec::new();
         let mut dylib_metadata = None;
 
@@ -1167,6 +1203,12 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
             if let Some(symtab_command) = command.symtab()? {
                 ensure!(symbols.is_none(), "At most one symtab command expected");
                 symbols = Some(symtab_command.symbols::<macho::MachHeader64<_>, _>(LE, input)?);
+            } else if let Some(dysymtab_command) = command.dysymtab()? {
+                ensure!(
+                    indirect_symbols.is_none(),
+                    "At most one dysymtab command expected"
+                );
+                indirect_symbols = Some(dysymtab_command.indirect_symbols(LE, input)?);
             } else if is_dynamic && command.cmd() == macho::LC_ID_DYLIB {
                 ensure!(
                     dylib_metadata.is_none(),
@@ -1195,6 +1237,13 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
         }
 
         let symbols = symbols.ok_or("Missing symbol table")?;
+        if !is_dynamic {
+            validate_indirect_symbol_sections(
+                sections.as_deref().ok_or("Missing segment command")?,
+                symbols.len(),
+                indirect_symbols,
+            )?;
+        }
         let symbol_entries = symbols
             .iter()
             .map(|raw| {
@@ -1479,7 +1528,7 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
 
     fn process_gnu_note_section(
         &self,
-        _state: &mut (),
+        _state: &mut MachORelocationCache,
         _section_index: object::SectionIndex,
     ) -> Result {
         // GNU property notes are ELF metadata. Mach-O has neither their section type nor an
@@ -1509,6 +1558,112 @@ fn is_non_alloc_section(flags: SectionFlags, segment_name: &[u8]) -> bool {
 
 fn is_tls_section_type(section_type: macho::SectionType) -> bool {
     matches!(section_type, S_THREAD_LOCAL_REGULAR | S_THREAD_LOCAL_ZEROFILL)
+}
+
+/// Returns the name of a section type whose entries are interpreted through `LC_DYSYMTAB`'s
+/// indirect-symbol table rather than through ordinary object-file relocations.
+///
+/// Clang's `MH_OBJECT` output does not use these types: it leaves branch, GOT, and TLVP intent in
+/// relocations for the static linker. These types describe the already-linked dynamic-loader
+/// tables in a final image. Wild emits the equivalent final ARM64 tables from relocations using
+/// chained fixups, and intentionally does not write `LC_DYSYMTAB`. Copying one of these input
+/// sections would therefore leave its slot/stub addresses and dynamic bindings unrepresented.
+fn indirect_symbol_section_type_name(section_type: macho::SectionType) -> Option<&'static str> {
+    Some(match section_type {
+        macho::S_NON_LAZY_SYMBOL_POINTERS => "S_NON_LAZY_SYMBOL_POINTERS",
+        macho::S_LAZY_SYMBOL_POINTERS => "S_LAZY_SYMBOL_POINTERS",
+        macho::S_SYMBOL_STUBS => "S_SYMBOL_STUBS",
+        macho::S_LAZY_DYLIB_SYMBOL_POINTERS => "S_LAZY_DYLIB_SYMBOL_POINTERS",
+        macho::S_THREAD_LOCAL_VARIABLE_POINTERS => "S_THREAD_LOCAL_VARIABLE_POINTERS",
+        _ => return None,
+    })
+}
+
+fn indirect_symbol_section_display_name(section: &SectionHeader) -> String {
+    format!(
+        "{},{}",
+        String::from_utf8_lossy(section.segment_name()),
+        String::from_utf8_lossy(section.name())
+    )
+}
+
+/// Validates, then rejects, pre-bound dynamic-loader sections in a regular object input.
+///
+/// The validation makes a corrupt `LC_DYSYMTAB` a normal input diagnostic rather than hiding it
+/// behind the unsupported-feature diagnostic. Once the table is structurally valid, rejection is
+/// deliberate: the writer has no ABI-correct way to preserve its pre-bound entries without also
+/// serialising `LC_DYSYMTAB`, legacy lazy-bind machinery, and architecture-specific stub rewrites.
+fn validate_indirect_symbol_sections(
+    sections: &[SectionHeader],
+    symbol_count: usize,
+    indirect_symbols: Option<&[object::endian::U32<Endianness, macho::IndirectSymbol>]>,
+) -> Result {
+    for section in sections {
+        let section_type = section.flags.get(LE).typ();
+        let Some(section_type_name) = indirect_symbol_section_type_name(section_type) else {
+            continue;
+        };
+        let section_name = indirect_symbol_section_display_name(section);
+        let section_size = section.size.get(LE);
+        let entry_size = if section_type == macho::S_SYMBOL_STUBS {
+            u64::from(section.reserved2.get(LE))
+        } else {
+            GOT_ENTRY_SIZE
+        };
+        ensure!(
+            entry_size != 0,
+            "Mach-O {section_type_name} section {section_name} has a zero stub entry size"
+        );
+        ensure!(
+            section_size % entry_size == 0,
+            "Mach-O {section_type_name} section {section_name} has size {section_size} that is not a multiple of entry size {entry_size}"
+        );
+        let entry_count = usize::try_from(section_size / entry_size).with_context(|| {
+            format!(
+                "Mach-O {section_type_name} section {section_name} has too many indirect-symbol entries"
+            )
+        })?;
+        if entry_count != 0 {
+            let indirect_symbols = indirect_symbols.with_context(|| {
+                format!(
+                    "Mach-O {section_type_name} section {section_name} requires LC_DYSYMTAB indirect-symbol entries"
+                )
+            })?;
+            let first_index = usize::try_from(section.reserved1.get(LE)).with_context(|| {
+                format!(
+                    "Mach-O {section_type_name} section {section_name} has an indirect-symbol index that does not fit usize"
+                )
+            })?;
+            let end_index = first_index.checked_add(entry_count).with_context(|| {
+                format!(
+                    "Mach-O {section_type_name} section {section_name} indirect-symbol range overflows"
+                )
+            })?;
+            ensure!(
+                end_index <= indirect_symbols.len(),
+                "Mach-O {section_type_name} section {section_name} requires indirect-symbol entries {first_index}..{end_index}, but LC_DYSYMTAB has only {}",
+                indirect_symbols.len()
+            );
+            for (entry_offset, indirect_symbol) in indirect_symbols[first_index..end_index]
+                .iter()
+                .enumerate()
+            {
+                let Some(symbol_index) = indirect_symbol.get(LE).index() else {
+                    continue;
+                };
+                ensure!(
+                    usize::try_from(symbol_index).is_ok_and(|index| index < symbol_count),
+                    "Mach-O {section_type_name} section {section_name} indirect-symbol entry {} refers to symbol {symbol_index}, but the symbol table has only {symbol_count} entries",
+                    first_index + entry_offset
+                );
+            }
+        }
+
+        bail!(
+            "Mach-O input section {section_name} uses {section_type_name}, an already-linked indirect-symbol table format that Wild cannot represent in chained-fixup output; rebuild or supply the original relocatable object"
+        );
+    }
+    Ok(())
 }
 
 fn symbol_section_properties_from_section(section: &SectionHeader) -> SymbolSectionProperties {
@@ -1567,8 +1722,6 @@ impl platform::SectionHeader for SectionHeader {
     }
 
     fn should_exclude(&self) -> bool {
-        // TODO: We need support for sections backed by the Mach-O indirect symbol table for dynamic
-        // linking.
         (self.flags.get(LE).intersects(S_ATTR_DEBUG)
             && SegmentName::from_bytes(self.segment_name()) != SegmentName::LD)
             || matches!(
@@ -1577,14 +1730,6 @@ impl platform::SectionHeader for SectionHeader {
                     | SegmentName::LINKEDIT
                     | SegmentName::LLVM
                     | SegmentName::DWARF
-            )
-            || matches!(
-                self.flags.get(LE).typ(),
-                macho::S_NON_LAZY_SYMBOL_POINTERS
-                    | macho::S_LAZY_SYMBOL_POINTERS
-                    | macho::S_SYMBOL_STUBS
-                    | macho::S_LAZY_DYLIB_SYMBOL_POINTERS
-                    | macho::S_THREAD_LOCAL_VARIABLE_POINTERS
             )
     }
 
@@ -2108,7 +2253,7 @@ impl platform::Platform for MachO {
     type LayoutResourcesExt<'data> = ();
     type PreludeLayoutStateExt = PreludeLayoutExt;
     type PreludeLayoutExt = PreludeLayoutExt;
-    type ObjectLayoutStateExt<'data> = ();
+    type ObjectLayoutStateExt<'data> = MachORelocationCache;
     type RawSymbolName<'data> = RawSymbolName<'data>;
     type VersionNames<'data> = ();
     type VerneedTable<'data> = VerneedTable<'data>;
@@ -2414,9 +2559,13 @@ impl platform::Platform for MachO {
                 // A relocation belongs to the atom containing its source address. Do not let a
                 // dead neighbour retain targets merely because Mach-O stores relocations beside
                 // the complete input section.
-                for relocation in paired_relocations(object.relocations(section_index)?.relocations)
-                {
-                    let relocation = relocation?;
+                let raw_relocations = object.relocations(section_index)?.relocations;
+                object
+                    .format_specific
+                    .cache(section_index, raw_relocations)?;
+                let relocation_count = object.format_specific.for_section(section_index).len();
+                for relocation_index in 0..relocation_count {
+                    let relocation = object.format_specific.for_section(section_index)[relocation_index];
                     if !range.contains(&u64::from(relocation.info.r_address)) {
                         continue;
                     }
@@ -3403,11 +3552,12 @@ impl platform::Platform for MachO {
             );
             // Thread-local payloads are ordinary Mach-O `__DATA` sections, even though the
             // generic layout keeps them separate so it can preserve TLS-specific liveness and
-            // zero-fill semantics. Keep the data/zero-fill ordering adjacent to their ordinary
-            // counterparts; dyld's TLS descriptor points into these final addresses.
+            // zero-fill semantics. The regular and zero-fill TLS sections form one contiguous
+            // image TLS template: descriptors contain offsets from `__thread_data`, so an
+            // ordinary `__bss` section must not be placed between them.
             add_sections_in_segment(&mut builder, output_sections, &custom.tdata, segment);
-            add_sections_in_segment(&mut builder, output_sections, &custom.bss, segment);
             add_sections_in_segment(&mut builder, output_sections, &custom.tbss, segment);
+            add_sections_in_segment(&mut builder, output_sections, &custom.bss, segment);
         }
         builder.add_section(output_section_id::COMMON);
 
@@ -4586,6 +4736,143 @@ mod tests {
     use crate::output_kind::OutputKind;
     use crate::output_section_id::OutputSections;
 
+    /// Builds the smallest regular ARM64 Mach-O object with one indirect-symbol-backed section.
+    /// Clang intentionally does not produce these sections for a relocatable object, so retain a
+    /// byte-level fixture for the pre-bound-input boundary instead of relying on an Apple SDK
+    /// image or a particular linker version.
+    fn indirect_symbol_object(section_type: macho::SectionType) -> Vec<u8> {
+        const HEADER_SIZE: usize = 32;
+        const SEGMENT_COMMAND_SIZE: usize = 72;
+        const SECTION_SIZE: usize = 80;
+        const DYSYMTAB_SIZE: usize = 80;
+        const SYMTAB_SIZE: usize = 24;
+        const SECTION_HEADER_OFFSET: usize = HEADER_SIZE + SEGMENT_COMMAND_SIZE;
+        const DYSYMTAB_OFFSET: usize = HEADER_SIZE + SEGMENT_COMMAND_SIZE + SECTION_SIZE;
+        const SYMTAB_OFFSET: usize = DYSYMTAB_OFFSET + DYSYMTAB_SIZE;
+        const SECTION_DATA_OFFSET: usize = SYMTAB_OFFSET + SYMTAB_SIZE;
+
+        let (section_name, segment_name, entry_size) = match section_type {
+            macho::S_NON_LAZY_SYMBOL_POINTERS => {
+                (b"__nl_symbol_ptr".as_slice(), b"__DATA".as_slice(), GOT_ENTRY_SIZE)
+            }
+            macho::S_LAZY_SYMBOL_POINTERS => {
+                (b"__la_symbol_ptr".as_slice(), b"__DATA".as_slice(), GOT_ENTRY_SIZE)
+            }
+            macho::S_SYMBOL_STUBS => (b"__stubs".as_slice(), b"__TEXT".as_slice(), PLT_ENTRY_SIZE),
+            macho::S_LAZY_DYLIB_SYMBOL_POINTERS => {
+                (b"__la_dylib_ptr".as_slice(), b"__DATA".as_slice(), GOT_ENTRY_SIZE)
+            }
+            macho::S_THREAD_LOCAL_VARIABLE_POINTERS => {
+                (b"__thread_ptrs".as_slice(), b"__DATA".as_slice(), GOT_ENTRY_SIZE)
+            }
+            _ => panic!("fixture requires an indirect-symbol-backed section type"),
+        };
+        let section_size = usize::try_from(entry_size).unwrap();
+        let indirect_symbol_offset = SECTION_DATA_OFFSET + section_size;
+        let symbol_offset = indirect_symbol_offset + size_of::<u32>();
+        let string_offset = symbol_offset + size_of::<RawSymtabEntry>();
+        let mut data = vec![0; string_offset + 1];
+
+        let put_u32 = |data: &mut [u8], offset: usize, value: u32| {
+            data[offset..offset + size_of::<u32>()].copy_from_slice(&value.to_le_bytes());
+        };
+        let put_u64 = |data: &mut [u8], offset: usize, value: u64| {
+            data[offset..offset + size_of::<u64>()].copy_from_slice(&value.to_le_bytes());
+        };
+
+        // mach_header_64
+        put_u32(&mut data, 0, macho::MH_MAGIC_64);
+        put_u32(&mut data, 4, macho::CPU_TYPE_ARM64.0);
+        put_u32(&mut data, 12, macho::MH_OBJECT.0);
+        put_u32(&mut data, 16, 3);
+        put_u32(
+            &mut data,
+            20,
+            u32::try_from(SEGMENT_COMMAND_SIZE + SECTION_SIZE + DYSYMTAB_SIZE + SYMTAB_SIZE)
+                .unwrap(),
+        );
+
+        // LC_SEGMENT_64 with one section. MH_OBJECT uses one compact unnamed segment.
+        put_u32(&mut data, HEADER_SIZE, macho::LC_SEGMENT_64.0);
+        put_u32(
+            &mut data,
+            HEADER_SIZE + 4,
+            u32::try_from(SEGMENT_COMMAND_SIZE + SECTION_SIZE).unwrap(),
+        );
+        put_u64(
+            &mut data,
+            HEADER_SIZE + 40,
+            u64::try_from(SECTION_DATA_OFFSET).unwrap(),
+        );
+        put_u64(
+            &mut data,
+            HEADER_SIZE + 48,
+            u64::try_from(section_size).unwrap(),
+        );
+        put_u32(&mut data, HEADER_SIZE + 64, 1);
+
+        // section_64. All five types use one indexed entry; stubs alone use reserved2 for their
+        // entry size. The one index targets the sole undefined nlist below.
+        data[SECTION_HEADER_OFFSET..SECTION_HEADER_OFFSET + section_name.len()]
+            .copy_from_slice(section_name);
+        data[SECTION_HEADER_OFFSET + 16..SECTION_HEADER_OFFSET + 16 + segment_name.len()]
+            .copy_from_slice(segment_name);
+        put_u64(
+            &mut data,
+            SECTION_HEADER_OFFSET + 40,
+            u64::try_from(section_size).unwrap(),
+        );
+        put_u32(
+            &mut data,
+            SECTION_HEADER_OFFSET + 48,
+            u32::try_from(SECTION_DATA_OFFSET).unwrap(),
+        );
+        put_u32(&mut data, SECTION_HEADER_OFFSET + 52, 3);
+        put_u32(&mut data, SECTION_HEADER_OFFSET + 64, u32::from(section_type.0));
+        put_u32(
+            &mut data,
+            SECTION_HEADER_OFFSET + 72,
+            u32::try_from(entry_size).unwrap(),
+        );
+
+        // LC_DYSYMTAB's indirect-symbol table and the matching LC_SYMTAB.
+        put_u32(&mut data, DYSYMTAB_OFFSET, macho::LC_DYSYMTAB.0);
+        put_u32(
+            &mut data,
+            DYSYMTAB_OFFSET + 4,
+            u32::try_from(DYSYMTAB_SIZE).unwrap(),
+        );
+        put_u32(
+            &mut data,
+            DYSYMTAB_OFFSET + 56,
+            u32::try_from(indirect_symbol_offset).unwrap(),
+        );
+        put_u32(&mut data, DYSYMTAB_OFFSET + 60, 1);
+        put_u32(&mut data, SYMTAB_OFFSET, macho::LC_SYMTAB.0);
+        put_u32(
+            &mut data,
+            SYMTAB_OFFSET + 4,
+            u32::try_from(SYMTAB_SIZE).unwrap(),
+        );
+        put_u32(
+            &mut data,
+            SYMTAB_OFFSET + 8,
+            u32::try_from(symbol_offset).unwrap(),
+        );
+        put_u32(&mut data, SYMTAB_OFFSET + 12, 1);
+        put_u32(
+            &mut data,
+            SYMTAB_OFFSET + 16,
+            u32::try_from(string_offset).unwrap(),
+        );
+        put_u32(&mut data, SYMTAB_OFFSET + 20, 1);
+
+        // nlist_64[0] is an external undefined symbol. The indirect entry at
+        // `indirect_symbol_offset` is already zero, so it names this nlist.
+        data[symbol_offset + 4] = macho::N_UNDF.0 | macho::N_EXT.0;
+        data
+    }
+
     #[test]
     fn malformed_object_header_is_rejected_before_layout() {
         // File detection routes a Mach-O candidate into this parser before any layout state is
@@ -4597,6 +4884,81 @@ mod tests {
         };
 
         assert!(!error.to_string().is_empty());
+    }
+
+    #[test]
+    fn indirect_symbol_sections_are_rejected_before_layout() {
+        // These are final-image dyld structures, not regular Clang relocation sections. Test
+        // every supported Mach-O spelling so a future SectionHeader classification change cannot
+        // make one disappear silently again.
+        for (section_type, section_type_name) in [
+            (macho::S_NON_LAZY_SYMBOL_POINTERS, "S_NON_LAZY_SYMBOL_POINTERS"),
+            (macho::S_LAZY_SYMBOL_POINTERS, "S_LAZY_SYMBOL_POINTERS"),
+            (macho::S_SYMBOL_STUBS, "S_SYMBOL_STUBS"),
+            (
+                macho::S_LAZY_DYLIB_SYMBOL_POINTERS,
+                "S_LAZY_DYLIB_SYMBOL_POINTERS",
+            ),
+            (
+                macho::S_THREAD_LOCAL_VARIABLE_POINTERS,
+                "S_THREAD_LOCAL_VARIABLE_POINTERS",
+            ),
+        ] {
+            let object = indirect_symbol_object(section_type);
+            let header = macho::MachHeader64::<Endianness>::parse(&*object, 0).unwrap();
+            let mut commands = header.load_commands(LE, &*object, 0).unwrap();
+            let command = commands.next().unwrap().unwrap();
+            let (segment, segment_data) = command.segment_64().unwrap().unwrap();
+            let section = &segment.sections(LE, segment_data).unwrap()[0];
+            assert!(
+                !section.should_exclude(),
+                "{section_type_name} must not disappear during section resolution"
+            );
+
+            let error =
+                <File<'_> as platform::ObjectFile>::parse_bytes(&object, false).unwrap_err();
+            let message = error.to_string();
+            assert!(message.contains(section_type_name), "{message}");
+            assert!(message.contains("already-linked indirect-symbol table format"), "{message}");
+        }
+    }
+
+    #[test]
+    fn malformed_indirect_symbol_section_reports_its_missing_table_entry() {
+        let mut object = indirect_symbol_object(macho::S_NON_LAZY_SYMBOL_POINTERS);
+        // LC_DYSYMTAB says it has no indirect entries, while the section still has one pointer.
+        // This must report the broken structural contract rather than falling through to the
+        // generic unsupported-input message.
+        const DYSYMTAB_INDIRECT_SYMBOL_COUNT_OFFSET: usize = 32 + 72 + 80 + 60;
+        object[DYSYMTAB_INDIRECT_SYMBOL_COUNT_OFFSET..DYSYMTAB_INDIRECT_SYMBOL_COUNT_OFFSET + 4]
+            .copy_from_slice(&0u32.to_le_bytes());
+
+        let error = <File<'_> as platform::ObjectFile>::parse_bytes(&object, false).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("requires indirect-symbol entries 0..1, but LC_DYSYMTAB has only 0")
+        );
+    }
+
+    #[test]
+    fn malformed_indirect_symbol_section_reports_its_out_of_range_symbol() {
+        let mut object = indirect_symbol_object(macho::S_NON_LAZY_SYMBOL_POINTERS);
+        // The sole table entry follows an eight-byte non-lazy pointer. It must name the sole
+        // nlist (index zero), so index one proves that every indirect entry is checked before the
+        // unsupported-input diagnostic is issued.
+        const INDIRECT_SYMBOL_OFFSET: usize = 32 + 72 + 80 + 80 + 24 + 8;
+        object[INDIRECT_SYMBOL_OFFSET..INDIRECT_SYMBOL_OFFSET + 4]
+            .copy_from_slice(&1u32.to_le_bytes());
+
+        let error = <File<'_> as platform::ObjectFile>::parse_bytes(&object, false).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains(
+                "indirect-symbol entry 0 refers to symbol 1, but the symbol table has only 1 entries"
+            ),
+            "{message}"
+        );
     }
 
     #[test]
@@ -4733,6 +5095,41 @@ mod tests {
         assert_eq!(relocations[0].addend, 0x24);
         assert_eq!(relocations[1].info.r_type, macho::ARM64_RELOC_PAGEOFF12);
         assert_eq!(relocations[1].addend, -4);
+    }
+
+    #[test]
+    fn relocation_cache_reuses_normalized_section_relocations() {
+        let relocations = [
+            raw_relocation(8, 0x24, false, 2, false, macho::ARM64_RELOC_ADDEND),
+            raw_relocation(8, 7, true, 2, true, macho::ARM64_RELOC_BRANCH26),
+        ];
+        let section_index = object::SectionIndex(3);
+        let mut cache = MachORelocationCache::default();
+
+        cache.cache(section_index, &relocations).unwrap();
+        assert_eq!(cache.for_section(section_index).len(), 1);
+        assert_eq!(
+            cache.for_section(section_index)[0].info.r_type,
+            macho::ARM64_RELOC_BRANCH26
+        );
+        assert_eq!(cache.for_section(section_index)[0].addend, 0x24);
+
+        // The input object is immutable while linking. A second atom in this section must use
+        // its existing normalized records instead of reparsing even malformed replacement data.
+        let malformed = [raw_relocation(
+            0,
+            1,
+            false,
+            2,
+            false,
+            macho::ARM64_RELOC_ADDEND,
+        )];
+        cache.cache(section_index, &malformed).unwrap();
+        assert_eq!(cache.for_section(section_index).len(), 1);
+        assert_eq!(
+            cache.for_section(section_index)[0].info.r_type,
+            macho::ARM64_RELOC_BRANCH26
+        );
     }
 
     #[test]

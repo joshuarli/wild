@@ -11,6 +11,13 @@ pub fn answer() -> i32 {
     42
 }
 
+// Keep the copied-workspace rebuild qualification dependent on an actual `build.rs` input. The
+// caller need not use this value: embedding it in the dylib is enough to make a changed marker
+// require Cargo to re-run the script and relink the producer and consumer.
+pub fn build_marker() -> &'static str {
+    env!("CARGO_MACHO_QUALIFICATION_BUILD_MARKER")
+}
+
 pub fn dynamic_tls_read() -> i32 {
     DYNAMIC_DYLIB_TLS.with(Cell::get)
 }

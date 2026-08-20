@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = [
+  "async-network",
+  "cli-regex",
+  "git2-cli",
+  "native-cpp",
+]

@@ -22,6 +22,7 @@
 //! * Prmary part references anything: ValueFlags::HAS_RANGE_LIMITED_REL set for local symbol in the
 //!   object that made the reference.
 
+use crate::error::Result;
 use crate::input_data::FileId;
 use crate::layout;
 use crate::layout::FileLayoutState;
@@ -42,6 +43,7 @@ use itertools::Itertools as _;
 use rayon::iter::IntoParallelIterator;
 use rayon::iter::IntoParallelRefIterator;
 use rayon::iter::ParallelIterator as _;
+use std::collections::HashMap;
 use std::collections::HashSet;
 
 /// Identifies a ThunkBlock within a Vec.
@@ -81,6 +83,11 @@ pub(crate) struct ThunkLayoutBuilder {
     /// The range beyond which we'll allocate thunks, allowing a bit of overhead for the thunks
     /// themselves.
     branch_range: u64,
+
+    /// The architecture's actual direct-branch range. We use a smaller range while assigning
+    /// blocks so an island has room to grow, then re-check against this range after reserving
+    /// each block's exact island bytes.
+    max_direct_branch_range: u64,
 
     primary_function_part_id: PartId,
 
@@ -127,6 +134,7 @@ impl ThunkLayoutBuilder {
 
         Some(ThunkLayoutBuilder {
             branch_range: config.min_branch_range - MAXIMUM_THUNK_BYTES_PER_BLOCK,
+            max_direct_branch_range: config.min_branch_range,
             primary_function_part_id: config.primary_function_part_id,
             non_primary_referenced_symbols: SegQueue::new(),
         })
@@ -140,13 +148,13 @@ impl ThunkLayoutBuilder {
         per_symbol_flags: &crate::value_flags::PerSymbolFlags,
         output_sections: &OutputSections<P>,
         section_part_sizes: &OutputSectionPartMap<u64>,
-    ) -> Vec<ThunkBlock> {
+    ) -> Result<Vec<ThunkBlock>> {
         timing_phase!("Build thunk layout");
 
         let non_primary_text_size =
             self.compute_non_primary_text_size(output_sections, section_part_sizes);
 
-        let primary_ranges = collect_primary_ranges(group_states, non_primary_text_size);
+        let primary_ranges = collect_primary_ranges(group_states, non_primary_text_size)?;
 
         let mut block_builders =
             assign_thunk_blocks_to_groups(group_states, &primary_ranges, self.branch_range);
@@ -155,10 +163,29 @@ impl ThunkLayoutBuilder {
             &primary_ranges,
             symbol_db,
             per_symbol_flags,
+            self.branch_range,
             &mut block_builders,
         );
 
         self.process_non_primary_part_refs(&mut block_builders);
+
+        // An island is emitted after its owner object. A block can grow beyond the historical
+        // fixed allowance above, so that insertion can turn a previously-direct branch into an
+        // out-of-range one. Recalculate object ranges with the exact current island sizes and
+        // add only the newly-required target islands. This is monotonic: every pass adds a
+        // (block, symbol) pair, so it reaches a fixed point without an arbitrary iteration cap.
+        loop {
+            let primary_ranges = relayout_primary_ranges(&primary_ranges, &block_builders)?;
+            if !self.process_primary_part_refs(
+                &primary_ranges,
+                symbol_db,
+                per_symbol_flags,
+                self.max_direct_branch_range,
+                &mut block_builders,
+            ) {
+                break;
+            }
+        }
 
         let blocks = block_builders
             .into_par_iter()
@@ -167,7 +194,7 @@ impl ThunkLayoutBuilder {
 
         tracing::trace!("Thunk blocks: {blocks:#?}");
 
-        blocks
+        Ok(blocks)
     }
 
     fn compute_non_primary_text_size<P: Platform>(
@@ -199,6 +226,7 @@ impl ThunkLayoutBuilder {
         block_builders[ThunkBlockId::FIRST.as_usize()]
             .symbols
             .extend(core::mem::take(&mut self.non_primary_referenced_symbols));
+        block_builders[ThunkBlockId::FIRST.as_usize()].sort_and_dedup_symbols();
     }
 
     fn process_primary_part_refs<'data, P: Platform>(
@@ -206,8 +234,9 @@ impl ThunkLayoutBuilder {
         primary_ranges: &[Vec<Option<(u64, u64)>>],
         symbol_db: &crate::symbol_db::SymbolDb<'data, P>,
         per_symbol_flags: &crate::value_flags::PerSymbolFlags,
+        branch_range: u64,
         block_builders: &mut [ThunkBlockBuilder<'data, '_, P>],
-    ) {
+    ) -> bool {
         verbose_timing_phase!("Process primary part refs");
 
         let primary_range_for_symbol = |definition_id: SymbolId| -> Option<(u64, u64)> {
@@ -232,86 +261,178 @@ impl ThunkLayoutBuilder {
                 if definition_flags.contains(ValueFlags::PLT) {
                     def_start = 0;
                 }
-                let span_start = src_start.min(def_start);
-                let span_end = src_end.max(def_end);
-                return span_end.saturating_sub(span_start) < self.branch_range;
+                return primary_ranges_are_within_branch_range(
+                    (src_start, src_end),
+                    (def_start, def_end),
+                    branch_range,
+                );
             }
 
-            src_end < self.branch_range
+            src_end < branch_range
         };
 
         // Collect primary-section range-limited symbols by scanning each block's objects in
         // parallel, then reducing object-local symbol sets into one set per block.
-        block_builders.into_par_iter().for_each(|block| {
-            let symbols = block
-                .objects
-                .par_iter()
-                .map(|obj| {
-                    verbose_timing_phase!("Collect object primary part thunks");
+        block_builders
+            .into_par_iter()
+            .map(|block| {
+                let prior_symbol_count = block.symbols.len();
+                let symbols = block
+                    .objects
+                    .par_iter()
+                    .map(|obj| {
+                        verbose_timing_phase!("Collect object primary part thunks");
 
-                    let mut object_symbols = HashSet::new();
-                    for (i, raw_flags) in per_symbol_flags
-                        .raw_range(obj.symbol_id_range)
-                        .iter()
-                        .enumerate()
-                    {
-                        if !raw_flags.get().contains(ValueFlags::HAS_RANGE_LIMITED_REL) {
-                            continue;
+                        let mut object_symbols = HashSet::new();
+                        for (i, raw_flags) in per_symbol_flags
+                            .raw_range(obj.symbol_id_range)
+                            .iter()
+                            .enumerate()
+                        {
+                            if !raw_flags.get().contains(ValueFlags::HAS_RANGE_LIMITED_REL) {
+                                continue;
+                            }
+
+                            let local_symbol_id = obj.symbol_id_range.offset_to_id(i);
+                            let definition_id = symbol_db.definition(local_symbol_id);
+                            let Some((src_start, src_end)) =
+                                primary_ranges[obj.file_id.group()][obj.file_id.file()]
+                            else {
+                                continue;
+                            };
+
+                            if !provably_in_range(src_start, src_end, definition_id) {
+                                object_symbols.insert(definition_id);
+                            }
                         }
+                        object_symbols
+                    })
+                    .reduce(HashSet::new, |mut a, mut b| {
+                        verbose_timing_phase!("Merge thunk block symbols");
 
-                        let local_symbol_id = obj.symbol_id_range.offset_to_id(i);
-                        let definition_id = symbol_db.definition(local_symbol_id);
-                        let Some((src_start, src_end)) =
-                            primary_ranges[obj.file_id.group()][obj.file_id.file()]
-                        else {
-                            continue;
-                        };
-
-                        if !provably_in_range(src_start, src_end, definition_id) {
-                            object_symbols.insert(definition_id);
+                        if b.len() > a.len() {
+                            std::mem::swap(&mut a, &mut b);
                         }
-                    }
-                    object_symbols
-                })
-                .reduce(HashSet::new, |mut a, mut b| {
-                    verbose_timing_phase!("Merge thunk block symbols");
+                        a.extend(b);
+                        a
+                    });
 
-                    if b.len() > a.len() {
-                        std::mem::swap(&mut a, &mut b);
-                    }
-                    a.extend(b);
-                    a
-                });
-
-            block.symbols.extend(symbols);
-        });
+                block.symbols.extend(symbols);
+                block.sort_and_dedup_symbols();
+                block.symbols.len() > prior_symbol_count
+            })
+            // Do not use `any` here: its short-circuiting could leave later blocks unprocessed
+            // in a convergence pass.
+            .reduce(|| false, |a, b| a || b)
     }
 }
 
 fn collect_primary_ranges<P: Platform>(
     group_states: &[layout::GroupState<P>],
     initial_offset: u64,
-) -> Vec<Vec<Option<(u64, u64)>>> {
+) -> Result<Vec<Vec<Option<(u64, u64)>>>> {
     let mut offset = initial_offset;
-    group_states
-        .iter()
-        .map(|group| {
-            group
-                .files
-                .iter()
-                .map(|file| {
-                    if let FileLayoutState::Object(obj) = file {
-                        let start = offset;
-                        let end = start + obj.post_gc_primary_bytes;
-                        offset = end;
-                        Some((start, end))
-                    } else {
-                        None
-                    }
+    let mut ranges = Vec::with_capacity(group_states.len());
+
+    for group in group_states {
+        let mut group_ranges = Vec::with_capacity(group.files.len());
+        for file in &group.files {
+            let Some(obj) = (match file {
+                FileLayoutState::Object(obj) => Some(obj),
+                _ => None,
+            }) else {
+                group_ranges.push(None);
+                continue;
+            };
+
+            let start = offset;
+            offset = offset.checked_add(obj.post_gc_primary_bytes).ok_or_else(|| {
+                crate::error!("primary text layout overflows while placing input object")
+            })?;
+            group_ranges.push(Some((start, offset)));
+        }
+        ranges.push(group_ranges);
+    }
+
+    Ok(ranges)
+}
+
+/// Replays the primary-part layout after inserting the exact current island size immediately
+/// after every block owner. `base_ranges` deliberately stays unchanged so each convergence pass
+/// is a fresh relayout rather than accumulating the same island bytes twice.
+fn relayout_primary_ranges<P: Platform>(
+    base_ranges: &[Vec<Option<(u64, u64)>>],
+    block_builders: &[ThunkBlockBuilder<'_, '_, P>],
+) -> Result<Vec<Vec<Option<(u64, u64)>>>> {
+    let mut thunk_bytes_after_owner = HashMap::new();
+
+    for block in block_builders {
+        let Some(owner) = block.objects.iter().find(|obj| obj.owns_thunk_block) else {
+            continue;
+        };
+        let Some(config) = P::file_thunk_config(owner.object) else {
+            continue;
+        };
+        let count = u64::try_from(block.symbols.len())
+            .map_err(|_| crate::error!("thunk block symbol count does not fit in u64"))?;
+        let thunk_bytes = count.checked_mul(config.thunk_size).ok_or_else(|| {
+            crate::error!("thunk block size overflows while re-evaluating branch ranges")
+        })?;
+        if thunk_bytes_after_owner
+            .insert((owner.file_id.group(), owner.file_id.file()), thunk_bytes)
+            .is_some()
+        {
+            return Err(crate::error!(
+                "multiple branch-island blocks have the same owner object"
+            ));
+        }
+    }
+
+    replay_primary_ranges_after_island_insertions(base_ranges, &thunk_bytes_after_owner)
+}
+
+fn replay_primary_ranges_after_island_insertions(
+    base_ranges: &[Vec<Option<(u64, u64)>>],
+    thunk_bytes_after_owner: &HashMap<(usize, usize), u64>,
+) -> Result<Vec<Vec<Option<(u64, u64)>>>> {
+    let mut inserted_bytes = 0;
+    let mut ranges = Vec::with_capacity(base_ranges.len());
+    for (group_id, group_ranges) in base_ranges.iter().enumerate() {
+        let mut relaid_group_ranges = Vec::with_capacity(group_ranges.len());
+        for (file_id, range) in group_ranges.iter().enumerate() {
+            let range = range
+                .map(|(start, end)| {
+                    let start = start.checked_add(inserted_bytes).ok_or_else(|| {
+                        crate::error!("primary text layout overflows while placing branch islands")
+                    })?;
+                    let end = end.checked_add(inserted_bytes).ok_or_else(|| {
+                        crate::error!("primary text layout overflows while placing branch islands")
+                    })?;
+                    Ok::<_, crate::error::Error>((start, end))
                 })
-                .collect()
-        })
-        .collect()
+                .transpose()?;
+            relaid_group_ranges.push(range);
+
+            if let Some(&thunk_bytes) = thunk_bytes_after_owner.get(&(group_id, file_id)) {
+                inserted_bytes = inserted_bytes.checked_add(thunk_bytes).ok_or_else(|| {
+                    crate::error!("primary text layout overflows while placing branch islands")
+                })?;
+            }
+        }
+        ranges.push(relaid_group_ranges);
+    }
+
+    Ok(ranges)
+}
+
+fn primary_ranges_are_within_branch_range(
+    source: (u64, u64),
+    definition: (u64, u64),
+    branch_range: u64,
+) -> bool {
+    let span_start = source.0.min(definition.0);
+    let span_end = source.1.max(definition.1);
+    span_end.saturating_sub(span_start) < branch_range
 }
 
 /// Records that a thunkable relocation was encountered during the GC phase. The actual decision
@@ -467,13 +588,17 @@ fn assign_thunk_blocks(
 }
 
 impl<'data, 'state, P: Platform> ThunkBlockBuilder<'data, 'state, P> {
+    fn sort_and_dedup_symbols(&mut self) {
+        self.symbols.sort();
+        self.symbols.dedup();
+    }
+
     fn build(mut self) -> ThunkBlock {
         verbose_timing_phase!("Build thunk block");
         // Sorting is needed for deterministic output, since the symbols came here in hashset
         // iteration order. Deduplication has mostly already occurred, but the non-primary hasn't
         // yet been deduplicated against other thunks for the first block.
-        self.symbols.sort();
-        self.symbols.dedup();
+        self.sort_and_dedup_symbols();
         ThunkBlock {
             symbols: self.symbols,
         }
@@ -542,5 +667,44 @@ mod tests {
         assert_eq!(assignments[&FileId::new(0, 2)], ThunkBlockId(1));
         assert_eq!(assignments[&FileId::new(0, 3)], ThunkBlockId(1));
         assert_eq!(assignments[&FileId::new(0, 4)], ThunkBlockId(1));
+    }
+
+    #[test]
+    fn arm64_macho_rechecks_direct_branches_after_a_large_island_insertion() {
+        // ARM64's B/BL reach is 128 MiB. The old one-pass calculation reserved 2 MiB for a
+        // block but did not enforce that limit. A block just larger than that could be inserted
+        // between this target and source, changing a previously-safe direct branch into an
+        // out-of-range one. Keep this synthetic layout tiny while preserving those exact limits.
+        const ARM64_BRANCH_RANGE: u64 = 128 * 1024 * 1024;
+        const HISTORICAL_RESERVE: u64 = 2 * 1024 * 1024;
+
+        let base_ranges = vec![vec![
+            Some((0, 4)),
+            Some((4, 8)),
+            Some((
+                ARM64_BRANCH_RANGE - HISTORICAL_RESERVE - 8,
+                ARM64_BRANCH_RANGE - HISTORICAL_RESERVE - 4,
+            )),
+        ]];
+        let target = base_ranges[0][0].unwrap();
+        let source = base_ranges[0][2].unwrap();
+        assert!(primary_ranges_are_within_branch_range(
+            source,
+            target,
+            ARM64_BRANCH_RANGE - HISTORICAL_RESERVE
+        ));
+
+        let relaid_ranges = replay_primary_ranges_after_island_insertions(
+            &base_ranges,
+            &HashMap::from([((0, 1), HISTORICAL_RESERVE + 12)]),
+        )
+        .unwrap();
+        let relaid_source = relaid_ranges[0][2].unwrap();
+
+        assert!(!primary_ranges_are_within_branch_range(
+            relaid_source,
+            target,
+            ARM64_BRANCH_RANGE
+        ));
     }
 }

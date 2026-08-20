@@ -130,13 +130,20 @@ impl crate::platform::Arch for MachOAArch64 {
         got_address: u64,
         plt_address: u64,
     ) -> crate::error::Result {
-        // TODO: For simplicity, we assume now the PLT entry precedes the GOT entry, so we can
-        // make the offset calculation in the unsigned type.
-        debug_assert!(plt_address < got_address);
+        // The stub uses a forward ADRP/LDR pair. A reversed layout would have wrapped this
+        // unsigned calculation in release builds and encoded an unrelated address.
+        ensure!(
+            plt_address < got_address,
+            "Mach-O stub address {plt_address:#x} must precede GOT address {got_address:#x}"
+        );
 
         plt_entry.copy_from_slice(STUB_TEMPLATE);
         let plt_page_address = plt_address & !PAGE_MASK_4KB;
-        let offset = got_address.wrapping_sub(plt_page_address);
+        let offset = got_address.checked_sub(plt_page_address).ok_or_else(|| {
+            crate::error!(
+                "Mach-O GOT address {got_address:#x} is before stub page {plt_page_address:#x}"
+            )
+        })?;
         ensure!(
             offset < (1 << 32),
             "Mach-O stub is more than 4GiB away from GOT"
@@ -470,6 +477,14 @@ mod tests {
 
         assert!(relocation.thunkable);
         assert_eq!(MachOAArch64::thunk_config().unwrap().thunk_size, 12);
+    }
+
+    #[test]
+    fn rejects_a_plt_entry_after_its_got_slot() {
+        let mut plt_entry = [0; STUB_TEMPLATE.len()];
+        let error = MachOAArch64::write_plt_entry(&mut plt_entry, 0x1000, 0x1000).unwrap_err();
+
+        assert!(error.to_string().contains("must precede GOT"));
     }
 
     #[test]

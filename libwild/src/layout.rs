@@ -244,17 +244,17 @@ pub fn compute<'data, P: Platform, A: Arch<Platform = P>, F: FileSystem>(
         .and_then(A::Platform::single_part_id)
         .map_or(0, |part_id| *section_part_sizes.get(part_id) / 8);
 
-    let thunk_blocks = thunk_layout_builder
-        .map(|builder| {
-            builder.build(
-                &mut group_states,
-                &symbol_db,
-                &per_symbol_flags,
-                &output_sections,
-                &section_part_sizes,
-            )
-        })
-        .unwrap_or_default();
+    let thunk_blocks = if let Some(builder) = thunk_layout_builder {
+        builder.build(
+            &mut group_states,
+            &symbol_db,
+            &per_symbol_flags,
+            &output_sections,
+            &section_part_sizes,
+        )?
+    } else {
+        Vec::new()
+    };
 
     allocate_thunk_block_space::<A::Platform>(
         &mut group_states,
@@ -5661,13 +5661,9 @@ fn compute_layout_sections<'data, P: Platform>(
                 let is_tls_nobits = section_info.section_attributes.is_tls()
                     && section_info.section_attributes.is_no_bits();
                 if is_tls_nobits {
-                    // Save our current mem_offset as we enter our first nobits TLS section
-                    if tls_memsave.is_none() {
-                        tls_memsave = Some(mem_offset);
-                    }
-                } else if let Some(tls_memsave) = tls_memsave.take() {
-                    // Restore offsets when exiting nobits TLS sections
-                    mem_offset = tls_memsave;
+                    enter_tls_nobits_memory::<P>(&mut tls_memsave, mem_offset);
+                } else {
+                    leave_tls_nobits_memory::<P>(&mut tls_memsave, &mut mem_offset);
                 }
 
                 let part_id_range = section_id.part_id_range::<P>();
@@ -5850,6 +5846,25 @@ fn compute_layout_sections<'data, P: Platform>(
     validate_all_non_empty_sections_emitted(sizes, output_sections, output_order)?;
 
     Ok((records_out, section_layouts, resolved_lc))
+}
+
+/// Records the ordinary-memory cursor before TLS zero-fill storage only on platforms where that
+/// storage is kept out of the containing load segment. Mach-O's `__thread_bss` is in `__DATA`, so
+/// its allocation must advance the cursor seen by the following segment.
+fn enter_tls_nobits_memory<P: Platform>(tls_memsave: &mut Option<u64>, mem_offset: u64) {
+    if !P::tls_nobits_extend_load_segment() && tls_memsave.is_none() {
+        *tls_memsave = Some(mem_offset);
+    }
+}
+
+/// Restores the ordinary-memory cursor after a run of ELF-style TLS zero-fill storage. Platforms
+/// whose TLS zero-fill belongs to an ordinary load segment deliberately retain the advanced cursor.
+fn leave_tls_nobits_memory<P: Platform>(tls_memsave: &mut Option<u64>, mem_offset: &mut u64) {
+    if !P::tls_nobits_extend_load_segment()
+        && let Some(saved_mem_offset) = tls_memsave.take()
+    {
+        *mem_offset = saved_mem_offset;
+    }
 }
 
 /// Checks if we've allocated space to any sections which aren't listed in our output ordering.
@@ -6495,6 +6510,37 @@ fn verify_consistent_allocation_handling<P: Platform, A: Arch<Platform = P>>(
     })?;
 
     Ok(())
+}
+
+#[test]
+fn macho_tls_nobits_keeps_the_load_segment_cursor_advanced() {
+    let tbss_start = 0x2b7f60;
+    let tbss_size = 0xc8;
+    let mut mem_offset = tbss_start;
+    let mut tls_memsave = None;
+
+    enter_tls_nobits_memory::<crate::macho::MachO>(&mut tls_memsave, mem_offset);
+    mem_offset += tbss_size;
+    leave_tls_nobits_memory::<crate::macho::MachO>(&mut tls_memsave, &mut mem_offset);
+
+    // `__thread_bss` is in Mach-O's __DATA segment. The next segment must therefore be aligned
+    // after its end, rather than after the cursor from before the TLS allocation.
+    assert_eq!(mem_offset, tbss_start + tbss_size);
+    assert!(tls_memsave.is_none());
+}
+
+#[test]
+fn elf_tls_nobits_restores_the_non_tls_cursor() {
+    let non_tls_start = 0x1000;
+    let mut mem_offset = non_tls_start;
+    let mut tls_memsave = None;
+
+    enter_tls_nobits_memory::<crate::elf::Elf64>(&mut tls_memsave, mem_offset);
+    mem_offset += 0xc8;
+    leave_tls_nobits_memory::<crate::elf::Elf64>(&mut tls_memsave, &mut mem_offset);
+
+    assert_eq!(mem_offset, non_tls_start);
+    assert!(tls_memsave.is_none());
 }
 
 impl<'scope, 'data, P: Platform> FinaliseLayoutResources<'scope, 'data, P> {

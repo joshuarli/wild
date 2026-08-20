@@ -1,0 +1,65 @@
+name: Extended Mach-O qualification
+
+on:
+  schedule:
+    - cron: '17 11 * * 1'
+  workflow_dispatch:
+    inputs:
+      scope:
+        description: ARM64 qualification workload
+        required: true
+        default: cargo-corpus
+        type: choice
+        options:
+          - cargo-corpus
+          - self-host
+
+permissions: {}
+
+jobs:
+  cargo-corpus:
+    if: github.event_name == 'schedule' || inputs.scope == 'cargo-corpus'
+    name: Cargo corpus (AArch64)
+    runs-on: macos-latest
+    timeout-minutes: 35
+    env:
+      WILD_TEST_IGNORE_FORMAT: '1'
+      WILD_RUN_MACHO_REAL_CARGO_CORPUS: '1'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@nightly-2026-07-24
+        with:
+          components: rust-src,llvm-tools
+      - run: rustup toolchain install stable
+      - run: cargo +nightly-2026-07-24 build --profile ci -p wild-linker --features macho --bin wild
+      - run: cargo +nightly-2026-07-24 test --profile ci -p wild-linker --features macho --test integration_tests -- 'macho/aarch64/real-cargo-corpus/default'
+
+  self-host:
+    if: github.event_name == 'workflow_dispatch' && inputs.scope == 'self-host'
+    name: Self-host (AArch64)
+    runs-on: macos-latest
+    timeout-minutes: 35
+    env:
+      WILD_TEST_IGNORE_FORMAT: '1'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@nightly-2026-07-24
+        with:
+          components: rust-src,llvm-tools
+      - run: cargo +nightly-2026-07-24 build --profile ci -p wild-linker --features macho --bin wild
+      - run: |
+          set -o pipefail
+          CARGO_TARGET_DIR="$RUNNER_TEMP/wild-selfhost" \
+          RUSTFLAGS="-C linker=clang -C link-arg=--ld-path=$GITHUB_WORKSPACE/target/ci/wild -C link-arg=-v -Wlinker-messages" \
+          cargo +nightly-2026-07-24 build -vv --profile ci -p wild-linker --features macho --bin wild 2>&1 | tee "$RUNNER_TEMP/wild-selfhost.log"
+          grep -F "$GITHUB_WORKSPACE/target/ci/wild" "$RUNNER_TEMP/wild-selfhost.log"
+      - run: |
+          set -o pipefail
+          CARGO_TARGET_DIR="$RUNNER_TEMP/wild-selfhost-tests" \
+          RUSTFLAGS="-C linker=clang -C link-arg=--ld-path=$RUNNER_TEMP/wild-selfhost/ci/wild -C link-arg=-v -Wlinker-messages" \
+          cargo +nightly-2026-07-24 test --profile ci --workspace --features macho 2>&1 | tee "$RUNNER_TEMP/wild-selfhost-tests.log"
+          grep -F "$RUNNER_TEMP/wild-selfhost/ci/wild" "$RUNNER_TEMP/wild-selfhost-tests.log"
