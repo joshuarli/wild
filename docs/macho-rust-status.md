@@ -12,7 +12,8 @@ implemented behavior from planned behavior: an unchecked item is not a claim of 
 | Xcode / SDK | Xcode 26.6 (17F113), macOS SDK 26.5 |
 | SDK path | `/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk` |
 | Rust stable | `rustc 1.97.1 (8bab26f4f 2026-07-14)` |
-| Rust nightly available | `nightly-aarch64-apple-darwin` (also dated 2026-04-20, 2026-07-20, and 2026-07-24) |
+| Rust nightly qualification target | `nightly-2026-07-24`: `rustc 1.99.0-nightly (89c61a754 2026-07-23)` and Cargo `1.99.0-nightly (3efb1f477 2026-07-17)` |
+| Requested nightly components | `rust-src`, `llvm-tools-aarch64-apple-darwin` installed |
 | Primary qualification target | `aarch64-apple-darwin` |
 | Scope boundary | `x86_64-apple-darwin` is explicitly out of scope; this ledger qualifies ARM64 only |
 | Apple toolchain | Apple clang 21.0.0; ld64 1267; Homebrew `ld64.lld` present |
@@ -30,6 +31,10 @@ Baseline checks completed on this host:
 * `WILD_TEST_IGNORE_FORMAT=1 cargo test --profile ci --workspace --features macho` — pass
   (185 `libwild` tests, 35 Mach-O integration tests, recorder tests, and remaining workspace/doc
   tests).
+* `WILD_TEST_IGNORE_FORMAT=1 cargo +nightly-2026-07-24 test --profile ci --workspace --features
+  macho` — pass (all workspace unit tests and doctests, including 197 `libwild` tests and 52
+  ARM64 Mach-O integrations). This is the reproducible dated-nightly gate; it is run with the
+  installed `rust-src` and `llvm-tools` components, not by falling back to stable Rust.
 * Without `WILD_TEST_IGNORE_FORMAT=1`, only tidy tests fail because this host lacks `taplo` and
   `clang-format`; this is the same exemption configured for the macOS CI job. No formatter or
   linter was run as part of this work.
