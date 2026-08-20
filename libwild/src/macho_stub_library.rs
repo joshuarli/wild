@@ -8,7 +8,9 @@
 //! The parser accepts multi-document YAML TBD files. The first document is
 //! treated as the main library. Additional documents are followed through their
 //! `reexported-libraries` edges, so an umbrella can reexport another umbrella
-//! without flattening every leaf into its root document.
+//! without flattening every leaf into its root document. SDK stubs can instead
+//! put a reexport in a separate TBD file; callers supply the lookup boundary
+//! used to extend the same graph in that case.
 
 use crate::ensure;
 use crate::error;
@@ -98,10 +100,23 @@ impl DefinedStubLibrary<'_> {
     }
 }
 
+#[cfg(test)]
 pub fn parse_defined_library<'data>(input: &'data str) -> Result<DefinedStubLibrary<'data>> {
-    let library_definitions = serde_yaml::Deserializer::from_str(input)
-        .map(TextBasedDefinition::deserialize)
-        .collect::<Result<Vec<_>, _>>()?;
+    parse_defined_library_with_external_reexports(input, |install_name| {
+        Err(error!(
+            "reexported library '{install_name}' is not defined by this TBD document"
+        ))
+    })
+}
+
+/// Parses a TBD root and all ARM64-compatible reexports. `load_external_reexport` is called only
+/// when a reexport is not another document in the current file. It must return data whose lifetime
+/// is retained by the caller, because the resulting symbol names borrow the TBD text.
+pub fn parse_defined_library_with_external_reexports<'data>(
+    input: &'data str,
+    mut load_external_reexport: impl FnMut(&str) -> Result<&'data str>,
+) -> Result<DefinedStubLibrary<'data>> {
+    let mut library_definitions = parse_library_definitions(input)?;
 
     let main_library = library_definitions
         .first()
@@ -120,47 +135,37 @@ pub fn parse_defined_library<'data>(input: &'data str) -> Result<DefinedStubLibr
                 main_library.compatibility_version,
             )?,
         },
-        symbols: Vec::with_capacity(
-            library_definitions
-                .iter()
-                .flat_map(TextBasedDefinition::all_exports)
-                .map(|exp| exp.symbols.len())
-                .sum(),
-        ),
-        weak_symbols: Vec::with_capacity(
-            library_definitions
-                .iter()
-                .flat_map(TextBasedDefinition::all_exports)
-                .map(|exp| exp.weak_symbols.len())
-                .sum(),
-        ),
+        symbols: Vec::new(),
+        weak_symbols: Vec::new(),
     };
 
-    let libraries_by_install_name: HashMap<_, _> = library_definitions
-        .iter()
-        .map(|library| (library.install_name, library))
-        .collect();
-    ensure!(
-        libraries_by_install_name.len() == library_definitions.len(),
-        "duplicate TBD install-name documents are unsupported"
-    );
+    let mut libraries_by_install_name = HashMap::new();
+    for (index, library) in library_definitions.iter().enumerate() {
+        ensure!(
+            libraries_by_install_name.insert(library.install_name, index).is_none(),
+            "duplicate TBD install-name documents are unsupported"
+        );
+    }
 
     // A framework can reexport a nested umbrella, which then describes its own children. Walk
     // only the arm64e-compatible graph reachable from the root: unrelated multi-document entries
-    // do not become visible and nested leaves do not need a redundant root-level edge.
-    let mut pending = VecDeque::from([main_library]);
+    // do not become visible and nested leaves do not need a redundant root-level edge. When an
+    // SDK places a child into a separate TBD file (for example libiconv -> libcharset), append its
+    // documents to this lookup graph but keep the root's dylib metadata above.
+    let mut pending = VecDeque::from([0]);
     let mut visited = HashSet::new();
-    while let Some(lib) = pending.pop_front() {
-        if !visited.insert(lib.install_name) {
+    while let Some(library_index) = pending.pop_front() {
+        let library = &library_definitions[library_index];
+        if !visited.insert(library.install_name) {
             continue;
         }
         ensure!(
-            lib.tbd_version == 4,
+            library.tbd_version == 4,
             "TBD version 4 expected, got {}",
-            lib.tbd_version
+            library.tbd_version
         );
 
-        for export in lib.all_exports() {
+        for export in library.all_exports() {
             if export.targets.contains(&ARM64_LIB_ARCH) {
                 defined_library.symbols.extend(export.symbols.iter());
                 defined_library
@@ -169,22 +174,49 @@ pub fn parse_defined_library<'data>(input: &'data str) -> Result<DefinedStubLibr
             }
         }
 
-        for reexport in &lib.reexported_libraries {
-            if !reexport.targets.contains(&ARM64_LIB_ARCH) {
+        let reexports: Vec<_> = library
+            .reexported_libraries
+            .iter()
+            .filter(|reexport| reexport.targets.contains(&ARM64_LIB_ARCH))
+            .flat_map(|reexport| reexport.libraries.iter().copied())
+            .collect();
+        for install_name in reexports {
+            if let Some(&child_index) = libraries_by_install_name.get(install_name) {
+                pending.push_back(child_index);
                 continue;
             }
-            for &install_name in &reexport.libraries {
-                let child = libraries_by_install_name.get(install_name).ok_or_else(|| {
+
+            let external_definitions = parse_library_definitions(load_external_reexport(install_name)?)?;
+            let child_external_index = external_definitions
+                .iter()
+                .position(|library| library.install_name == install_name)
+                .ok_or_else(|| {
                     error!(
-                        "reexported library '{install_name}' is not defined by this TBD document"
+                        "external TBD for reexported library '{install_name}' does not define that install name"
                     )
                 })?;
-                pending.push_back(*child);
+            let first_external_index = library_definitions.len();
+            for external_library in external_definitions {
+                let external_index = library_definitions.len();
+                ensure!(
+                    libraries_by_install_name
+                        .insert(external_library.install_name, external_index)
+                        .is_none(),
+                    "duplicate TBD install-name documents are unsupported"
+                );
+                library_definitions.push(external_library);
             }
+            pending.push_back(first_external_index + child_external_index);
         }
     }
 
     Ok(defined_library)
+}
+
+fn parse_library_definitions<'data>(input: &'data str) -> Result<Vec<TextBasedDefinition<'data>>> {
+    Ok(serde_yaml::Deserializer::from_str(input)
+        .map(TextBasedDefinition::deserialize)
+        .collect::<Result<Vec<_>, _>>()?)
 }
 
 #[cfg(test)]
@@ -293,5 +325,37 @@ exports:
         assert_eq!(stub_library.dylib.install_name, b"/usr/lib/libRoot.dylib");
         assert_eq!(stub_library.dylib.versions, DylibVersions::tbd("", "").unwrap());
         assert_eq!(stub_library.symbols, ["_nested_leaf"]);
+    }
+
+    #[test]
+    fn parses_reexport_from_separate_tbd_file() {
+        let root = r"--- !tapi-tbd
+tbd-version: 4
+targets: [ arm64e-macos ]
+install-name: '/usr/lib/libRoot.dylib'
+reexported-libraries:
+  - targets: [ arm64e-macos ]
+    libraries: [ '/usr/lib/libChild.1.dylib' ]
+exports:
+  - targets: [ arm64e-macos ]
+    symbols: [ _root ]
+";
+        let child = r"--- !tapi-tbd
+tbd-version: 4
+targets: [ arm64e-macos ]
+install-name: '/usr/lib/libChild.1.dylib'
+exports:
+  - targets: [ arm64e-macos ]
+    symbols: [ _child ]
+";
+
+        let stub_library = parse_defined_library_with_external_reexports(root, |install_name| {
+            assert_eq!(install_name, "/usr/lib/libChild.1.dylib");
+            Ok(child)
+        })
+        .expect("separate reexport should parse");
+
+        assert_eq!(stub_library.dylib.install_name, b"/usr/lib/libRoot.dylib");
+        assert_eq!(stub_library.symbols, ["_root", "_child"]);
     }
 }

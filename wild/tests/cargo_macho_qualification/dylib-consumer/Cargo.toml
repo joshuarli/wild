@@ -1,0 +1,7 @@
+[package]
+name = "cargo-macho-dylib-consumer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cargo-macho-dylib-producer = { path = "../dylib-producer" }

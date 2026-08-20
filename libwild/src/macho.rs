@@ -1012,6 +1012,10 @@ enum ObjectKind<'data> {
 struct RegularObject<'data> {
     #[debug(skip)]
     pub(crate) sections: SectionTable<'data>,
+    /// Atom boundaries are a property of the input file, not a liveness query. Rust's standard
+    /// library has enough symbols that rebuilding and then coalescing this list for every graph
+    /// edge turns a valid proc-macro link quadratic.
+    atom_starts: Vec<Vec<u64>>,
 }
 
 impl<'data> platform::ObjectFile<'data> for File<'data> {
@@ -1056,15 +1060,24 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
         } else {
             ObjectKind::Regular(RegularObject {
                 sections: sections.ok_or("Missing segment command")?,
+                atom_starts: Vec::new(),
             })
         };
 
-        Ok(File {
+        let mut file = File {
             data: input,
             symbols: symbols.ok_or("Missing symbol table")?,
             flags: header.flags(LE),
             kind,
-        })
+        };
+        if file.uses_subsections_via_symbols() {
+            let atom_starts = file.compute_atom_starts()?;
+            let ObjectKind::Regular(regular) = &mut file.kind else {
+                unreachable!("only regular Mach-O objects may opt into subsection atoms");
+            };
+            regular.atom_starts = atom_starts;
+        }
+        Ok(file)
     }
 
     fn parse(input: &crate::input_data::InputBytes<'data>, _args: &MachOArgs) -> Result<Self> {
@@ -2713,8 +2726,12 @@ impl platform::Platform for MachO {
             prelude.format_specific.load_command_count += 1;
         };
 
-        // Separately emitted __PAGEZERO.
-        allocate_load_cmd(size_of::<SegmentCommand>());
+        // __PAGEZERO reserves the low address space for an executable. A dylib instead starts
+        // its relocatable image at VM address zero and must not advertise an executable-only
+        // synthetic segment.
+        if resources.symbol_db.output_kind.is_executable() {
+            allocate_load_cmd(size_of::<SegmentCommand>());
+        }
 
         for &segment_id in &header_info.active_segment_ids {
             let segment = program_segments.segment_def(segment_id);
@@ -3647,7 +3664,14 @@ fn process_normalized_relocation<'data, 'scope, A: platform::Arch<Platform = Mac
     if let Some(subtractor) = relocation.subtractor {
         validate_subtractor_pair_targets(object, relocation.info, subtractor, resources)?;
     }
-    process_relocation::<A>(object, relocation.info, section_index, resources, queue, scope)?;
+    process_relocation::<A>(
+        object,
+        relocation.info,
+        section_index,
+        resources,
+        queue,
+        scope,
+    )?;
     if let Some(subtractor) = relocation.subtractor {
         process_subtractor_target::<A>(object, subtractor, section_index, resources, queue, scope)?;
     }
@@ -3928,7 +3952,7 @@ impl<'data> File<'data> {
     ) -> Result<Range<u64>> {
         let section = self.section(section_index)?;
         let section_size = self.section_size(section)?;
-        let starts = self.atom_starts(section_index, section_size)?;
+        let starts = self.atom_starts(section_index)?;
         // The synthetic zero boundary gives the first symbol ownership of any leading bytes.
         // Later atoms begin at real symbol boundaries. This also accepts aliases without
         // allocating a separate atom for every symbol table entry at the same address.
@@ -3947,16 +3971,28 @@ impl<'data> File<'data> {
         Ok(start..end)
     }
 
-    fn atom_starts(
-        &self,
-        section_index: object::SectionIndex,
-        section_size: u64,
-    ) -> Result<Vec<u64>> {
-        let mut starts = vec![0];
+    fn atom_starts(&self, section_index: object::SectionIndex) -> Result<&[u64]> {
+        let ObjectKind::Regular(regular) = &self.kind else {
+            bail!("dynamic Mach-O input has no subsection atoms");
+        };
+        Ok(regular
+            .atom_starts
+            .get(section_index.0)
+            .map(Vec::as_slice)
+            .context("Mach-O subsection atom section index out of range")?)
+    }
+
+    fn compute_atom_starts(&self) -> Result<Vec<Vec<u64>>> {
+        let mut all_starts = vec![vec![0]; self.sections().len()];
         for (symbol_index, symbol) in self.enumerate_symbols() {
-            if self.symbol_section(symbol, symbol_index)? != Some(section_index) {
+            let Some(section_index) = self.symbol_section(symbol, symbol_index)? else {
                 continue;
-            }
+            };
+            let starts = all_starts
+                .get_mut(section_index.0)
+                .context("Mach-O symbol section index out of range while forming dead-strip atoms")?;
+            let section = self.section(section_index)?;
+            let section_size = self.section_size(section)?;
             let offset = self.symbol_offset_in_section(symbol, section_index)?;
             ensure!(
                 offset <= section_size,
@@ -3964,31 +4000,35 @@ impl<'data> File<'data> {
             );
             starts.push(offset);
         }
-        starts.sort_unstable();
-        starts.dedup();
 
         // Do not create an atom boundary through a relocation field. The relocation belongs to
         // the atom containing its first byte, but its storage must remain contiguous even when a
         // symbol labels the middle of a pointer or instruction operand. Merging those boundaries
         // is conservative and avoids silently patching a dead neighbouring atom.
-        for relocation in paired_relocations(self.relocations(section_index, &())?.relocations) {
-            let relocation = relocation?;
-            let relocation_start = u64::from(relocation.info.r_address);
-            let width = 1u64
-                .checked_shl(u32::from(relocation.info.r_length))
-                .context("Mach-O relocation width is invalid")?;
-            let relocation_end = relocation_start
-                .checked_add(width)
-                .context("Mach-O relocation range overflows")?;
-            ensure!(
-                relocation_end <= section_size,
-                "Mach-O relocation extends past the end of its section"
-            );
-            starts.retain(|boundary| {
-                *boundary == 0 || !(*boundary > relocation_start && *boundary < relocation_end)
-            });
+        for (section_index, section) in self.enumerate_sections() {
+            let section_size = self.section_size(section)?;
+            let starts = &mut all_starts[section_index.0];
+            starts.sort_unstable();
+            starts.dedup();
+            for relocation in paired_relocations(self.relocations(section_index, &())?.relocations) {
+                let relocation = relocation?;
+                let relocation_start = u64::from(relocation.info.r_address);
+                let width = 1u64
+                    .checked_shl(u32::from(relocation.info.r_length))
+                    .context("Mach-O relocation width is invalid")?;
+                let relocation_end = relocation_start
+                    .checked_add(width)
+                    .context("Mach-O relocation range overflows")?;
+                ensure!(
+                    relocation_end <= section_size,
+                    "Mach-O relocation extends past the end of its section"
+                );
+                starts.retain(|boundary| {
+                    *boundary == 0 || !(*boundary > relocation_start && *boundary < relocation_end)
+                });
+            }
         }
-        Ok(starts)
+        Ok(all_starts)
     }
 
     fn sections(&self) -> &'data [SectionHeader] {

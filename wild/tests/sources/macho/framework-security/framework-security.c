@@ -1,6 +1,7 @@
 //#Object:runtime.c
 //#LinkerDriver:clang
 //#LinkArgs:-framework Security
+//#ExpectMachOLoadCommand:dylib:path=/System/Library/Frameworks/Security.framework/Versions/A/Security,current=61901.120.67,compatibility=1.0.0
 //#DiffIgnore:section.__unwind_info
 
 #include <Security/SecRandom.h>

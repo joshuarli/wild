@@ -100,8 +100,17 @@ impl crate::platform::Arch for MachOAArch64 {
     type Relaxation = Relaxation;
 
     type Platform = MachO;
-    fn start_memory_address(_output_kind: crate::output_kind::OutputKind) -> u64 {
-        crate::macho::MACHO_START_MEM_ADDRESS
+    fn start_memory_address(output_kind: crate::output_kind::OutputKind) -> u64 {
+        // Mach-O executables reserve the first 4 GiB with __PAGEZERO and begin the image at
+        // 0x1_0000_0000. Dylibs are relocatable images: ld64 gives their __TEXT segment a zero
+        // VM address so dyld's chained local rebases are image-relative. Reusing the executable
+        // base for an MH_DYLIB leaves its local function pointers invalid when rustc loads a
+        // proc macro.
+        if output_kind.is_shared_object() {
+            0
+        } else {
+            crate::macho::MACHO_START_MEM_ADDRESS
+        }
     }
     fn arch_identifier() -> <Self::Platform as crate::platform::Platform>::ArchIdentifier {
         todo!()
@@ -263,7 +272,10 @@ impl crate::platform::Arch for MachOAArch64 {
                 )?;
                 (
                     RelocationKind::AbsoluteLowPart,
-                    RelocationSize::bit_mask_aarch64(0, 12, AArch64Instruction::Add),
+                    // Dynamic TLVP loads remain an unsigned-immediate LDR, whose low-12
+                    // offset is scaled by the access width. Local TLVP loads are rewritten to
+                    // ADD before relocation application. MachOLow12 handles both encodings.
+                    RelocationSize::bit_mask_aarch64(0, 12, AArch64Instruction::MachOLow12),
                     None,
                     AllowedRange::no_check(),
                     1,
@@ -451,6 +463,23 @@ mod tests {
     }
 
     #[test]
+    fn dylibs_start_at_zero_while_executables_keep_pagezero_base() {
+        use crate::args::RelocationModel;
+        use crate::output_kind::OutputKind;
+
+        assert_eq!(
+            MachOAArch64::start_memory_address(OutputKind::DynamicExecutable(
+                RelocationModel::Relocatable
+            )),
+            crate::macho::MACHO_START_MEM_ADDRESS
+        );
+        assert_eq!(
+            MachOAArch64::start_memory_address(OutputKind::SharedObject),
+            0
+        );
+    }
+
+    #[test]
     fn rejects_an_unpaired_subtractor_after_macho_normalization() {
         let error = MachOAArch64::relocation_from_raw(relocation(
             object::macho::ARM64_RELOC_SUBTRACTOR,
@@ -483,5 +512,11 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(pageoff.kind, RelocationKind::AbsoluteLowPart);
+
+        // An imported descriptor remains an LDR, so the second 8-byte TLVP slot must encode an
+        // immediate of one rather than treating the byte offset as ADD's unscaled immediate.
+        let mut dynamic_ldr = 0xf940_0000u32.to_le_bytes();
+        pageoff.write_to_buffer(8, &mut dynamic_ldr).unwrap();
+        assert_eq!(u32::from_le_bytes(dynamic_ldr), 0xf940_0400);
     }
 }

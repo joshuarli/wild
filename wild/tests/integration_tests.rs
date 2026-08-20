@@ -420,7 +420,444 @@ fn main() -> Result<std::process::ExitCode> {
     let mut tests = Vec::new();
     collect_tests(&mut tests, &filter)?;
     external_tests::collect_tests(&mut tests, &filter)?;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+    collect_cargo_macho_qualification(&mut tests, &filter)?;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+    collect_cargo_macho_staticlib_qualification(&mut tests, &filter)?;
     Ok(libtest_mimic::run(&args, tests).exit_code())
+}
+
+/// Cargo normally hides the final linker command behind rustc, so this fixture runs with `-vv`
+/// and makes Clang print the selected linker. It exercises both kinds of Rust dylib that Cargo
+/// produces on ARM64: a proc macro that must be loaded during compilation, and a Rust `dylib`
+/// that must be found through the final executable's Mach-O rpath at runtime.
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+fn collect_cargo_macho_qualification(tests: &mut Vec<Trial>, filter: &Filter) -> Result {
+    const NAME: &str = "macho/aarch64/cargo-workspace-qualification/default";
+    if filter.excludes(NAME) {
+        return Ok(());
+    }
+
+    tests.push(Trial::test(NAME, || {
+        run_cargo_macho_qualification().map_err(|e| libtest_mimic::Failed::from(e.to_string()))
+    }));
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+fn run_cargo_macho_qualification() -> Result {
+    let manifest = base_dir()
+        .join("tests")
+        .join("cargo_macho_qualification")
+        .join("Cargo.toml");
+    ensure!(
+        manifest.is_file(),
+        "missing Cargo Mach-O qualification workspace at {}",
+        manifest.display()
+    );
+
+    // A fresh target directory guarantees Cargo performs every final link, so the `-v`
+    // transcript below is proof of the linker selected for each final artifact rather than a
+    // cached build's historical output. Cargo's native-dylib rpath is relative to that directory;
+    // keep it short under `/tmp` and retain the guard through runtime inspection.
+    let target_dir_guard = tempfile::Builder::new()
+        .prefix("wild-cargo-macho-qualification-")
+        .tempdir_in("/tmp")
+        .context("failed to create temporary Cargo target directory")?;
+    let target_dir = target_dir_guard.path();
+    let wild = wild_path()
+        .canonicalize()
+        .with_context(|| format!("failed to resolve Wild linker {}", wild_path().display()))?;
+    let rustflags = format!(
+        "-C linker=clang -C link-arg=--ld-path={} -C link-arg=-v -C prefer-dynamic",
+        wild.display()
+    );
+
+    cargo_build_with_wild(
+        &manifest,
+        &target_dir,
+        None,
+        &rustflags,
+        &wild,
+        "cargo-macho-macro-consumer",
+        &["libcargo_macho_macro_producer", "cargo_macho_macro_consumer-"],
+    )?;
+    let target_debug = target_dir.join("debug");
+    run_cargo_macho_binary(
+        &target_debug.join("cargo-macho-macro-consumer"),
+        "proc macro expanded and ran",
+    )?;
+
+    cargo_build_with_wild(
+        &manifest,
+        &target_dir,
+        None,
+        &rustflags,
+        &wild,
+        "cargo-macho-dylib-consumer",
+        &["libcargo_macho_dylib_producer", "cargo_macho_dylib_consumer-"],
+    )?;
+    let dylib_consumer = target_debug.join("cargo-macho-dylib-consumer");
+    run_cargo_macho_binary(
+        &dylib_consumer,
+        "dylib consumer loaded through its Mach-O rpath",
+    )?;
+    verify_cargo_dylib_rpath(&dylib_consumer)?;
+
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+fn cargo_build_with_wild(
+    manifest: &Path,
+    target_dir: &Path,
+    target: Option<&str>,
+    rustflags: &str,
+    wild: &Path,
+    package: &str,
+    expected_final_outputs: &[&str],
+) -> Result {
+    // Cargo chooses its toolchain before it opens the manifest, so the nested workspace's
+    // `rust-toolchain.toml` is not enough when this integration test starts from Wild's root.
+    // Keep the qualification target explicit: its proof must exercise the user's requested
+    // dated nightly rather than whichever Cargo happens to be active for the test harness.
+    let mut command = Command::new("cargo");
+    command.arg("+nightly-2026-07-24")
+        .arg("build")
+        .arg("--manifest-path")
+        .arg(manifest);
+    if let Some(target) = target {
+        command.arg("--target").arg(target);
+    }
+    command
+        .arg("--package")
+        .arg(package)
+        .arg("-vv")
+        .env("CARGO_TARGET_DIR", target_dir)
+        .env("RUSTFLAGS", rustflags);
+    let output = command
+        .output()
+        .with_context(|| format!("failed to run Cargo Mach-O qualification command {command:?}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let transcript = format!("{stdout}{stderr}");
+    ensure!(
+        output.status.success(),
+        "Cargo package `{package}` failed with {}:\n{transcript}",
+        output.status
+    );
+
+    let wild = wild.to_string_lossy();
+    let linker_lines = transcript
+        .lines()
+        .filter(|line| line.contains(wild.as_ref()) && line.contains(" -o "))
+        .collect_vec();
+    ensure!(
+        !linker_lines.is_empty(),
+        "Cargo package `{package}` did not print a final Clang link selecting Wild {}:\n{transcript}",
+        wild
+    );
+    ensure!(
+        linker_lines.iter().all(|line| line.contains("-arch arm64")),
+        "Cargo package `{package}` selected a non-ARM64 final link:\n{}",
+        linker_lines.join("\n")
+    );
+    ensure!(
+        linker_lines.iter().all(|line| !line.contains("x86_64")),
+        "Cargo package `{package}` selected an x86_64 final link:\n{}",
+        linker_lines.join("\n")
+    );
+    for expected_output in expected_final_outputs {
+        ensure!(
+            linker_lines.iter().any(|line| line.contains(expected_output)),
+            "Cargo package `{package}` did not link `{expected_output}` through Wild {}:\n{}",
+            wild,
+            linker_lines.join("\n")
+        );
+    }
+    ensure!(
+        linker_lines.iter().all(|line| {
+            expected_final_outputs
+                .iter()
+                .any(|expected_output| line.contains(expected_output))
+        }),
+        "Cargo package `{package}` performed an unexpected final link that was not audited:\n{}",
+        linker_lines.join("\n")
+    );
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+fn run_cargo_macho_binary(binary: &Path, expected_stdout: &str) -> Result {
+    let output = Command::new(binary)
+        // Cargo sets this for its own subprocesses. Removing both search-path overrides ensures
+        // a successful dylib launch comes from the final Mach-O LC_RPATH, not test environment.
+        .env_remove("DYLD_LIBRARY_PATH")
+        .env_remove("DYLD_FALLBACK_LIBRARY_PATH")
+        .output()
+        .with_context(|| format!("failed to run Cargo Mach-O binary {}", binary.display()))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    ensure!(
+        output.status.success(),
+        "Cargo Mach-O binary {} failed with {}:\n{stdout}{stderr}",
+        binary.display(),
+        output.status
+    );
+    ensure!(
+        stdout.contains(expected_stdout),
+        "Cargo Mach-O binary {} did not print `{expected_stdout}`:\n{stdout}{stderr}",
+        binary.display()
+    );
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+fn verify_cargo_dylib_rpath(binary: &Path) -> Result {
+    let load_commands = Command::new("otool")
+        .arg("-l")
+        .arg(binary)
+        .output()
+        .with_context(|| format!("failed to inspect Mach-O rpaths in {}", binary.display()))?;
+    let load_commands = String::from_utf8_lossy(&load_commands.stdout);
+    ensure!(
+        load_commands.contains("path @loader_path/"),
+        "Cargo dylib consumer {} has no @loader_path rpath:\n{load_commands}",
+        binary.display()
+    );
+    let dependencies = Command::new("otool")
+        .arg("-L")
+        .arg(binary)
+        .output()
+        .with_context(|| format!("failed to inspect Mach-O dependencies in {}", binary.display()))?;
+    let dependencies = String::from_utf8_lossy(&dependencies.stdout);
+    ensure!(
+        dependencies.contains("@rpath/libcargo_macho_dylib_producer.dylib"),
+        "Cargo dylib consumer {} does not load the Rust dylib through @rpath:\n{dependencies}",
+        binary.display()
+    );
+    Ok(())
+}
+
+/// Rust's `staticlib` output is consumed by a native final link, rather than by rustc. The two
+/// native controls keep its ordinary C exports and the C++ exception path distinct: the latter
+/// throws in C++, crosses an `extern "C-unwind"` Rust export, and is caught by its original C++
+/// frame.
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+fn collect_cargo_macho_staticlib_qualification(
+    tests: &mut Vec<Trial>,
+    filter: &Filter,
+) -> Result {
+    const NAME: &str = "macho/aarch64/cargo-staticlib-native/default";
+    if filter.excludes(NAME) {
+        return Ok(());
+    }
+
+    tests.push(Trial::test(NAME, || {
+        run_cargo_macho_staticlib_qualification()
+            .map_err(|e| libtest_mimic::Failed::from(e.to_string()))
+    }));
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+fn run_cargo_macho_staticlib_qualification() -> Result {
+    let fixture_dir = base_dir().join("tests").join("cargo_macho_staticlib");
+    let manifest = fixture_dir.join("Cargo.toml");
+    ensure!(
+        manifest.is_file(),
+        "missing Cargo staticlib fixture workspace at {}",
+        manifest.display()
+    );
+
+    let target_dir_guard = tempfile::Builder::new()
+        .prefix("wild-cargo-macho-staticlib-")
+        .tempdir_in("/tmp")
+        .context("failed to create temporary Cargo staticlib target directory")?;
+    let target_dir = target_dir_guard.path();
+    let mut cargo = Command::new("cargo");
+    cargo
+        // Cargo selects rustup's toolchain before reading the nested manifest.
+        .arg("+nightly-2026-07-24")
+        .arg("build")
+        .arg("--manifest-path")
+        .arg(&manifest)
+        .arg("--package")
+        .arg("wild-macho-staticlib")
+        .env("CARGO_TARGET_DIR", target_dir);
+    let cargo_output = cargo
+        .output()
+        .with_context(|| format!("failed to build Cargo staticlib fixture with {cargo:?}"))?;
+    ensure!(
+        cargo_output.status.success(),
+        "Cargo staticlib fixture failed with {}:\n{}{}",
+        cargo_output.status,
+        String::from_utf8_lossy(&cargo_output.stdout),
+        String::from_utf8_lossy(&cargo_output.stderr),
+    );
+
+    let archive = target_dir.join("debug").join("libwild_macho_staticlib.a");
+    ensure!(
+        archive.is_file(),
+        "Cargo staticlib fixture did not produce {}",
+        archive.display()
+    );
+    // Xcode's nm can lag the LLVM that produced the requested nightly's object members. Use the
+    // fixture toolchain's llvm-tools component so this archive-level export check remains coupled
+    // to the same dated compiler that created the staticlib.
+    let mut rustc = Command::new("rustc");
+    rustc
+        .arg("+nightly-2026-07-24")
+        .arg("--print")
+        .arg("target-libdir");
+    let target_libdir = rustc
+        .output()
+        .with_context(|| format!("failed to find nightly target libdir with {rustc:?}"))?;
+    ensure!(
+        target_libdir.status.success(),
+        "nightly rustc target-libdir query failed with {}:\n{}",
+        target_libdir.status,
+        String::from_utf8_lossy(&target_libdir.stderr),
+    );
+    let target_libdir = PathBuf::from(String::from_utf8_lossy(&target_libdir.stdout).trim());
+    let llvm_nm = target_libdir
+        .parent()
+        .context("nightly target libdir has no rust target directory")?
+        .join("bin")
+        .join("llvm-nm");
+    ensure!(
+        llvm_nm.is_file(),
+        "nightly llvm-tools component did not provide {}",
+        llvm_nm.display(),
+    );
+    let exported_symbols = Command::new(&llvm_nm)
+        .arg("-gU")
+        .arg(&archive)
+        .output()
+        .with_context(|| {
+            format!(
+                "failed to inspect Rust staticlib exports in {} with {}",
+                archive.display(),
+                llvm_nm.display()
+            )
+        })?;
+    ensure!(
+        exported_symbols.status.success(),
+        "nightly llvm-nm failed for Rust staticlib {} with {}:\n{}",
+        archive.display(),
+        exported_symbols.status,
+        String::from_utf8_lossy(&exported_symbols.stderr),
+    );
+    let exported_symbols = String::from_utf8_lossy(&exported_symbols.stdout);
+    for symbol in [
+        "_wild_staticlib_add_host",
+        "_wild_staticlib_factorial",
+        "_wild_staticlib_call_thrower",
+    ] {
+        ensure!(
+            exported_symbols.contains(symbol),
+            "Rust staticlib {} is missing C export `{symbol}`:\n{exported_symbols}",
+            archive.display(),
+        );
+    }
+
+    let wild = wild_path()
+        .canonicalize()
+        .with_context(|| format!("failed to resolve Wild linker {}", wild_path().display()))?;
+    for (source, stem, expected_exit) in [
+        (
+            fixture_dir.join("native").join("staticlib-export-consumer.cc"),
+            "staticlib-export-consumer",
+            0,
+        ),
+        (
+            fixture_dir.join("native").join("staticlib-consumer.cc"),
+            "staticlib-cross-unwind-consumer",
+            42,
+        ),
+    ] {
+        let apple_binary = target_dir.join(format!("apple-{stem}"));
+        link_native_staticlib_consumer(&source, &archive, &apple_binary, None)?;
+        run_native_staticlib_consumer(&apple_binary, expected_exit)?;
+
+        let wild_binary = target_dir.join(format!("wild-{stem}"));
+        link_native_staticlib_consumer(&source, &archive, &wild_binary, Some(&wild))?;
+        run_native_staticlib_consumer(&wild_binary, expected_exit)?;
+    }
+
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+fn link_native_staticlib_consumer(
+    source: &Path,
+    archive: &Path,
+    output: &Path,
+    wild: Option<&Path>,
+) -> Result {
+    let mut command = Command::new("clang++");
+    if let Some(wild) = wild {
+        // This is the native final link under test. Keep both the chosen linker and ARM64 target
+        // explicit instead of inheriting the harness's Rust compiler configuration.
+        command.arg(format!("--ld-path={}", wild.display()));
+    }
+    command
+        // Clang's verbose child command is the proof that this native final link did not fall
+        // back to Apple ld after accepting `--ld-path`.
+        .arg("-v")
+        .arg("-arch")
+        .arg("arm64")
+        .arg("-mmacosx-version-min=11.0")
+        .arg(source)
+        .arg(archive)
+        .arg("-o")
+        .arg(output);
+    let command_output = command
+        .output()
+        .with_context(|| format!("failed to link native Rust staticlib consumer with {command:?}"))?;
+    ensure!(
+        command_output.status.success(),
+        "native Rust staticlib consumer link failed with {}:\n{}{}",
+        command_output.status,
+        String::from_utf8_lossy(&command_output.stdout),
+        String::from_utf8_lossy(&command_output.stderr),
+    );
+    if let Some(wild) = wild {
+        let wild_text = wild.to_string_lossy();
+        let transcript = format!(
+            "{}{}",
+            String::from_utf8_lossy(&command_output.stdout),
+            String::from_utf8_lossy(&command_output.stderr),
+        );
+        ensure!(
+            transcript.contains(wild_text.as_ref()),
+            "native Rust staticlib consumer did not select Wild {}:\n{transcript}",
+            wild.display(),
+        );
+        ensure!(
+            transcript.contains("-arch arm64"),
+            "native Rust staticlib consumer selected a non-ARM64 final link:\n{transcript}",
+        );
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+fn run_native_staticlib_consumer(binary: &Path, expected_exit: i32) -> Result {
+    let output = Command::new(binary)
+        .env_remove("DYLD_LIBRARY_PATH")
+        .env_remove("DYLD_FALLBACK_LIBRARY_PATH")
+        .output()
+        .with_context(|| format!("failed to run native Rust staticlib consumer {}", binary.display()))?;
+    ensure!(
+        output.status.code() == Some(expected_exit),
+        "native Rust staticlib consumer {} exited with {}, expected {expected_exit}:\n{}{}",
+        binary.display(),
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    Ok(())
 }
 
 fn collect_tests(tests: &mut Vec<Trial>, filter: &Filter) -> Result {

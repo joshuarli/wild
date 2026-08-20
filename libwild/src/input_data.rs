@@ -18,7 +18,7 @@ use crate::linker_plugins::LinkerPlugin;
 use crate::linker_plugins::LtoInputInfo;
 use crate::linker_script::LinkerScript;
 use crate::macho_stub_library::DefinedStubLibrary;
-use crate::macho_stub_library::parse_defined_library;
+use crate::macho_stub_library::parse_defined_library_with_external_reexports;
 use crate::parsing::ParsedInputObject;
 use crate::platform;
 use crate::platform::Args;
@@ -189,7 +189,11 @@ enum LoadedFileState<'data, P: Platform, I: InputFileData> {
     Archive(&'data InputFile<I>, Vec<InputRecord<'data, P>>),
     ThinArchive(Vec<&'data InputFile<I>>, Vec<InputRecord<'data, P>>),
     LinkerScript(&'data InputFile<I>, LoadedLinkerScriptState<'data>),
-    StubLibrary(&'data InputFile<I>, DefinedStubLibrary<'data>),
+    StubLibrary(
+        &'data InputFile<I>,
+        Vec<&'data InputFile<I>>,
+        DefinedStubLibrary<'data>,
+    ),
     Error(Error),
 }
 
@@ -434,7 +438,11 @@ impl<'data, F: FileSystem> FileLoader<'data, F> {
                     self.extract_file(i, files, loaded, plugin)?;
                 }
             }
-            Some(LoadedFileState::StubLibrary(input_file, defined_stub_library)) => {
+            Some(LoadedFileState::StubLibrary(
+                input_file,
+                mut external_reexport_files,
+                defined_stub_library,
+            )) => {
                 self.has_dynamic = true;
                 loaded.stub_libraries.push(LoadedStubLibrary {
                     input: InputRef {
@@ -445,6 +453,7 @@ impl<'data, F: FileSystem> FileLoader<'data, F> {
                     defined_symbols: defined_stub_library,
                 });
                 self.loaded_files.push(input_file);
+                self.loaded_files.append(&mut external_reexport_files);
             }
             Some(LoadedFileState::Error(error)) => {
                 // For now, we just report the first error that we come to.
@@ -492,6 +501,55 @@ fn process_linker_script<'data, I: InputFileData>(
         },
         extra_inputs,
     })
+}
+
+/// Finds the physical SDK stub for an install-name reexport. A TBD's install name is a runtime
+/// path, while its stub is usually found by replacing the final `.dylib` extension with `.tbd`
+/// under the active sysroot. Keep the root search directory as a fallback because private SDK
+/// stubs can be adjacent even when the link did not carry an explicit sysroot.
+fn find_external_macho_stub_library(
+    root_stub_path: &Path,
+    install_name: &str,
+    args: &impl platform::Args,
+    file_system: &impl FileSystem,
+) -> Result<PathBuf> {
+    let install_path = Path::new(install_name);
+    let relative_install_path = install_path.strip_prefix("/").unwrap_or(install_path);
+    let reexport_tbd_path = relative_install_path.with_extension("tbd");
+    let reexport_tbd_filename = reexport_tbd_path
+        .file_name()
+        .context("reexported library does not name a library file")?;
+
+    let mut candidates = Vec::new();
+    if let Some(sysroot) = args.sysroot() {
+        candidates.push(sysroot.join(&reexport_tbd_path));
+    }
+    if let Some(root_directory) = root_stub_path.parent() {
+        candidates.push(root_directory.join(reexport_tbd_filename));
+    }
+    candidates.extend(
+        args.lib_search_path()
+            .iter()
+            .map(|directory| directory.join(reexport_tbd_filename)),
+    );
+    candidates.extend(
+        args.framework_search_path()
+            .iter()
+            .map(|directory| directory.join(&reexport_tbd_path)),
+    );
+
+    if let Some(path) = candidates
+        .iter()
+        .find(|candidate| file_system.file_type(candidate).is_ok())
+    {
+        return Ok(path.clone());
+    }
+
+    bail!(
+        "couldn't find external TBD reexport `{install_name}` while processing `{}`; searched {}",
+        root_stub_path.display(),
+        candidates.iter().map(|path| path.display()).join(", "),
+    );
 }
 
 fn process_archive<'data, P: Platform, F: FileSystem>(
@@ -717,11 +775,48 @@ impl<'data, P: Platform, F: FileSystem> TemporaryState<'data, P, F> {
                 ))
             }
             FileKind::MachOStubLibrary => {
-                let defined_library = parse_defined_library(str::from_utf8(input_file.data())?)
-                    .with_context(|| format!("Failed to process `{}`", absolute_path.display()))?;
+                let mut external_reexport_files = Vec::new();
+                let defined_library = parse_defined_library_with_external_reexports(
+                    str::from_utf8(input_file.data())?,
+                    |install_name| {
+                        let reexport_path = find_external_macho_stub_library(
+                            absolute_path,
+                            install_name,
+                            self.args,
+                            self.file_system.as_ref(),
+                        )?;
+                        let (data, _) = self
+                            .file_system
+                            .open_input(&reexport_path, self.args.common().prepopulate_maps)
+                            .with_context(|| {
+                                format!(
+                                    "Failed to open external TBD reexport `{install_name}` at `{}`",
+                                    reexport_path.display()
+                                )
+                            })?;
+                        let reexported_file = &*self.inputs_arena.alloc(InputFile {
+                            filename: reexport_path.clone(),
+                            original_filename: reexport_path,
+                            modifiers: input_file.modifiers,
+                            data: Some(data),
+                        });
+                        let reexported_data = str::from_utf8(reexported_file.data()).with_context(|| {
+                            format!(
+                                "External TBD reexport `{install_name}` is not valid UTF-8"
+                            )
+                        })?;
+                        external_reexport_files.push(reexported_file);
+                        Ok(reexported_data)
+                    },
+                )
+                .with_context(|| format!("Failed to process `{}`", absolute_path.display()))?;
                 tracing::debug!(file = ?input_file.filename, symbols = defined_library.symbols.len(),
                     weak_symbols = defined_library.weak_symbols.len(), "loaded TBD library");
-                Ok(LoadedFileState::StubLibrary(input_file, defined_library))
+                Ok(LoadedFileState::StubLibrary(
+                    input_file,
+                    external_reexport_files,
+                    defined_library,
+                ))
             }
             FileKind::FatMachOObject => {
                 process_fat_macho_object(input_file, input_ref, file.as_ref(), self)

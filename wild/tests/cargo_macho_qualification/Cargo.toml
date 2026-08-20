@@ -1,0 +1,11 @@
+[workspace]
+members = [
+    "dylib-consumer",
+    "dylib-producer",
+    "macro-consumer",
+    "macro-producer",
+]
+resolver = "2"
+
+[profile.dev]
+rpath = true

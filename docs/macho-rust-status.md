@@ -20,10 +20,9 @@ implemented behavior from planned behavior: an unchecked item is not a claim of 
 
 ## Current phase
 
-Phase 1–10: baseline, architecture audit, recorder infrastructure, and the first bounded
-Mach-O semantic implementations. The repository's existing macOS CI job builds the workspace
-and runs `cargo test --profile ci --workspace --features macho`; it is the existing fast Mach-O
-regression entry point. This remains a regression gate, not production qualification.
+Phase 1–10: architecture implementation plus expanding ARM64 qualification. The repository's
+existing macOS CI job builds the workspace and runs `cargo test --profile ci --workspace --features
+macho`; it remains the fast regression entry point, not a declaration of production completion.
 
 Baseline checks completed on this host:
 
@@ -32,7 +31,7 @@ Baseline checks completed on this host:
   (185 `libwild` tests, 35 Mach-O integration tests, recorder tests, and remaining workspace/doc
   tests).
 * `WILD_TEST_IGNORE_FORMAT=1 cargo +nightly-2026-07-24 test --profile ci --workspace --features
-  macho` — pass (all workspace unit tests and doctests, including 197 `libwild` tests and 52
+  macho` — pass (all workspace unit tests and doctests, including 201 `libwild` tests and 61
   ARM64 Mach-O integrations). This is the reproducible dated-nightly gate; it is run with the
   installed `rust-src` and `llvm-tools` components, not by falling back to stable Rust.
 * Without `WILD_TEST_IGNORE_FORMAT=1`, only tidy tests fail because this host lacks `taplo` and
@@ -53,8 +52,8 @@ than supported facilities:
 | Section/symbol classification | Handles data access, debug/non-alloc, `__DATA_CONST`, TLV storage, no-dead-strip, C strings, and Mach-O-specific no-op hooks. | partial |
 | ABI-level symbols | Bounded ARM64 fixtures cover tentative/common `N_UNDF` definitions (size and `n_desc` alignment in `__DATA,__common`), direct `N_INDR` aliases, `N_PEXT` visibility, hidden synthetic `___dso_handle`, C++ initialization/`atexit`/destruction, and Rust calling a native C function. Weak dylib imports retain `N_WEAK_REF` separately from weak definitions: all-weak dependencies use `LC_LOAD_WEAK_DYLIB` and the chained-import weak bit, while an unprovided weak import remains an undefined-symbol error. Absolute symbols, alias chains, and broad mixed-language qualification remain outside this bounded result. | partial; focused Apple controls and Wild runtime/structural fixtures green |
 | ARM64 relocations / thunks | Validates supported standalone forms, `POINTER_TO_GOT`, local and dylib-imported TLVP descriptors, paired `ADDEND`, bounded ordinary-data `SUBTRACTOR`/`UNSIGNED` expressions, and out-of-range `BRANCH26` via nearby text islands. Authenticated paths remain explicitly diagnosed or absent. | partial; unqualified |
-| Chained fixups | Plans address-ordered imported binds and local rebases per segment; gaps, leading local slots, 16 KiB pages, and malformed encodings are handled. Wider pointer-format/arm64e qualification remains. | partial; unqualified |
-| Dylib output / rpaths / exports | Emits `MH_DYLIB`, `LC_ID_DYLIB`, requested `LC_RPATH`, and omits executable-only commands; C runtime smoke passes. Dependency ordinals, weak/reexport behavior, and Rust dylib qualification remain. | partial; unqualified |
+| Chained fixups | Plans address-ordered imported binds and local rebases per segment; gaps, leading local slots, 16 KiB pages, and malformed encodings are handled. `macho/chained-fixups-multipage` executes 2300 imported `__got` binds across two pages, while `macho/chained-fixups-tlvp` executes two imported descriptor binds in `__thread_ptrs`. Wider pointer-format/arm64e qualification remains. | partial; bounded ARM64 runtime green |
+| Dylib output / rpaths / exports | Emits `MH_DYLIB`, `LC_ID_DYLIB`, requested `LC_RPATH`, and omits executable-only commands. C and bounded Rust `dylib` producer/consumer runtime controls pass. Dependency ordinals and weak/reexport behavior remain. | partial; bounded C/Rust dylib runtime green |
 | Dead strip / atoms | `MH_SUBSECTIONS_VIA_SYMBOLS` inputs are split into live symbol-delimited spans under `-dead_strip`; whole-section behavior is retained otherwise. | partial; differential smoke green |
 | TLS, compact unwind, DWARF, string merging | A local C TLS descriptor fixture executes successfully. ARM64 compact frame/frameless rows, personality pointers, and LSDAs are synthesized and a C++ throw/catch fixture passes. Bounded ARM64 DWARF-mode rows now serialize their live `__eh_frame` CIE/FDE records and pass a Rust `panic=unwind` / `catch_unwind` smoke under `-dead_strip`. Ordinary C debug data is represented only by a bounded `dsymutil` debug map; final executables intentionally do not copy `__DWARF`. | partial; bounded unwind and C debug-map smoke green |
 
@@ -63,29 +62,34 @@ than supported facilities:
 | Facility | Minimal fixture | Apple differential | Rust integration | Stress test | Status |
 | --- | --- | --- | --- | --- | --- |
 | ARM64 executable | existing `wild/tests/sources/macho/trivial` | pending | fresh stable Cargo bin and default `cargo test` link and run | n/a | smoke green |
-| SDK `.tbd` / libSystem | `macho/sdk-libcompression` links a versionless SDK TBD and runs; `macho/sdk-accelerate-nested-reexport` resolves an Accelerate → vecLib → BLAS export | Apple controls and Wild runtime pass | pending | n/a | bounded ARM64 SDK-stub support |
-| dylib | `trivial-dynamic` now links its `foo.c` dylib with Wild and consumes it at runtime; `macho/dylib-install-name-consumer` consumes an Apple-built physical-name mismatch through its `LC_ID_DYLIB` | Apple control, Wild load-command assertion, and C runtime pass | C runtime pass | n/a | bounded C dylib-input support |
-| framework | none | pending | pending | n/a | unqualified |
+| SDK `.tbd` / libSystem | `macho/sdk-libcompression` links a versionless SDK TBD and runs; `macho/sdk-accelerate-nested-reexport` resolves an in-file Accelerate → vecLib → BLAS export; `macho/sdk-libiconv-external-reexport` resolves libiconv's separate libcharset child while retaining only libiconv in the consumer | Apple controls and Wild runtime/load-command assertions pass | pending | n/a | bounded ARM64 SDK-stub support |
+| dylib | `trivial-dynamic` now links its `foo.c` dylib with Wild and consumes it at runtime; `macho/dylib-install-name-consumer` consumes an Apple-built physical-name mismatch through its `LC_ID_DYLIB` | Apple control, Wild load-command assertion, and C runtime pass | retained Cargo Rust `dylib` producer/consumer links each final artifact through Wild and loads through `@loader_path` rpath | n/a | bounded C/Rust dylib runtime green |
+| proc macro | `cargo_macho_macro_producer` expands through `TokenStream::from_str` into `40 + 2` | Apple control builds the producer/consumer pair | retained Cargo producer and consumer final links select Wild; the consumer runs the non-identity expansion | n/a | bounded ARM64 Cargo proc-macro runtime green |
+| framework | `macho/framework-security` calls `SecRandomCopyBytes` through `-framework Security` | Apple control and Wild output both carry the current SDK Security framework load command; both run successfully | C framework consumer runs through Wild | n/a | bounded ARM64 framework runtime/structural green |
 | dead strip | `macho/dead-strip` | code/data/export parity pass | C runtime pass | pending | atom smoke green |
 | ABI-level symbols | `macho/common-symbols`, `symbol-aliases`, `weak-symbols`, `weak-undefined`, `cxx-init-teardown` | Apple controls establish common/alias/weak behavior | `macho/rust-native-ffi` calls C through Wild | pending | bounded C/C++/Rust smoke green |
 | TLS | `macho/tls-local`, `macho/tls-dynamic`, `macho/rust-thread-local` | Apple ld binds the imported descriptor through `__got`; ld64.lld uses `__thread_ptrs` | C and Rust two-thread runtime passes under Wild; Rust static/dylib TLS qualification remains external | pending | bounded C/Rust local/dylib smoke green |
 | compact unwind | `macho/exception` C++ throw/catch; `macho/rust-panic-unwind` | structural section/header check; C++ and Rust runtime pass | ARM64 Rust `panic=unwind` / `catch_unwind` under `-dead_strip` | pending | bounded ARM64 support |
 | DWARF / dSYM / LLDB | `macho/debug-dwarf` C `-g -dead_strip` | Apple ld and ld64.lld establish the `N_SO`/`N_OSO`/paired-`N_FUN` control shape; Wild `dsymutil --dump-debug-map` passes | generated dSYM verifies; LLDB source breakpoint/backtrace and C parameter inspection pass | pending | bounded loose-object ARM64 C support |
-| chained fixups | existing output inspection only | pending | pending | pending | unqualified |
+| chained fixups | `macho/chained-fixups-tlvp`, `macho/chained-fixups-multipage` | Apple controls and Wild runtime pass | pending | 2300 imported `__got` binds cross two 16 KiB pages; two imported `__thread_ptrs` binds exercise a non-zero TLVP page offset | bounded ARM64 runtime green |
 | branch islands | `macho/branch-island`, `macho/branch-islands` | Apple links forced overflows | C runtime pass | multiple islands pass | ARM64 smoke green |
 
 ## Expanded ARM64 qualification observations
 
 ### SDK TBD and dylib identity metadata
 
-`macho_stub_library::parse_defined_library` accepts ARM64 TBD v4 roots that omit
+`macho_stub_library::parse_defined_library_with_external_reexports` accepts ARM64 TBD v4 roots that omit
 `current-version`, as the current SDK `libcompression.tbd` does. Missing `current-version` and
 `compatibility-version` each produce Apple's observed `1.0.0` consumer value. The parser walks
 only ARM64e-compatible `reexported-libraries` reachable from the root, so an umbrella may reexport
 another umbrella: the permanent Accelerate fixture imports `cblas_sdot` through
-Accelerate → vecLib → libBLAS. It retains a present root current/compatibility pair for the
-consumer load command. Unsupported TBD versions, duplicate install-name documents, and a reachable
-reexport lacking its child document remain diagnosed.
+Accelerate → vecLib → libBLAS. If the child is in a separate SDK TBD, `input_data` locates its
+physical `.tbd` from the active sysroot, root directory, or library search paths and retains that
+mapped input for the link lifetime. `macho/sdk-libiconv-external-reexport` covers the current
+libiconv → libcharset split. It retains the root current/compatibility pair and only the root
+install name in the consumer load command, matching Apple's dyld-facing contract. Unsupported TBD
+versions, duplicate install-name documents, and a reachable reexport whose external SDK child
+cannot be located remain diagnosed.
 
 `macho::DylibMetadata` carries one dynamic input's `LC_ID_DYLIB` install name plus its current and
 compatibility versions from parsing through library deduplication, ordinal assignment, and
@@ -98,9 +102,11 @@ consumer load command, while a newly produced `LC_ID_DYLIB` uses timestamp `1` a
 payload is shared with ordinary dependencies.
 
 The bounded permanent controls are `macho/sdk-libcompression`,
-`macho/sdk-accelerate-nested-reexport`, `macho/dylib-install-name-consumer`, and
-`macho/dylib-install-name-alias`. The custom consumer checks the exact load-command path and
-`7.8.9` / `3.2.1` pair; the alias fixture proves the clang/ld64 spelling
+`macho/sdk-accelerate-nested-reexport`, `macho/sdk-libiconv-external-reexport`,
+`macho/dylib-install-name-consumer`, and `macho/dylib-install-name-alias`. The libiconv control
+checks that `/usr/lib/libiconv.2.dylib`, rather than its reexported
+`/usr/lib/libcharset.1.dylib`, is present in the consumer. The custom consumer checks the exact
+load-command path and `7.8.9` / `3.2.1` pair; the alias fixture proves the clang/ld64 spelling
 `-dylib_install_name` produces a runnable dylib. This does not qualify platform variants beyond
 macOS ARM64, non-v4 TBD formats, or broad framework/reexport semantics.
 
@@ -109,18 +115,20 @@ passed wherever Wild is listed as failing.
 
 | Workflow | Current Wild result | Next required work |
 | --- | --- | --- |
-| Rust/C `Security` framework | links and runs | retain as a permanent integration fixture |
+| C `Security` framework | permanent `macho/framework-security` fixture links with `-framework Security`, asserts the SDK install name/version, and runs the imported `SecRandomCopyBytes` call under Wild | broaden framework search-path and Rust framework coverage |
 | C local and dylib TLS | `macho/tls-dynamic` passes an imported descriptor two-thread independence smoke under `-dead_strip` and PIE/ASLR | broaden TLS/dylib coverage |
 | Rust `cdylib` consumed from C | permanent `macho/rust-cdylib-consumer` replays rustc's `cdylib` link through Wild, exports a C ABI function, and runs from a C consumer | broaden Rust dylib/export and mixed-language coverage |
-| Rust `dylib` consumed from Rust | retained Cargo workspace links and runs through Wild | add Cargo crate-graph coverage outside the one-source integration harness |
-| Proc macro crate | retained Cargo workspace compiles, loads, and runs through Wild | add Cargo crate-graph coverage outside the one-source integration harness |
+| Rust `staticlib` consumed from C++ | ARM64-only `macho/aarch64/cargo-staticlib-native/default` builds with `nightly-2026-07-24`, checks C ABI exports, and links/runs native C++ consumers through Apple and explicitly through Wild; one control throws in C++, crosses Rust `extern "C-unwind"`, and catches in C++ | broaden the ABI and exception-stress matrix; x86_64 remains out of scope |
+| Rust `dylib` consumed from Rust | `macho/aarch64/cargo-workspace-qualification/default` links the producer and consumer through Wild and runs the consumer via its Mach-O rpath | broaden dependency and TLS matrix |
+| Proc macro crate | `macho/aarch64/cargo-workspace-qualification/default` links the proc-macro producer and consumer through Wild, loads the macro during compilation, and executes its non-identity expansion | broaden macro/crate stress coverage |
 | Rust `thread_local!` / `cargo test` | permanent `macho/rust-thread-local` two-thread fixture and default `cargo test` pass through Wild | exercise static/dylib TLS matrix |
 | C++ throw/catch | links, emits `__TEXT,__unwind_info`, and catches at runtime | broaden compact-unwind differential coverage |
 | Rust `panic=unwind` | `macho/rust-panic-unwind` selects live CIE/FDE records, rewrites DWARF compact-unwind FDE offsets, and catches a panic at runtime under `-dead_strip` | broaden CIE/FDE grammar and crate/stress coverage |
 | C DWARF / `dsymutil` | `macho/debug-dwarf` emits `N_SO`, `N_OSO`, and live-atom `N_FUN` pairs; `dsymutil` makes a verified dSYM and LLDB stops at the C source line under `-dead_strip` | qualify more C shapes and debug-map inputs |
 | `-dead_strip` and `-force_load` | dead C code/data and unreferenced forced archive member are covered | add stress/edge corpus |
 | 138 MiB fragmented branch | Apple and Wild both link/run through nearby islands | larger stress qualification |
-| 700 imported function binds | links/runs across multiple pages | extend fixups from imported GOT binds to local rebases |
+| 2300 imported data binds | `macho/chained-fixups-multipage` runs after reading every `__got` slot across two 16 KiB pages | broaden segment/pointer-format and local-rebase coverage |
+| Two imported TLS descriptors | `macho/chained-fixups-tlvp` runs through adjacent `__DATA,__thread_ptrs` chained binds; the second slot proves the LDR page offset is scaled | broaden TLS and multi-page descriptor coverage |
 
 ## Reproducers and qualification commands
 
@@ -128,6 +136,21 @@ passed wherever Wild is listed as failing.
 * Existing CI build: `cargo build --profile ci --workspace --no-default-features`.
 * Focused permanent Rust TLS fixture: `WILD_TEST_IGNORE_FORMAT=1 cargo test -p wild-linker
   --features macho --test integration_tests -- 'macho/aarch64/rust-thread-local/default'`.
+* Focused Apple-framework fixture: `WILD_TEST_IGNORE_FORMAT=1 cargo test --profile ci -p
+  wild-linker --features macho --test integration_tests --
+  'macho/aarch64/framework-security/default'`. It links the same ARM64 C consumer with Apple and
+  Wild, checks `LC_LOAD_DYLIB` for the current SDK Security framework identity/version, and runs
+  the imported call.
+* Focused external-SDK-reexport fixture: `WILD_TEST_IGNORE_FORMAT=1 cargo test --profile ci -p
+  wild-linker --features macho --test integration_tests --
+  'macho/aarch64/sdk-libiconv-external-reexport/default'`. It resolves the separate
+  `libcharset.1.tbd` child of the SDK's `libiconv.tbd`, then checks that only libiconv's install
+  name is emitted into the ARM64 consumer.
+* Cargo proc-macro and Rust-dylib qualification: `WILD_TEST_IGNORE_FORMAT=1 cargo test -p
+  wild-linker --features macho --test integration_tests --
+  'macho/aarch64/cargo-workspace-qualification/default'`. This retains the multi-package Cargo
+  workspace and audits each final ARM64 Clang invocation printed by `cargo -vv` for Wild's
+  `--ld-path`; it rejects any x86_64 final link.
 * Focused C debug-map fixture: `WILD_TEST_IGNORE_FORMAT=1 cargo test --profile ci -p wild-linker
   --test integration_tests --features macho -- 'macho/aarch64/debug-dwarf/default'`. Its output
   can be checked with `dsymutil --dump-debug-map <binary>`, `dsymutil <binary>`, and
@@ -187,24 +210,38 @@ The save-dir registration is ordinary path-valued option handling, not a cdylib 
 unit regression also covers the attached `-exported_symbols_list=path` spelling.
 
 Cargo Rust `dylib` consumption and proc-macro loading require multiple packages and distinct
-rustc invocations (producer, consumer, and proc-macro host). They therefore do not fit the
-single-source compiler model in this integration harness. Requalify them in a retained temporary
-Cargo workspace with the following repeatable controls:
+rustc invocations (producer, consumer, and proc-macro host). The existing integration runner
+therefore registers a separate ARM64-only trial,
+`macho/aarch64/cargo-workspace-qualification/default`, rather than pretending those graphs fit a
+single-source fixture. Its retained workspace is `wild/tests/cargo_macho_qualification` and has a
+path-dependent Rust `dylib` producer/consumer plus a `proc-macro = true` producer/consumer.
+
+For every package the trial creates a fresh short `/tmp` Cargo target directory and invokes
+`cargo +nightly-2026-07-24 build -vv` with `clang --ld-path=<Wild>`, `-v`, and
+`-C prefer-dynamic`. The explicit selector is necessary because rustup chooses Cargo before it
+opens a nested workspace's `rust-toolchain.toml`. The trial parses every final Clang link
+transcript, requires that each expected producer and consumer artifact selected Wild, requires
+`-arch arm64`, and rejects `x86_64`. The proc macro uses
+`TokenStream::from_str("40 + 2")`, so the consumer proves that a loaded macro performed a
+non-identity expansion. The Rust-dylib consumer is then executed after clearing the `DYLD_*`
+library search overrides; `otool` additionally checks both its `@loader_path` rpath and its
+`@rpath/libcargo_macho_dylib_producer.dylib` dependency. This coverage deliberately does not use
+`WILD_SAVE_DIR` or the `cdylib` replay path above.
+
+The separate ARM64-only `macho/aarch64/cargo-staticlib-native/default` trial builds
+`wild/tests/cargo_macho_staticlib` with the fixture's exact `nightly-2026-07-24` toolchain and
+uses that toolchain's `llvm-nm` for the archive export check. It then final-links native C++
+consumers with `-arch arm64`: once with Apple ld as a control and once with explicit
+`clang++ --ld-path=<Wild>`. The export consumer verifies two Rust `no_mangle` C functions and a
+native callback. Its second consumer has C++ throw, Rust `unsafe extern "C-unwind"` bridge, and
+C++ catch, proving the direct imported C++ typeinfo pointer is a chained bind rather than a
+provisional local rebase. This bounded result excludes x86_64, non-macOS hosts, and broad C++ or
+Rust ABI/exception qualification.
 
 ```sh
-cargo build -p wild-linker --features macho --bin wild
-WILD="$PWD/target/debug/wild"
-CARGO_TARGET_DIR="$QUAL_DIR/target" \
-RUSTFLAGS="-Clinker=clang -Clink-arg=--ld-path=$WILD" \
-  cargo run --manifest-path "$QUAL_DIR/Cargo.toml" \
-    --target aarch64-apple-darwin -vv
+WILD_TEST_IGNORE_FORMAT=1 cargo +nightly-2026-07-24 test --profile ci -p wild-linker \
+  --features macho --test integration_tests -- 'macho/aarch64/cargo-staticlib-native/default'
 ```
-
-The workspace should contain a path-dependent Rust `dylib` producer/consumer pair and a
-`proc-macro = true` crate plus a consumer. Preserve each `cargo -vv` log, the `WILD_SAVE_DIR`
-`run-with` file, and the exit status; accept a result only when the final rustc/clang invocation
-contains `--ld-path=$WILD` and the resulting ARM64 consumer runs. This is the reproducible Cargo
-qualification plan for those crate graphs without adding a parallel test framework here.
 
 ### Bounded C `dsymutil` debug map
 
@@ -248,14 +285,27 @@ relaxation APIs; none removes the known correctness gaps listed above.
 * Darwin argument parsing now models framework lookup (`-F` / `-framework`), dylib output,
   `-install_name`, `-rpath`, `-exported_symbols_list`, strip modes, and explicit ARM64 target
   validation. Unsupported `-x` is diagnosed rather than ignored.
+* SDK TBD reexports may be either additional YAML documents in the root stub or separately mapped
+  child TBDs. `input_data::find_external_macho_stub_library` resolves the latter through the
+  current ARM64 SDK search boundary, while `macho_stub_library` preserves the root metadata used by
+  `macho_writer::write_dylib_command`; `macho/sdk-libiconv-external-reexport` verifies the
+  libiconv → libcharset case without adding a libcharset load command to the consumer.
 * Wild emits `MH_DYLIB` / `LC_ID_DYLIB` for dylibs, `LC_RPATH` as requested, and keeps executable
   commands out of dylibs. The existing `trivial-dynamic` fixture now builds the dependency dylib
-  with Wild rather than forcing lld, then executes the consumer successfully.
-* Mach-O `__cstring` now reuses the generic merge map correctly: symbol values use a
-  section-relative input offset, merged bytes are emitted before code-signature hashing, and
-  Mach-O symtab entries retain the correct output section. `macho/cstring-merging` proves equal
-  literals from separate objects resolve to one address at runtime under `-dead_strip`. This fixed
-  an integration regression exposed by enabling C-string merging.
+  with Wild rather than forcing lld, then executes the consumer successfully. `MH_DYLIB` output
+  starts at VM address zero and omits synthetic `__PAGEZERO`, matching dylib image-relative
+  chained local rebases; `macho/dylib-local-rebase` calls through a local function pointer after
+  dyld loads the dylib. The retained Cargo workspace additionally verifies a Rust `dylib`
+  producer/consumer through its final `@loader_path` rpath.
+* Mach-O `__cstring` uses the generic merge map with section-relative symbol offsets; merged bytes
+  are emitted before code-signature hashing into the minimum-alignment part reserved by layout,
+  without overwriting a preceding higher-alignment section with the same Mach-O identity.
+  `macho/cstring-merging` proves equal literals from separate objects resolve to one address under
+  `-dead_strip`. `macho/cstring-local-symbol-identity` additionally uses direct ARM64 `ADRP`/`ADD`
+  references to different local literals at the same section-relative slot in two objects, with a
+  preceding regular aligned `__cstring` part, and proves the prefix and both local targets retain
+  their own bytes at runtime. This covers the cross-object/local-symbol case exposed by the
+  retained Cargo `regex-min` corpus.
 * AArch64 relocation validation now rejects malformed standalone encodings deterministically,
   supports both `ARM64_RELOC_POINTER_TO_GOT` representations, local executable TLVP descriptors,
   dylib-imported TLVP descriptor pointers, and paired `ADDEND` forms. A dynamic TLVP is recorded
@@ -270,17 +320,46 @@ relaxation APIs; none removes the known correctness gaps listed above.
   runtime.
 * Mach-O allocation now reserves every GOT/PLT entry that resolution creation will consume. The
   minimal stable Cargo smoke therefore advances past its empty-`__got` layout invariant.
+* A local definition may need both a chained-rebase GOT slot and a direct reference. Ordinary
+  relocations now use that definition's symbol address instead of the resolution's GOT-adjusted
+  raw value; `macho/local-got-rebase` calls the same local function both ways. This also covers
+  Rust proc-macro bridge callbacks whose direct function pointer otherwise landed in
+  non-executable `__DATA_CONST,__got`.
 * Mach-O dynamic-library inputs are deduplicated by install name, rather than their distinct SDK
   stub paths, and all aliases use the retained load-command ordinal. `macho/dylib-dedup` proves
   Rust's `-lSystem -lc -lm` no longer makes dyld reject duplicate `libSystem` commands.
-* Chained-fixup generation now uses actual dynamic GOT addresses, handles local gaps and multiple
-  16 KiB pages, and validates its chain encoding. The minimal stable Cargo binary links and runs
-  with Wild after its first dynamic bind at `__got + 0x68`.
+* Chained-fixup generation uses actual dynamic GOT addresses, handles local gaps and multiple
+  16 KiB pages, and validates its chain encoding. `macho/chained-fixups-multipage` executes 2300
+  distinct imported data binds across two `__DATA_CONST,__got` pages. A dynamic TLVP remains an
+  LDR rather than the local-descriptor ADD rewrite, so its page offset must use the instruction's
+  scaled low-12 encoding: `macho/chained-fixups-tlvp` executes two adjacent
+  `__DATA,__thread_ptrs` binds and reaches the second slot at +8. The minimal stable Cargo binary
+  also links and runs with Wild after its first dynamic bind at `__got + 0x68`.
 * ARM64 DWARF compact-unwind rows now retain only live `__eh_frame` FDEs, serialize their final
   CIE/FDE records, and rewrite the compact-unwind low 24-bit FDE offsets. The serializer supports
   the Rust-produced DWARF32 `zR` / `zPLR` CIE grammar with an indirect PC-relative personality
   pointer; for a local personality it adds the required validated chained GOT rebase. Permanent
-  `macho/rust-panic-unwind` runs Rust `panic=unwind` / `catch_unwind` with `-dead_strip`.
+`macho/rust-panic-unwind` runs Rust `panic=unwind` / `catch_unwind` with `-dead_strip`.
+
+### Dated-nightly Cargo corpus and self-host check
+
+The retained synthetic Cargo workspaces are deliberately small. A separate, disposable corpus
+was run with the exact `nightly-2026-07-24` toolchain, fresh per-project target directories, and
+`-C linker=clang -C link-arg=--ld-path=<Wild> -C link-arg=-v`. Each passing final transcript
+selected Wild and `-arch arm64`. The `regex 1.13.1` control builds and prints its successful
+match/capture; `clap` derive builds and executes its parsed-value CLI; Tokio's loopback runtime
+builds and runs through the SDK's `libiconv.tbd`; an `cc` build-script C++ client and a Security
+framework client both build and run. The previous regex failure became the permanent
+`macho/cstring-local-symbol-identity` regression; the previous Tokio link failure became the
+permanent `macho/sdk-libiconv-external-reexport` regression. Corpus directories are intentionally
+ephemeral because Cargo fingerprints and absolute paths are not durable test inputs.
+
+Self-hosting was also run in an isolated temporary target directory. A dated-nightly baseline
+Wild built a fresh Wild with `clang --ld-path=<baseline Wild> -v`; Clang's final child command
+named the baseline ARM64 Wild binary. The resulting `MH_EXECUTE` carries `LC_MAIN`, chained
+fixups, and a valid strict ad-hoc code signature. The integration test executable compiled in the
+self-host target embeds that self-hosted Wild path and passed all 61 ARM64 Mach-O integrations.
+This is a strong regression check, not a Rust compiler-bootstrap result.
 
 ## Deferred / deliberately unsupported today
 
@@ -294,6 +373,6 @@ relaxation APIs; none removes the known correctness gaps listed above.
 
 1. Broaden final `__TEXT,__eh_frame` CIE/FDE grammar and qualify C++/Objective-C/Rust/archive
    debug-map inputs before designing any generic ordinary-DWARF relocation path.
-2. Broaden subtractor coverage beyond the validated ordinary 64-bit static data form, and complete
-   full dylib/proc-macro and Rust TLS qualification.
+2. Broaden subtractor coverage beyond the validated ordinary 64-bit static data form, and expand
+   the bounded dylib/proc-macro and Rust TLS qualification.
 3. Expand the Apple-differential corpus and ARM64 Rust crate-type/stress qualification.
