@@ -210,7 +210,12 @@ impl SaveDirState {
         let mut args = args.iter();
 
         while let Some(arg) = args.next() {
-            if let Some(args_path) = arg.strip_prefix("@") {
+            // Mach-O `@rpath/…`, `@loader_path/…`, and `@executable_path/…` values may be
+            // passed as separate linker arguments by rustc. They are runtime loader placeholders,
+            // not `@file` response-file arguments.
+            if let Some(args_path) = arg.strip_prefix("@")
+                && !is_macho_runtime_path(arg)
+            {
                 let args_from_file = crate::args::read_args_from_file(Path::new(args_path))?;
 
                 if is_rsp_file {
@@ -635,6 +640,12 @@ fn shell_escape_string(value: &'_ str) -> Cow<'_, str> {
     Cow::Owned(value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
+fn is_macho_runtime_path(arg: &str) -> bool {
+    ["@rpath/", "@loader_path/", "@executable_path/"]
+        .into_iter()
+        .any(|prefix| arg.starts_with(prefix))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -716,5 +727,57 @@ mod tests {
             "$D/{}",
             to_output_relative_path(&std::path::absolute(&exported_symbols_list).unwrap()).display()
         )));
+    }
+
+    #[test]
+    fn macho_runtime_paths_are_not_treated_as_response_files() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let save_dir = temp_dir.path().join("save");
+        std::fs::create_dir(&save_dir).unwrap();
+
+        let saved_args = vec![
+            "-dylib".to_owned(),
+            "-dylib_install_name".to_owned(),
+            "@rpath/librustc_driver-example.dylib".to_owned(),
+            "-rpath".to_owned(),
+            "@loader_path/Frameworks".to_owned(),
+            "-install_name".to_owned(),
+            "@executable_path/../Frameworks/libexample.dylib".to_owned(),
+        ];
+        let mut args = crate::args::macho::MachOArgs::default();
+        args.parse(saved_args.iter()).unwrap();
+
+        let state = SaveDirState::new(save_dir.clone(), saved_args);
+        state
+            .write_args_file(&save_dir.join("run-with"), &args)
+            .unwrap();
+
+        let run_with = std::fs::read_to_string(save_dir.join("run-with")).unwrap();
+        assert!(run_with.contains("@rpath/librustc_driver-example.dylib"));
+        assert!(run_with.contains("@loader_path/Frameworks"));
+        assert!(run_with.contains("@executable_path/../Frameworks/libexample.dylib"));
+        assert!(!run_with.contains("RSP_0="));
+    }
+
+    #[test]
+    fn response_files_are_still_saved_for_replay() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let response_file = temp_dir.path().join("linker.rsp");
+        std::fs::write(&response_file, "-dylib\n-o\noriginal-output.dylib\n").unwrap();
+
+        let save_dir = temp_dir.path().join("save");
+        std::fs::create_dir(&save_dir).unwrap();
+        let saved_args = vec![format!("@{}", response_file.display())];
+        let mut args = crate::args::macho::MachOArgs::default();
+        args.parse(saved_args.iter()).unwrap();
+
+        let state = SaveDirState::new(save_dir.clone(), saved_args);
+        state
+            .write_args_file(&save_dir.join("run-with"), &args)
+            .unwrap();
+
+        let run_with = std::fs::read_to_string(save_dir.join("run-with")).unwrap();
+        assert!(run_with.contains("RSP_0=$(mktemp)"));
+        assert!(save_dir.join("at-0.txt").exists());
     }
 }

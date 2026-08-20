@@ -31,7 +31,7 @@ Baseline checks completed on this host:
   (185 `libwild` tests, 35 Mach-O integration tests, recorder tests, and remaining workspace/doc
   tests).
 * `WILD_TEST_IGNORE_FORMAT=1 cargo +nightly-2026-07-24 test --profile ci --workspace --features
-  macho` — pass (all workspace unit tests and doctests, including 201 `libwild` tests and 61
+  macho` — pass (all workspace unit tests and doctests, including 203 `libwild` tests and 62
   ARM64 Mach-O integrations). This is the reproducible dated-nightly gate; it is run with the
   installed `rust-src` and `llvm-tools` components, not by falling back to stable Rust.
 * Without `WILD_TEST_IGNORE_FORMAT=1`, only tidy tests fail because this host lacks `taplo` and
@@ -329,6 +329,11 @@ relaxation APIs; none removes the known correctness gaps listed above.
   raw value; `macho/local-got-rebase` calls the same local function both ways. This also covers
   Rust proc-macro bridge callbacks whose direct function pointer otherwise landed in
   non-executable `__DATA_CONST,__got`.
+* `S_MOD_INIT_FUNC_POINTERS` is a semantic liveness root under `-dead_strip`, not merely a
+  section-name convention. Its entries are ordinary relocation edges, so this retains their
+  target atoms while dead siblings stay eligible for stripping. `macho/cxx-init-dead-strip`
+  loads a Wild-built C++ dylib and proves an initializer-only constructor runs while a hidden
+  unused atom does not survive.
 * Mach-O dynamic-library inputs are deduplicated by install name, rather than their distinct SDK
   stub paths, and all aliases use the retained load-command ordinal. `macho/dylib-dedup` proves
   Rust's `-lSystem -lc -lm` no longer makes dyld reject duplicate `libSystem` commands.
@@ -364,6 +369,21 @@ named the baseline ARM64 Wild binary. The resulting `MH_EXECUTE` carries `LC_MAI
 fixups, and a valid strict ad-hoc code signature. The integration test executable compiled in the
 self-host target embeds that self-hosted Wild path and passed all 61 ARM64 Mach-O integrations.
 This is a strong regression check, not a Rust compiler-bootstrap result.
+
+An isolated Rust bootstrap used the exact source commit behind the requested toolchain,
+`89c61a7545da48b06116675b888398d02a4064c7`, with ARM64 host/target, Xcode Clang, and a Wild
+`--ld-path` recorded in every relevant rustc invocation. The stage1 `rustc_driver` dylib linked
+through Wild and its generated stage1 rustc completed
+`--target aarch64-apple-darwin -Zunstable-options --print=deployment-target` with exit 0. This
+previously crashed before target configuration because `-dead_strip` removed
+`PassWrapper.cpp`'s `__mod_init_func` entry, leaving LLVM's `BBSectionsView` uninitialized.
+`SectionHeader::should_retain` now roots the ABI-defined `S_MOD_INIT_FUNC_POINTERS` section type,
+so its pointer relocation retains just the constructor atom; the permanent
+`macho/cxx-init-dead-strip` dylib control returns 42 while its unrelated hidden atom remains
+stripped. The outer `x.py build --stage 1 library/core` advanced to stage1 core artifacts, then
+stopped at `unknown -Z no-embed-metadata`; the exact installed nightly Cargo and an Apple-linker
+control both lack that newer Rust-build-system flag. This is a toolchain/source compatibility
+blocker for further bootstrap stages, not an observed Wild link or runtime failure.
 
 One link-only performance replay used the same dated nightly and a saved `sizable-cli` Cargo
 final link (Clap derive, regex, Serde, and serde_json): 48 replay files / 50.1 MiB and 46

@@ -1376,7 +1376,11 @@ impl platform::SectionHeader for SectionHeader {
     }
 
     fn should_retain(&self) -> bool {
-        self.flags.get(LE).contains(S_ATTR_NO_DEAD_STRIP)
+        let flags = self.flags.get(LE);
+        // Dyld discovers constructor pointers from `__mod_init_func`, rather than through a
+        // symbol reference from an ordinary live atom. Keep the pointer section as a GC root so
+        // its relocations retain exactly the referenced constructor atoms under `-dead_strip`.
+        flags.contains(S_ATTR_NO_DEAD_STRIP) || flags.typ() == macho::S_MOD_INIT_FUNC_POINTERS
     }
 
     fn should_exclude(&self) -> bool {
