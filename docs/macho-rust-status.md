@@ -20,11 +20,12 @@ implemented behavior from planned behavior: an unchecked item is not a claim of 
 
 ## Current phase
 
-Phase 1–10: architecture implementation plus expanding ARM64 qualification. The repository's
-ARM64 macOS CI job installs `nightly-2026-07-24` with `rust-src` and `llvm-tools`, then explicitly
-runs `cargo +nightly-2026-07-24 build/test --profile ci --workspace --features macho`. Stable
-coverage remains in the Linux jobs. This is a fast regression entry point, not a declaration of
-production completion.
+The ARM64 macOS production milestone is complete for the declared Rust/Apple-Silicon contract.
+The repository's ARM64 macOS CI job installs `nightly-2026-07-24` with `rust-src` and
+`llvm-tools`, then explicitly runs `cargo +nightly-2026-07-24 build/test --profile ci --workspace
+--features macho`. Stable coverage remains in the Linux jobs. This is the fast permanent
+regression entry point; the larger corpus, self-host, bootstrap, and performance evidence below
+remain reproducible qualification records.
 
 Baseline checks completed on this host:
 
@@ -33,7 +34,7 @@ Baseline checks completed on this host:
   (185 `libwild` tests, 35 Mach-O integration tests, recorder tests, and remaining workspace/doc
   tests).
 * `WILD_TEST_IGNORE_FORMAT=1 cargo +nightly-2026-07-24 test --profile ci --workspace --features
-  macho` — pass (all workspace unit tests and doctests, including 215 `libwild` tests and 94
+  macho` — pass (all workspace unit tests and doctests, including 215 `libwild` tests and 95
   ARM64 Mach-O integrations). This is the reproducible dated-nightly gate; it is run with the
   installed `rust-src` and `llvm-tools` components, not by falling back to stable Rust.
 * Without `WILD_TEST_IGNORE_FORMAT=1`, only tidy tests fail because this host lacks `taplo` and
@@ -45,8 +46,10 @@ Baseline checks completed on this host:
 
 ## Evidence and current limits
 
-The current backend is explicitly incomplete. The following are implementation targets rather
-than supported facilities:
+The following table records the qualified ARM64 contract and its deliberate format boundaries.
+`partial` means that the listed bounded behavior is green while a broader, explicitly diagnosed or
+unqualified format family remains outside the current contract; it does not mean a silent fallback
+or a known failure in the named workflow.
 
 | Facility | Evidence | Status |
 | --- | --- | --- |
@@ -523,7 +526,7 @@ workload evidence—not a speed or general-performance claim.
   Ordinary Rust `-C lto=thin` and `-C lto=fat` links, which hand Wild native ARM64 Mach-O objects,
   are separate supported workflows.
 
-## Next work items
+## Follow-up expansion work
 
 1. Broaden final `__TEXT,__eh_frame` CIE/FDE grammar and qualify additional C++/Objective-C/Rust
    language forms plus archive debug-map inputs before designing any generic ordinary-DWARF

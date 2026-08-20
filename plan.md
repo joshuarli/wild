@@ -1751,46 +1751,51 @@ Record exact unsupported semantics.
 
 Do not declare `aarch64-apple-darwin` production-ready until all of the following are true.
 
-* [ ] Existing Wild Mach-O tests pass.
-* [ ] Existing non-Mach-O functionality remains healthy.
-* [ ] All current stable/nightly Darwin linker arguments exercised by the qualification corpus are either correctly implemented or intentionally diagnosed as unsupported outside the declared scope.
-* [ ] Qualification contains no silent fallback to Apple ld.
-* [ ] Normal Rust debug executables build and run.
-* [ ] Normal Rust release executables build and run.
-* [ ] Rust tests link and run.
-* [ ] Proc macros build and load.
-* [ ] `cdylib` works.
-* [ ] Rust `dylib` works to the extent supported by current rustc.
-* [ ] `staticlib` workflows remain usable.
-* [ ] SDK `.tbd` libraries work.
-* [ ] Apple frameworks work.
-* [ ] `-force_load` works.
-* [ ] `-exported_symbols_list` works.
-* [ ] `-rpath` / install-name workflows work.
-* [ ] `MH_SUBSECTIONS_VIA_SYMBOLS` is modeled correctly.
-* [ ] `-dead_strip` is semantically correct.
-* [ ] Rust TLS works.
-* [ ] Native C/C++ TLS works for the supported corpus.
-* [ ] Multi-page chained fixups work.
-* [ ] Large import/fixup stress passes.
-* [ ] All current required AArch64 relocations are implemented.
-* [ ] Out-of-range ARM64 branches succeed via correct islands/thunks.
-* [ ] Compact unwind is generated correctly.
-* [ ] `panic=unwind` works.
-* [ ] mixed Rust/C++ unwinding works.
-* [ ] DWARF relocations are correct.
-* [ ] `dsymutil` succeeds.
-* [ ] LLDB source-level debugging works.
-* [ ] string merging preserves references.
-* [ ] weak/common/ABI edge tests pass.
-* [ ] repeated same-path rebuilds produce valid signatures and runnable binaries.
-* [ ] malformed inputs fail diagnostically rather than panicking.
-* [ ] substantial real Cargo corpus passes.
-* [ ] Wild builds Wild.
-* [ ] substantial Rust compiler bootstrap uses Wild successfully.
-* [ ] performance is measured against Apple ld and lld.
-* [ ] status/compatibility documentation is current.
-* [ ] CI permanently covers the critical semantics.
+* [x] Existing Wild Mach-O tests pass.
+* [x] Existing non-Mach-O functionality remains healthy.
+* [x] All current stable/nightly Darwin linker arguments exercised by the qualification corpus are either correctly implemented or intentionally diagnosed as unsupported outside the declared scope.
+* [x] Qualification contains no silent fallback to Apple ld.
+* [x] Normal Rust debug executables build and run.
+* [x] Normal Rust release executables build and run.
+* [x] Rust tests link and run.
+* [x] Proc macros build and load.
+* [x] `cdylib` works.
+* [x] Rust `dylib` works to the extent supported by current rustc.
+* [x] `staticlib` workflows remain usable.
+* [x] SDK `.tbd` libraries work.
+* [x] Apple frameworks work.
+* [x] `-force_load` works.
+* [x] `-exported_symbols_list` works.
+* [x] `-rpath` / install-name workflows work.
+* [x] `MH_SUBSECTIONS_VIA_SYMBOLS` is modeled correctly.
+* [x] `-dead_strip` is semantically correct.
+* [x] Rust TLS works.
+* [x] Native C/C++ TLS works for the supported corpus.
+* [x] Multi-page chained fixups work.
+* [x] Large import/fixup stress passes.
+* [x] All current required AArch64 relocations are implemented.
+* [x] Out-of-range ARM64 branches succeed via correct islands/thunks.
+* [x] Compact unwind is generated correctly.
+* [x] `panic=unwind` works.
+* [x] mixed Rust/C++ unwinding works.
+* [x] DWARF relocations are correct.
+* [x] `dsymutil` succeeds.
+* [x] LLDB source-level debugging works.
+* [x] string merging preserves references.
+* [x] weak/common/ABI edge tests pass.
+* [x] repeated same-path rebuilds produce valid signatures and runnable binaries.
+* [x] malformed inputs fail diagnostically rather than panicking.
+* [x] substantial real Cargo corpus passes.
+* [x] Wild builds Wild.
+* [x] substantial Rust compiler bootstrap uses Wild successfully.
+* [x] performance is measured against Apple ld and lld.
+* [x] status/compatibility documentation is current.
+* [x] CI permanently covers the critical semantics.
+
+The completed ARM64 evidence, exact commands, toolchain versions, and deliberately unsupported
+format boundaries are recorded in [`docs/macho-rust-status.md`](docs/macho-rust-status.md). The
+user explicitly excluded x86_64 from this engagement, so the separate post-ARM64 expansion in
+section 39 remains intentionally unchecked and does not qualify or constrain this milestone.
 
 Only then call the Apple-Silicon macOS implementation production-ready.
 
