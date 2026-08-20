@@ -1677,15 +1677,15 @@ fn build_exports_trie(layout: &MachOLayout<'_>) -> Result<Vec<u8>> {
                     )
                 })?;
 
+            let exported_address = export_symbol_address(resolution);
             let (address, mut flags) = if resolution.is_absolute() {
                 (
-                    resolution.raw_value,
+                    exported_address,
                     object::macho::EXPORT_SYMBOL_FLAGS_KIND_ABSOLUTE.into(),
                 )
             } else {
                 (
-                    resolution
-                        .raw_value
+                    exported_address
                         .checked_sub(image_base)
                         .with_context(|| {
                             format!(
@@ -1710,6 +1710,20 @@ fn build_exports_trie(layout: &MachOLayout<'_>) -> Result<Vec<u8>> {
         .collect::<Result<Vec<_>>>()?;
 
     Ok(crate::trie::build(&mut symbols))
+}
+
+/// Export records name definitions, whereas `raw_value` names the relocation target. A local
+/// definition with a GOT use has its `raw_value` rewritten to the GOT slot so GOT relocations can
+/// address it. That slot is data, not a callable or dereferenceable export target. Keep dynamic
+/// and PLT-backed resolution semantics unchanged; all other definitions export their own address.
+fn export_symbol_address(resolution: &Resolution<MachO>) -> u64 {
+    if resolution.dynamic_symbol_index.is_none()
+        && resolution.format_specific.plt_address.is_none()
+    {
+        resolution.format_specific.symbol_address
+    } else {
+        resolution.raw_value
+    }
 }
 
 fn exported_symbol_is_weak(layout: &MachOLayout<'_>, symbol_id: SymbolId) -> Result<bool> {
@@ -4045,6 +4059,38 @@ mod tests {
 
     #[repr(align(8))]
     struct AlignedBytes<const N: usize>([u8; N]);
+
+    #[test]
+    fn local_got_exports_definition_address_without_changing_dynamic_or_plt_targets() {
+        let local_got = Resolution {
+            raw_value: 0x9000,
+            dynamic_symbol_index: None,
+            flags: ValueFlags::empty(),
+            format_specific: crate::macho::ResolutionExt {
+                symbol_address: 0x3000,
+                got_address: std::num::NonZeroU64::new(0x9000),
+                tlvp_address: None,
+                plt_address: None,
+            },
+        };
+        assert_eq!(export_symbol_address(&local_got), 0x3000);
+
+        let dynamic = Resolution {
+            dynamic_symbol_index: std::num::NonZeroU32::new(1),
+            ..local_got
+        };
+        assert_eq!(export_symbol_address(&dynamic), 0x9000);
+
+        let local_plt = Resolution {
+            dynamic_symbol_index: None,
+            format_specific: crate::macho::ResolutionExt {
+                plt_address: std::num::NonZeroU64::new(0x8000),
+                ..local_got.format_specific
+            },
+            ..local_got
+        };
+        assert_eq!(export_symbol_address(&local_plt), 0x9000);
+    }
 
     #[test]
     fn dylib_install_name_uses_an_id_load_command() {

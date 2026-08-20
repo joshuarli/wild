@@ -31,7 +31,7 @@ Baseline checks completed on this host:
   (185 `libwild` tests, 35 Mach-O integration tests, recorder tests, and remaining workspace/doc
   tests).
 * `WILD_TEST_IGNORE_FORMAT=1 cargo +nightly-2026-07-24 test --profile ci --workspace --features
-  macho` — pass (all workspace unit tests and doctests, including 203 `libwild` tests and 62
+  macho` — pass (all workspace unit tests and doctests, including 204 `libwild` tests and 63
   ARM64 Mach-O integrations). This is the reproducible dated-nightly gate; it is run with the
   installed `rust-src` and `llvm-tools` components, not by falling back to stable Rust.
 * Without `WILD_TEST_IGNORE_FORMAT=1`, only tidy tests fail because this host lacks `taplo` and
@@ -329,6 +329,11 @@ relaxation APIs; none removes the known correctness gaps listed above.
   raw value; `macho/local-got-rebase` calls the same local function both ways. This also covers
   Rust proc-macro bridge callbacks whose direct function pointer otherwise landed in
   non-executable `__DATA_CONST,__got`.
+* The export trie similarly represents definitions, not relocation targets. A local function
+  with a live GOT use exports `ResolutionExt::symbol_address` rather than its GOT-adjusted
+  `raw_value`; dynamic and PLT targets retain their existing values. This prevents a `dlsym`
+  client from executing a `__DATA_CONST,__got` slot. `macho/dylib-export-local-got` keeps both
+  reference forms live and calls the exported definition at runtime.
 * `S_MOD_INIT_FUNC_POINTERS` is a semantic liveness root under `-dead_strip`, not merely a
   section-name convention. Its entries are ordinary relocation edges, so this retains their
   target atoms while dead siblings stay eligible for stripping. `macho/cxx-init-dead-strip`
@@ -372,18 +377,25 @@ This is a strong regression check, not a Rust compiler-bootstrap result.
 
 An isolated Rust bootstrap used the exact source commit behind the requested toolchain,
 `89c61a7545da48b06116675b888398d02a4064c7`, with ARM64 host/target, Xcode Clang, and a Wild
-`--ld-path` recorded in every relevant rustc invocation. The stage1 `rustc_driver` dylib linked
-through Wild and its generated stage1 rustc completed
-`--target aarch64-apple-darwin -Zunstable-options --print=deployment-target` with exit 0. This
-previously crashed before target configuration because `-dead_strip` removed
+`--ld-path` recorded in each rebuilt rustc invocation. The source tree's legacy
+`-Zno-embed-metadata` requires Rust's downloaded stage0 Cargo 1.98.0-beta.2 as the bootstrap
+driver; it still uses the requested `nightly-2026-07-24` rustc/rustdoc. Apple and Wild controls
+both built stage1 `library/core`. Wild then rebuilt stage1 `rustc_driver`, `compiler/rustc`, and
+`src/tools/rustdoc`; their saved final-link replays and verbose logs name the current Wild binary.
+The resulting ARM64 stage1 `rustc` and `rustdoc` both execute (`rustc 1.99.0-dev` and
+`rustdoc 1.99.0-dev`), and rustc reports `MACOSX_DEPLOYMENT_TARGET=11.0` for ARM64.
+
+This bootstrap initially crashed before target configuration because `-dead_strip` removed
 `PassWrapper.cpp`'s `__mod_init_func` entry, leaving LLVM's `BBSectionsView` uninitialized.
 `SectionHeader::should_retain` now roots the ABI-defined `S_MOD_INIT_FUNC_POINTERS` section type,
 so its pointer relocation retains just the constructor atom; the permanent
 `macho/cxx-init-dead-strip` dylib control returns 42 while its unrelated hidden atom remains
-stripped. The outer `x.py build --stage 1 library/core` advanced to stage1 core artifacts, then
-stopped at `unknown -Z no-embed-metadata`; the exact installed nightly Cargo and an Apple-linker
-control both lack that newer Rust-build-system flag. This is a toolchain/source compatibility
-blocker for further bootstrap stages, not an observed Wild link or runtime failure.
+stripped. A subsequent stage1 rustdoc `SIGBUS` exposed a second issue: the export trie wrote a
+local function's GOT-adjusted `raw_value`, making `std::io::stdio::stdout` point at
+`__DATA_CONST,__got`. `macho_writer::export_symbol_address` now emits `symbol_address` for local
+non-PLT definitions; `macho/dylib-export-local-got` proves a `dlsym` call reaches text while the
+function also has a live GOT use. This remains a bounded stage1 bootstrap qualification, not a
+full Rust distribution or compiler-test-suite claim.
 
 One link-only performance replay used the same dated nightly and a saved `sizable-cli` Cargo
 final link (Clap derive, regex, Serde, and serde_json): 48 replay files / 50.1 MiB and 46
