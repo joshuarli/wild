@@ -4819,6 +4819,7 @@ impl<'data> File<'data> {
             let starts = &mut all_starts[section_index.0];
             starts.sort_unstable();
             starts.dedup();
+            let mut relocation_ranges = Vec::new();
             for relocation in paired_relocations(self.relocations(section_index, &())?.relocations) {
                 let relocation = relocation?;
                 let relocation_start = u64::from(relocation.info.r_address);
@@ -4832,10 +4833,9 @@ impl<'data> File<'data> {
                     relocation_end <= section_size,
                     "Mach-O relocation extends past the end of its section"
                 );
-                starts.retain(|boundary| {
-                    *boundary == 0 || !(*boundary > relocation_start && *boundary < relocation_end)
-                });
+                relocation_ranges.push(relocation_start..relocation_end);
             }
+            remove_relocation_interior_atom_starts(starts, &mut relocation_ranges);
         }
         Ok(all_starts)
     }
@@ -4852,6 +4852,29 @@ impl<'data> ObjectKind<'data> {
             ObjectKind::Dylib(_) => &[],
         }
     }
+}
+
+/// Removes symbol atom boundaries that fall inside relocation storage. Sorting the relocation
+/// ranges lets this perform one pass over the already sorted boundaries instead of retaining the
+/// full boundary vector once for every relocation in a large compiler-generated object.
+fn remove_relocation_interior_atom_starts(
+    starts: &mut Vec<u64>,
+    relocation_ranges: &mut [Range<u64>],
+) {
+    relocation_ranges.sort_unstable_by_key(|range| range.start);
+    let mut range_index = 0;
+    starts.retain(|boundary| {
+        while relocation_ranges
+            .get(range_index)
+            .is_some_and(|range| range.end <= *boundary)
+        {
+            range_index += 1;
+        }
+        *boundary == 0
+            || relocation_ranges
+                .get(range_index)
+                .is_none_or(|range| *boundary <= range.start)
+    });
 }
 
 impl DynamicLayoutStateExt {
@@ -4921,6 +4944,28 @@ mod tests {
                 .collect_vec(),
             vec![8, 3, 7, 1]
         );
+    }
+
+    #[test]
+    fn relocation_ranges_remove_only_their_interior_atom_boundaries() {
+        let mut starts = vec![0, 2, 3, 4, 5, 6, 7, 8, 10, 12];
+        let mut relocation_ranges = vec![6..10, 2..4, 4..6];
+
+        remove_relocation_interior_atom_starts(&mut starts, &mut relocation_ranges);
+
+        // A boundary at either end of a relocation stays valid, including a boundary shared by
+        // two adjacent relocation fields. Boundaries inside any field are coalesced away.
+        assert_eq!(starts, vec![0, 2, 4, 6, 10, 12]);
+    }
+
+    #[test]
+    fn overlapping_relocation_ranges_remove_boundaries_inside_either_range() {
+        let mut starts = vec![0, 2, 3, 4, 5, 6, 7, 8, 10, 12];
+        let mut relocation_ranges = vec![5..10, 3..7];
+
+        remove_relocation_interior_atom_starts(&mut starts, &mut relocation_ranges);
+
+        assert_eq!(starts, vec![0, 2, 3, 10, 12]);
     }
 
     /// Builds the smallest regular ARM64 Mach-O object with one indirect-symbol-backed section.
