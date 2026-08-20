@@ -194,11 +194,12 @@ passed wherever Wild is listed as failing.
 * Every future Rust/Cargo qualification must record the exact linker argv, working directory,
   SDK path, toolchain version, and proof that Wild performed the final link. No Apple-linker
   fallback is accepted as a passing Wild qualification.
-* An ARM64 capture with `nightly-2026-07-24` confirms that rustc passes `-lto_library` even when
-  ordinary `-C lto=thin` has already produced native Mach-O objects. That link now runs through
-  Wild and the `panic=unwind` fixture exits 42. In contrast, `-C linker-plugin-lto` adds
-  `-plugin-opt=O0` and `-plugin-opt=mcpu=apple-m1`; Wild diagnoses that separate LLVM-bitcode
-  linker-plugin contract explicitly rather than accepting the options and silently doing no LTO.
+* The permanent ARM64 `macho/rust-lto` fixture uses `nightly-2026-07-24` to run both
+  `-C lto=thin -C codegen-units=2` and `-C lto=fat -C codegen-units=1`. rustc passes
+  `-lto_library` even though ordinary LTO has already produced native Mach-O objects, and both
+  links run through Wild. In contrast, `-C linker-plugin-lto` adds `-plugin-opt=O0` and
+  `-plugin-opt=mcpu=apple-m1`; Wild diagnoses that separate LLVM-bitcode linker-plugin contract
+  explicitly rather than accepting the options and silently doing no LTO.
 
 ### Current Rust smoke: local executable links and runs
 
@@ -349,7 +350,8 @@ relaxation APIs; none removes the known correctness gaps listed above.
   `-install_name`, `-rpath`, `-exported_symbols_list`, strip modes, and explicit ARM64 target
   validation. Unsupported `-x` is diagnosed rather than ignored.
 * Rust's unconditional `-lto_library` is recognized only as the no-op native-object ld64
-  contract it is for ordinary Rust LTO. Rust `-C linker-plugin-lto` reaches the separately
+  contract it is for ordinary Rust LTO. `macho/rust-lto` permanently runs both ThinLTO and fat
+  LTO through the exact dated nightly. Rust `-C linker-plugin-lto` reaches the separately
   diagnosed `-plugin-opt` path, which names the unsupported ARM64 Mach-O LLVM-bitcode boundary.
 * SDK TBD reexports may be either additional YAML documents in the root stub or separately mapped
   child TBDs. `input_data::find_external_macho_stub_library` resolves the latter through the
