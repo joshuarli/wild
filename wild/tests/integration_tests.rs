@@ -446,25 +446,30 @@ fn collect_cargo_macho_qualification(tests: &mut Vec<Trial>, filter: &Filter) ->
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
 fn run_cargo_macho_qualification() -> Result {
-    let manifest = base_dir()
-        .join("tests")
-        .join("cargo_macho_qualification")
-        .join("Cargo.toml");
+    let fixture_dir = base_dir().join("tests").join("cargo_macho_qualification");
+    let manifest = fixture_dir.join("Cargo.toml");
     ensure!(
         manifest.is_file(),
         "missing Cargo Mach-O qualification workspace at {}",
         manifest.display()
     );
 
+    // Keep the retained fixture read-only. The producer rebuild below changes an implementation
+    // body in a private workspace copy, while a source snapshot makes that boundary explicit.
+    let fixture_sources = cargo_macho_qualification_rust_sources(&fixture_dir)?;
+    let workspace_guard = tempfile::Builder::new()
+        .prefix("wild-cargo-macho-qualification-")
+        .tempdir_in("/tmp")
+        .context("failed to create temporary Cargo qualification directory")?;
+    let workspace_dir = workspace_guard.path().join("workspace");
+    copy_cargo_macho_qualification_workspace(&fixture_dir, &workspace_dir)?;
+    let manifest = workspace_dir.join("Cargo.toml");
+
     // A fresh target directory guarantees Cargo performs every final link, so the `-v`
     // transcript below is proof of the linker selected for each final artifact rather than a
     // cached build's historical output. Cargo's native-dylib rpath is relative to that directory;
     // keep it short under `/tmp` and retain the guard through runtime inspection.
-    let target_dir_guard = tempfile::Builder::new()
-        .prefix("wild-cargo-macho-qualification-")
-        .tempdir_in("/tmp")
-        .context("failed to create temporary Cargo target directory")?;
-    let target_dir = target_dir_guard.path();
+    let target_dir = workspace_guard.path().join("target");
     let wild = wild_path()
         .canonicalize()
         .with_context(|| format!("failed to resolve Wild linker {}", wild_path().display()))?;
@@ -504,6 +509,146 @@ fn run_cargo_macho_qualification() -> Result {
     )?;
     verify_cargo_dylib_rpath(&dylib_consumer)?;
 
+    // Cargo must re-link the changed Rust dylib and its final consumer. Retain the public API and
+    // return value so a successful launch isolates the rebuild/link path rather than testing a
+    // different application contract.
+    let producer_source = workspace_dir.join("dylib-producer").join("src").join("lib.rs");
+    let producer_contents = std::fs::read_to_string(&producer_source).with_context(|| {
+        format!(
+            "failed to read copied Cargo dylib producer source {}",
+            producer_source.display()
+        )
+    })?;
+    let rebuilt_producer_contents = producer_contents.replacen(
+        "    42\n",
+        "    let rebuilt_answer = 42;\n    rebuilt_answer\n",
+        1,
+    );
+    ensure!(
+        rebuilt_producer_contents != producer_contents,
+        "copied Cargo dylib producer {} no longer has the expected answer body",
+        producer_source.display()
+    );
+    std::fs::write(&producer_source, rebuilt_producer_contents).with_context(|| {
+        format!(
+            "failed to update copied Cargo dylib producer source {}",
+            producer_source.display()
+        )
+    })?;
+
+    cargo_build_with_wild(
+        &manifest,
+        &target_dir,
+        None,
+        &rustflags,
+        &wild,
+        "cargo-macho-dylib-consumer",
+        &[
+            "libcargo_macho_dylib_producer",
+            "cargo_macho_dylib_consumer-",
+        ],
+    )?;
+    run_cargo_macho_binary(
+        &dylib_consumer,
+        "dylib consumer loaded through its Mach-O rpath",
+    )?;
+    verify_cargo_dylib_rpath(&dylib_consumer)?;
+    ensure_cargo_macho_qualification_sources_unchanged(&fixture_dir, &fixture_sources)?;
+
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+fn copy_cargo_macho_qualification_workspace(source: &Path, destination: &Path) -> Result {
+    std::fs::create_dir_all(destination).with_context(|| {
+        format!(
+            "failed to create copied Cargo qualification workspace {}",
+            destination.display()
+        )
+    })?;
+    for entry in std::fs::read_dir(source)
+        .with_context(|| format!("failed to read Cargo qualification workspace {}", source.display()))?
+    {
+        let entry = entry?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            copy_cargo_macho_qualification_workspace(&source_path, &destination_path)?;
+        } else if file_type.is_file() {
+            std::fs::copy(&source_path, &destination_path).with_context(|| {
+                format!(
+                    "failed to copy Cargo qualification fixture {} to {}",
+                    source_path.display(),
+                    destination_path.display()
+                )
+            })?;
+        } else {
+            bail!(
+                "Cargo qualification fixture {} contains unsupported non-file entry {}",
+                source.display(),
+                source_path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+fn cargo_macho_qualification_rust_sources(
+    root: &Path,
+) -> Result<Vec<(PathBuf, Vec<u8>)>> {
+    let mut sources = Vec::new();
+    collect_cargo_macho_qualification_rust_sources(root, root, &mut sources)?;
+    Ok(sources)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+fn collect_cargo_macho_qualification_rust_sources(
+    root: &Path,
+    directory: &Path,
+    sources: &mut Vec<(PathBuf, Vec<u8>)>,
+) -> Result {
+    for entry in std::fs::read_dir(directory)
+        .with_context(|| format!("failed to read Cargo qualification directory {}", directory.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            collect_cargo_macho_qualification_rust_sources(root, &path, sources)?;
+        } else if file_type.is_file() && path.extension().is_some_and(|extension| extension == "rs") {
+            let relative = path
+                .strip_prefix(root)
+                .context("Cargo qualification source escaped its fixture root")?
+                .to_owned();
+            let contents = std::fs::read(&path)
+                .with_context(|| format!("failed to read Cargo qualification source {}", path.display()))?;
+            sources.push((relative, contents));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+fn ensure_cargo_macho_qualification_sources_unchanged(
+    fixture_dir: &Path,
+    sources: &[(PathBuf, Vec<u8>)],
+) -> Result {
+    for (relative_path, expected_contents) in sources {
+        let source_path = fixture_dir.join(relative_path);
+        let actual_contents = std::fs::read(&source_path).with_context(|| {
+            format!(
+                "failed to re-read retained Cargo qualification source {}",
+                source_path.display()
+            )
+        })?;
+        ensure!(
+            actual_contents == *expected_contents,
+            "Cargo qualification source {} changed while its temporary copy rebuilt",
+            source_path.display()
+        );
+    }
     Ok(())
 }
 

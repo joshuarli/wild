@@ -225,8 +225,12 @@ transcript, requires that each expected producer and consumer artifact selected 
 `TokenStream::from_str("40 + 2")`, so the consumer proves that a loaded macro performed a
 non-identity expansion. The Rust-dylib consumer is then executed after clearing the `DYLD_*`
 library search overrides; `otool` additionally checks both its `@loader_path` rpath and its
-`@rpath/libcargo_macho_dylib_producer.dylib` dependency. This coverage deliberately does not use
-`WILD_SAVE_DIR` or the `cdylib` replay path above.
+`@rpath/libcargo_macho_dylib_producer.dylib` dependency. The trial then copies the retained
+workspace into its temporary directory, changes only the copied dylib producer implementation
+body while preserving its API and result, and rebuilds/runs the dylib consumer. Its second
+transcript again requires both producer and consumer final ARM64 links through Wild; a snapshot
+asserts that every retained fixture Rust source is unchanged. This coverage deliberately does not
+use `WILD_SAVE_DIR` or the `cdylib` replay path above.
 
 The separate ARM64-only `macho/aarch64/cargo-staticlib-native/default` trial builds
 `wild/tests/cargo_macho_staticlib` with the fixture's exact `nightly-2026-07-24` toolchain and
@@ -360,6 +364,18 @@ named the baseline ARM64 Wild binary. The resulting `MH_EXECUTE` carries `LC_MAI
 fixups, and a valid strict ad-hoc code signature. The integration test executable compiled in the
 self-host target embeds that self-hosted Wild path and passed all 61 ARM64 Mach-O integrations.
 This is a strong regression check, not a Rust compiler-bootstrap result.
+
+One link-only performance replay used the same dated nightly and a saved `sizable-cli` Cargo
+final link (Clap derive, regex, Serde, and serde_json): 48 replay files / 50.1 MiB and 46
+object-or-archive arguments. On this M1 Pro (10 cores, 32 GiB, macOS 26.5.2), rotating 15-sample
+wall-clock measurements had min/median/mean/max milliseconds of Apple ld64 1267:
+135.368/145.258/155.662/212.253; ld64.lld 22.1.8:
+99.108/109.214/113.753/153.635; and Wild:
+127.857/142.855/149.300/193.012. Each ARM64 output passed the same runtime JSON/regex check;
+sizes were 2,771,312 / 2,794,720 / 3,636,348 bytes respectively. The replay is retained under
+`/tmp/wild-macho-performance.EnGAT0`. Earlier grouped repetitions had substantial ordering
+sensitivity, `/tmp` is APFS, and thermal state was uncontrolled, so this is preliminary one-
+workload evidence—not a speed or general-performance claim.
 
 ## Deferred / deliberately unsupported today
 
