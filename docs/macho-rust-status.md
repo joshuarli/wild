@@ -33,7 +33,7 @@ Baseline checks completed on this host:
   (185 `libwild` tests, 35 Mach-O integration tests, recorder tests, and remaining workspace/doc
   tests).
 * `WILD_TEST_IGNORE_FORMAT=1 cargo +nightly-2026-07-24 test --profile ci --workspace --features
-  macho` — pass (all workspace unit tests and doctests, including 212 `libwild` tests and 73
+  macho` — pass (all workspace unit tests and doctests, including 212 `libwild` tests and 75
   ARM64 Mach-O integrations). This is the reproducible dated-nightly gate; it is run with the
   installed `rust-src` and `llvm-tools` components, not by falling back to stable Rust.
 * Without `WILD_TEST_IGNORE_FORMAT=1`, only tidy tests fail because this host lacks `taplo` and
@@ -74,7 +74,7 @@ than supported facilities:
 | ABI-level symbols | `macho/common-symbols`, `symbol-aliases`, `weak-symbols`, `weak-undefined`, `cxx-init-teardown` | Apple controls establish common/alias/weak behavior | `macho/rust-native-ffi` calls C through Wild | pending | bounded C/C++/Rust smoke green |
 | TLS | `macho/tls-local`, `macho/tls-dynamic`, `macho/rust-thread-local` | Apple ld binds the imported descriptor through `__got`; ld64.lld uses `__thread_ptrs` | C and Rust two-thread runtime passes under Wild; Rust static/dylib TLS qualification remains external | pending | bounded C/Rust local/dylib smoke green |
 | compact unwind | `macho/exception` C++ throw/catch; `macho/rust-panic-unwind` | structural section/header check; C++ and Rust runtime pass | ARM64 Rust `panic=unwind` / `catch_unwind` under `-dead_strip` | pending | bounded ARM64 support |
-| DWARF / dSYM / LLDB | `macho/debug-dwarf`, `cxx-debug-dwarf`, `objc-debug-dwarf`, and Rust `rust-debug-dwarf`, all `-g -dead_strip` | Apple ld and ld64.lld establish the same `N_SO`/`N_OSO`/paired-`N_FUN` control shape; Wild `dsymutil --dump-debug-map` passes | generated dSYMs verify; LLDB stops at the C, C++14, Objective-C, and Rust source locations (Rust uses `nightly-2026-07-24`) | pending | bounded loose-object ARM64 C/C++/Objective-C/Rust support |
+| DWARF / dSYM / LLDB | `macho/debug-dwarf`, `cxx-debug-dwarf`, `objc-debug-dwarf`, and Rust `rust-debug-dwarf` / `rust-split-debug-dwarf`, all `-g -dead_strip` | Apple ld and ld64.lld establish the same `N_SO`/`N_OSO`/paired-`N_FUN` control shape; Wild `dsymutil --dump-debug-map` passes | generated dSYMs verify; LLDB stops at the C, C++14, Objective-C, normal Rust, and Rust `split-debuginfo=unpacked` source locations (Rust uses `nightly-2026-07-24`) | pending | bounded loose-object ARM64 C/C++/Objective-C/Rust support |
 | chained fixups | `macho/chained-fixups-tlvp`, `macho/chained-fixups-multipage` | Apple controls and Wild runtime pass | pending | 2300 imported `__got` binds cross two 16 KiB pages; two imported `__thread_ptrs` binds exercise a non-zero TLVP page offset | bounded ARM64 runtime green |
 | branch islands | `macho/branch-island`, `macho/branch-islands` | Apple links forced overflows | C runtime pass | multiple islands pass | ARM64 smoke green |
 
@@ -128,7 +128,7 @@ passed wherever Wild is listed as failing.
 | Rust `thread_local!` / `cargo test` | permanent `macho/rust-thread-local` two-thread fixture and default `cargo test` pass through Wild | exercise static/dylib TLS matrix |
 | C++ throw/catch | links, emits `__TEXT,__unwind_info`, and catches at runtime | broaden compact-unwind differential coverage |
 | Rust `panic=unwind` | `macho/rust-panic-unwind` selects live CIE/FDE records, rewrites DWARF compact-unwind FDE offsets, and catches a panic at runtime under `-dead_strip` | broaden CIE/FDE grammar and crate/stress coverage |
-| C/C++/Objective-C/Rust DWARF / `dsymutil` | `macho/debug-dwarf`, `cxx-debug-dwarf`, `objc-debug-dwarf`, and `rust-debug-dwarf` emit `N_SO`, `N_OSO`, and live-atom `N_FUN` pairs; `dsymutil` makes verified dSYMs and LLDB stops at their source lines under `-dead_strip` | qualify more language forms and debug-map inputs |
+| C/C++/Objective-C/Rust DWARF / `dsymutil` | `macho/debug-dwarf`, `cxx-debug-dwarf`, `objc-debug-dwarf`, `rust-debug-dwarf`, and `rust-split-debug-dwarf` emit `N_SO`, `N_OSO`, and live-atom `N_FUN` pairs; `dsymutil` makes verified dSYMs and LLDB stops at their source lines under `-dead_strip` | qualify more language forms and debug-map inputs |
 | `-dead_strip` and `-force_load` | dead C code/data and unreferenced forced archive member are covered | add stress/edge corpus |
 | 138 MiB fragmented branch | Apple and Wild both link/run through nearby islands | larger stress qualification |
 | 2300 imported data binds | `macho/chained-fixups-multipage` runs after reading every `__got` slot across two 16 KiB pages | broaden segment/pointer-format and local-rebase coverage |
@@ -295,8 +295,9 @@ dSYM support beyond the separately controlled loose-object `DW_LANG_ObjC` map.
 
 `macho/debug-dwarf` is the permanent ARM64 C control; `macho/cxx-debug-dwarf` is the explicit
 C++14 control; `macho/objc-debug-dwarf` is the normal Objective-C control; and
-`macho/rust-debug-dwarf` is the normal Rust-executable control compiled with
-`nightly-2026-07-24`. Each supplies one loose `-g` object and links with `-dead_strip`. Wild
+`macho/rust-debug-dwarf` and `macho/rust-split-debug-dwarf` are normal Rust-executable controls
+compiled with `nightly-2026-07-24`; the latter additionally uses
+`-C split-debuginfo=unpacked`. Each supplies one loose `-g` object and links with `-dead_strip`. Wild
 intentionally leaves final `__DWARF` sections out of the executable, as Apple ld and ld64.lld do.
 Instead `MachO::allocate_object_symtab_space` reserves, and `write_dsymutil_debug_map` emits,
 `N_SO`, `N_OSO`, one start/terminator `N_FUN` pair for each live executable atom, and the
@@ -310,9 +311,10 @@ The supported input is deliberately small: a loose ARM64 Mach-O object with
 (`DW_LANG_ObjC`) debug data, and live, non-merged executable atoms. Every fixture checks that a
 dead private function is absent from the map, runs `dsymutil --dump-debug-map`, verifies the
 generated dSYM with `dwarfdump`, and uses an LLDB batch source breakpoint. Other C++ and
-Objective-C language forms (including Objective-C++), archives, split DWARF, Rust library/dylib
-debug maps, and Rust modes other than the controlled normal executable remain unclaimed. There is
-no final-section copy or generic debug relocation writer hidden behind these controls.
+Objective-C language forms (including Objective-C++), archives, split-debug modes other than the
+controlled Rust `unpacked` form, Rust library/dylib debug maps, and Rust modes other than the
+controlled normal executable remain unclaimed. There is no final-section copy or generic debug
+relocation writer hidden behind these controls.
 
 ### Local chained-rebase regression
 
@@ -484,8 +486,9 @@ workload evidence—not a speed or general-performance claim.
 * Incremental linking.
 * x86_64 Mach-O is outside the agreed scope for this effort.
 * C++ language forms other than controlled `DW_LANG_C_plus_plus_14`, Objective-C++ and other
-  Objective-C language forms, archived/split-DWARF dSYM debug maps, Rust library/dylib and
-  broader debug-info-mode maps, and generic output-DWARF relocation.
+  Objective-C language forms, archived and split-debug dSYM maps other than Rust's controlled
+  `split-debuginfo=unpacked` form, Rust library/dylib and broader debug-info-mode maps, and
+  generic output-DWARF relocation.
 * Objective-C selector forms other than ARM64 `_objc_msgSend$<selector>`, including selector-stub
   range-extension islands.
 * ARM64 Mach-O linker-plugin LTO (`-C linker-plugin-lto` and Rust's `-plugin-opt` arguments).
