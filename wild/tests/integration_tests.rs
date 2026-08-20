@@ -523,6 +523,21 @@ fn run_cargo_macho_qualification() -> Result {
     )?;
     verify_cargo_dylib_rpath(&dylib_consumer)?;
 
+    // `cargo test` builds a separate Rust test-harness executable. Keep its final ARM64 link
+    // audited and let Cargo execute the harness so this qualification does not treat an ordinary
+    // unit-test workflow as equivalent to the preceding binary-only build.
+    cargo_test_with_wild(
+        &manifest,
+        &target_dir,
+        &rustflags,
+        &wild,
+        "cargo-macho-dylib-consumer",
+        &[
+            "libcargo_macho_dylib_producer",
+            "cargo_macho_dylib_consumer-",
+        ],
+    )?;
+
     // Cargo must re-link the changed Rust dylib and its final consumer. Retain the public API and
     // return value so a successful launch isolates the rebuild/link path rather than testing a
     // different application contract.
@@ -705,6 +720,52 @@ fn cargo_build_with_wild(
         "Cargo package `{package}` failed with {}:\n{transcript}",
         output.status
     );
+
+    verify_cargo_wild_transcript(&transcript, wild, package, expected_final_outputs)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+fn cargo_test_with_wild(
+    manifest: &Path,
+    target_dir: &Path,
+    rustflags: &str,
+    wild: &Path,
+    package: &str,
+    expected_final_outputs: &[&str],
+) -> Result {
+    let mut command = Command::new("cargo");
+    command
+        .arg("+nightly-2026-07-24")
+        .arg("test")
+        .arg("--manifest-path")
+        .arg(manifest)
+        .arg("--package")
+        .arg(package)
+        .arg("-vv")
+        .env("CARGO_TARGET_DIR", target_dir)
+        .env("RUSTFLAGS", rustflags);
+    let output = command
+        .output()
+        .with_context(|| format!("failed to run Cargo Mach-O test command {command:?}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let transcript = format!("{stdout}{stderr}");
+    ensure!(
+        output.status.success(),
+        "Cargo test package `{package}` failed with {}:\n{transcript}",
+        output.status
+    );
+
+    verify_cargo_wild_transcript(&transcript, wild, package, expected_final_outputs)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+fn verify_cargo_wild_transcript(
+    transcript: &str,
+    wild: &Path,
+    package: &str,
+    expected_final_outputs: &[&str],
+) -> Result {
 
     let wild = wild.to_string_lossy();
     let linker_lines = transcript

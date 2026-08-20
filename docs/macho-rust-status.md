@@ -249,12 +249,14 @@ transcript, requires that each expected producer and consumer artifact selected 
 `TokenStream::from_str("40 + 2")`, so the consumer proves that a loaded macro performed a
 non-identity expansion. The Rust-dylib consumer is then executed after clearing the `DYLD_*`
 library search overrides; `otool` additionally checks both its `@loader_path` rpath and its
-`@rpath/libcargo_macho_dylib_producer.dylib` dependency. The trial then copies the retained
-workspace into its temporary directory, changes only the copied dylib producer implementation
-body while preserving its API and result, and rebuilds/runs the dylib consumer. Its second
-transcript again requires both producer and consumer final ARM64 links through Wild; a snapshot
-asserts that every retained fixture Rust source is unchanged. This coverage deliberately does not
-use `WILD_SAVE_DIR` or the `cdylib` replay path above.
+`@rpath/libcargo_macho_dylib_producer.dylib` dependency. It also invokes `cargo test -vv` for
+that consumer: Cargo executes its dylib-dependent unit-test harness, and the trial separately
+audits both the harness and test-mode producer final ARM64 links through Wild. The trial then
+copies the retained workspace into its temporary directory, changes only the copied dylib producer
+implementation body while preserving its API and result, and rebuilds/runs the dylib consumer.
+Its second transcript again requires both producer and consumer final ARM64 links through Wild; a
+snapshot asserts that every retained fixture Rust source is unchanged. This coverage deliberately
+does not use `WILD_SAVE_DIR` or the `cdylib` replay path above.
 
 The separate ARM64-only `macho/aarch64/cargo-staticlib-native/default` trial builds
 `wild/tests/cargo_macho_staticlib` with the fixture's exact `nightly-2026-07-24` toolchain and
