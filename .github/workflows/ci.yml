@@ -171,14 +171,18 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
+      # Keep the ARM64 Mach-O runtime matrix on the dated toolchain used by Rust's
+      # Cargo/staticlib qualification fixtures. Stable coverage remains in the Linux jobs.
+      - uses: dtolnay/rust-toolchain@nightly-2026-07-24
         id: rust-toolchain
+        with:
+          components: rust-src,llvm-tools
       - uses: Swatinem/rust-cache@v2
         with:
           env-vars: ImageVersion
       - run: echo "WILD_TEST_CONFIG=test-config-ci.toml" >> $GITHUB_ENV
-      - run: cargo build --profile ci --workspace --no-default-features
-      - run: cargo test --profile ci --workspace --features macho
+      - run: cargo +nightly-2026-07-24 build --profile ci --workspace --no-default-features
+      - run: cargo +nightly-2026-07-24 test --profile ci --workspace --features macho
 
   windows-build:
     name: Build Windows (x86_64)

@@ -21,8 +21,10 @@ implemented behavior from planned behavior: an unchecked item is not a claim of 
 ## Current phase
 
 Phase 1–10: architecture implementation plus expanding ARM64 qualification. The repository's
-existing macOS CI job builds the workspace and runs `cargo test --profile ci --workspace --features
-macho`; it remains the fast regression entry point, not a declaration of production completion.
+ARM64 macOS CI job installs `nightly-2026-07-24` with `rust-src` and `llvm-tools`, then explicitly
+runs `cargo +nightly-2026-07-24 build/test --profile ci --workspace --features macho`. Stable
+coverage remains in the Linux jobs. This is a fast regression entry point, not a declaration of
+production completion.
 
 Baseline checks completed on this host:
 
