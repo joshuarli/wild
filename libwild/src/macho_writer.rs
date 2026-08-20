@@ -3108,7 +3108,9 @@ fn apply_relocation<'data, A: Arch<Platform = MachO>>(
                 .bitand(mask.symbol_plus_addend)
                 .wrapping_sub(place.bitand(mask.place)),
             RelocationKind::Got => symbol_plus_addend.bitand(mask.symbol_plus_addend),
-            _ => todo!(),
+            kind => bail!(
+                "Mach-O relocation reached the writer with unsupported normalized kind {kind:?}"
+            ),
         }
     };
 
