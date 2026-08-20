@@ -249,6 +249,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn malformed_tbd_is_rejected_before_reexport_traversal() {
+        // The reexport graph assumes every document has the TAPI schema fields below. Make a
+        // malformed root an input diagnostic, not an invalid partially-initialized library.
+        let error = parse_defined_library(
+            r"--- !tapi-tbd
+tbd-version: 4
+targets: [ arm64e-macos ]
+",
+        )
+        .expect_err("a TBD without an install-name must not parse");
+
+        assert!(error.to_string().contains("install-name"));
+    }
+
+    #[test]
     fn parse_library_with_reexports() {
         let stub_library = parse_defined_library(
             r"--- !tapi-tbd

@@ -33,7 +33,7 @@ Baseline checks completed on this host:
   (185 `libwild` tests, 35 Mach-O integration tests, recorder tests, and remaining workspace/doc
   tests).
 * `WILD_TEST_IGNORE_FORMAT=1 cargo +nightly-2026-07-24 test --profile ci --workspace --features
-  macho` — pass (all workspace unit tests and doctests, including 212 `libwild` tests and 84
+  macho` — pass (all workspace unit tests and doctests, including 214 `libwild` tests and 90
   ARM64 Mach-O integrations). This is the reproducible dated-nightly gate; it is run with the
   installed `rust-src` and `llvm-tools` components, not by falling back to stable Rust.
 * Without `WILD_TEST_IGNORE_FORMAT=1`, only tidy tests fail because this host lacks `taplo` and
@@ -77,6 +77,7 @@ than supported facilities:
 | DWARF / dSYM / LLDB | `macho/debug-dwarf`, `cxx-debug-dwarf`, `objc-debug-dwarf`, `strip-symbols`, and Rust `rust-debug-dwarf` / `rust-debuginfo-line-tables` / `rust-split-debug-dwarf` / `rust-split-debug-packed` | Apple ld and ld64.lld establish the same `N_SO`/`N_OSO`/paired-`N_FUN` control shape; `-S` / `-s` links run, and Wild `dsymutil --dump-debug-map` passes | generated dSYMs verify; LLDB stops at C, C++14, Objective-C, normal Rust, Rust `debuginfo=1`, and Rust `split-debuginfo=unpacked` / `packed` source locations (Rust uses `nightly-2026-07-24`) | pending | bounded loose-object ARM64 C/C++/Objective-C/Rust support |
 | chained fixups | `macho/chained-fixups-tlvp`, `chained-fixups-multipage`, `chained-fixups-10000` | Apple controls and Wild runtime pass | pending | 10,000 imported `__got` binds cross five 16 KiB pages; two imported `__thread_ptrs` binds exercise a non-zero TLVP page offset | bounded ARM64 runtime green |
 | branch islands | `macho/branch-island`, `macho/branch-islands` | Apple links forced overflows | C runtime pass | multiple islands pass | ARM64 smoke green |
+| malformed input diagnostics | `macho::tests::malformed_object_header_is_rejected_before_layout`, `macho_stub_library::tests::malformed_tbd_is_rejected_before_reexport_traversal`, and existing relocation/argument/undefined-input controls | n/a | n/a | n/a | malformed object/TBD input is rejected before layout; supported negative controls diagnose rather than panic |
 
 ## Expanded ARM64 qualification observations
 

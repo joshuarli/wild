@@ -4587,6 +4587,19 @@ mod tests {
     use crate::output_section_id::OutputSections;
 
     #[test]
+    fn malformed_object_header_is_rejected_before_layout() {
+        // File detection routes a Mach-O candidate into this parser before any layout state is
+        // created. Keep truncated input a normal diagnostic rather than allowing malformed bytes
+        // to reach the linker graph.
+        let error = match <File<'_> as platform::ObjectFile>::parse_bytes(&[], false) {
+            Ok(_) => panic!("an empty Mach-O object must not parse"),
+            Err(error) => error,
+        };
+
+        assert!(!error.to_string().is_empty());
+    }
+
+    #[test]
     fn eh_frame_zplr_reports_relocation_storage() {
         // One DWARF32 CIE with `zPLR`, then an FDE referring back to it. Keep this byte-level
         // regression independent of a Rust toolchain so malformed length/LEB handling is caught
