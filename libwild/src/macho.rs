@@ -1325,7 +1325,8 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
     }
 
     fn symbol_versions(&self) -> &[()] {
-        todo!()
+        // Mach-O has no ELF-style per-symbol version table.
+        &[]
     }
 
     fn dynamic_symbol_used(
@@ -1481,11 +1482,14 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
         _state: &mut (),
         _section_index: object::SectionIndex,
     ) -> Result {
-        todo!()
+        // GNU property notes are ELF metadata. Mach-O has neither their section type nor an
+        // equivalent object-level property table.
+        Ok(())
     }
 
     fn dynamic_tags(&self) -> Result<&'data [()]> {
-        todo!()
+        // Mach-O load commands are parsed directly; there is no ELF dynamic-tag table.
+        Ok(&[])
     }
 }
 
@@ -2028,7 +2032,8 @@ pub(crate) struct VerneedTable<'data> {
 
 impl<'data> platform::VerneedTable<'data> for VerneedTable<'data> {
     fn version_name(&self, _local_symbol_index: object::SymbolIndex) -> Option<&'data [u8]> {
-        todo!()
+        // Mach-O dynamic symbols use library ordinals rather than ELF symbol versions.
+        None
     }
 }
 
@@ -2239,14 +2244,18 @@ impl platform::Platform for MachO {
             crate::layout::OutputRecordLayout,
         >,
     ) -> Result<u32> {
-        todo!()
+        // Mach-O emits imports through the chained-fixup import table, not an ELF `.dynsym`
+        // allocation. Reaching this means a generic dynamic-symbol path was selected without a
+        // Mach-O representation, so diagnose it rather than emitting a malformed index.
+        bail!("Mach-O does not support generic dynamic-symbol table allocation")
     }
 
     fn compute_object_addresses<'data>(
         _object: &crate::layout::ObjectLayoutState<'data, Self>,
         _memory_offsets: &mut crate::output_section_part_map::OutputSectionPartMap<u64>,
     ) {
-        todo!()
+        // Mach-O does not reserve a format-specific object region while iterative section-size
+        // relaxation runs. Branch islands are fixed-size and planned separately.
     }
 
     fn layout_resources_ext<'data>(

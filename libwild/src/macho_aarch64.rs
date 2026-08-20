@@ -75,24 +75,24 @@ const _ASSERTS: () = {
 pub(crate) struct Relaxation {}
 
 impl crate::platform::Relaxation for Relaxation {
-    fn apply(&self, section_bytes: &mut [u8], offset_in_section: &mut u64, addend: &mut i64) {
-        todo!()
+    fn apply(&self, _section_bytes: &mut [u8], _offset_in_section: &mut u64, _addend: &mut i64) {
+        unreachable!("Mach-O does not create size-reduction relaxations")
     }
 
     fn rel_info(&self) -> linker_utils::elf::RelocationKindInfo {
-        todo!()
+        unreachable!("Mach-O does not create size-reduction relaxations")
     }
 
     fn debug_kind(&self) -> impl std::fmt::Debug {
-        todo!()
+        unreachable!("Mach-O does not create size-reduction relaxations")
     }
 
     fn next_modifier(&self) -> linker_utils::relaxation::RelocationModifier {
-        todo!()
+        unreachable!("Mach-O does not create size-reduction relaxations")
     }
 
     fn is_mandatory(&self) -> bool {
-        todo!()
+        false
     }
 }
 
@@ -113,13 +113,16 @@ impl crate::platform::Arch for MachOAArch64 {
         }
     }
     fn arch_identifier() -> <Self::Platform as crate::platform::Platform>::ArchIdentifier {
-        todo!()
+        // Mach-O's CPU type is written directly by `macho_writer::populate_file_header`; this
+        // generic identifier exists for ELF headers and has unit type for Mach-O.
     }
 
     fn get_dynamic_relocation_type(
         relocation: linker_utils::elf::DynamicRelocationKind,
     ) -> object::macho::RelocationInfo {
-        todo!()
+        unreachable!(
+            "Mach-O encodes dynamic relocations as chained fixups, not generic relocation records: {relocation:?}"
+        )
     }
 
     fn write_plt_entry(
@@ -309,19 +312,27 @@ impl crate::platform::Arch for MachOAArch64 {
     }
 
     fn tp_offset_start(layout: &crate::layout::Layout<Self::Platform>) -> u64 {
-        todo!()
+        // Mach-O TLV descriptors are modeled directly in `macho.rs`; it has no generic ELF TLS
+        // block offset to contribute here.
+        0
     }
 
     fn get_property_class(property_type: u32) -> Option<crate::elf::PropertyClass> {
-        todo!()
+        // GNU property notes are ELF metadata.
+        None
     }
 
     fn merge_eflags(eflags: impl Iterator<Item = u32>) -> crate::error::Result<u32> {
-        todo!()
+        // Mach-O has no ELF e_flags field. Consume the iterator to keep this a deliberate
+        // format boundary rather than an accidentally ignored future input property.
+        let _ = eflags.count();
+        Ok(0)
     }
 
     fn high_part_relocations() -> &'static [object::macho::RelocationInfo] {
-        todo!()
+        // The Mach-O loader retains ADDEND/SUBTRACTOR pairs explicitly; no ELF-style high-part
+        // relocation cache is needed.
+        &[]
     }
 
     fn thunk_config() -> Option<crate::platform::ThunkConfig> {
@@ -365,19 +376,22 @@ impl crate::platform::Arch for MachOAArch64 {
     }
 
     fn new_relaxation(
-        relocation_kind: object::macho::RelocationInfo,
-        section_bytes: &[u8],
-        offset_in_section: u64,
-        flags: crate::value_flags::ValueFlags,
-        output_kind: crate::output_kind::OutputKind,
-        section_flags: <Self::Platform as crate::platform::Platform>::SectionFlags,
-        relax_deltas: Option<&linker_utils::relaxation::SectionRelaxDeltas>,
+        _relocation_kind: object::macho::RelocationInfo,
+        _section_bytes: &[u8],
+        _offset_in_section: u64,
+        _flags: crate::value_flags::ValueFlags,
+        _output_kind: crate::output_kind::OutputKind,
+        _section_flags: <Self::Platform as crate::platform::Platform>::SectionFlags,
+        _relax_deltas: Option<&linker_utils::relaxation::SectionRelaxDeltas>,
         _sym_addr: u64,
         _section_address: u64,
         _rel_addend: i64,
         _previous_relocation: Option<PreviousRelocationInfo<object::macho::RelocationInfo>>,
     ) -> Option<Self::Relaxation> {
-        todo!()
+        // Mach-O range extension is handled by fixed-size branch islands after layout. It does
+        // not have a relaxation that shrinks an input section, so the generic relaxation scan is
+        // intentionally disabled by `supports_size_reduction_relaxations`.
+        None
     }
 }
 
@@ -399,6 +413,14 @@ mod tests {
             r_extern: true,
             r_type,
         }
+    }
+
+    #[test]
+    fn elf_generic_metadata_hooks_are_macho_noops() {
+        assert_eq!(MachOAArch64::arch_identifier(), ());
+        assert!(MachOAArch64::get_property_class(0).is_none());
+        assert_eq!(MachOAArch64::merge_eflags([0, 1].into_iter()).unwrap(), 0);
+        assert!(MachOAArch64::high_part_relocations().is_empty());
     }
 
     #[test]
