@@ -33,7 +33,7 @@ Baseline checks completed on this host:
   (185 `libwild` tests, 35 Mach-O integration tests, recorder tests, and remaining workspace/doc
   tests).
 * `WILD_TEST_IGNORE_FORMAT=1 cargo +nightly-2026-07-24 test --profile ci --workspace --features
-  macho` — pass (all workspace unit tests and doctests, including 214 `libwild` tests and 90
+  macho` — pass (all workspace unit tests and doctests, including 215 `libwild` tests and 94
   ARM64 Mach-O integrations). This is the reproducible dated-nightly gate; it is run with the
   installed `rust-src` and `llvm-tools` components, not by falling back to stable Rust.
 * Without `WILD_TEST_IGNORE_FORMAT=1`, only tidy tests fail because this host lacks `taplo` and
