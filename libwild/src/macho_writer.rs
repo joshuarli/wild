@@ -2846,7 +2846,13 @@ fn write_object<'data, A: Arch<Platform = MachO>>(
         }
     }
 
-    write_symbols(object, buffers, layout, symbol_writer)?;
+    // Layout deliberately reserves no nlist or string-table space for ld64's `-s` mode. The
+    // writer must make the same decision: attempting to serialize an otherwise-live input symbol
+    // would consume a zero-length `__LINKEDIT` part and panic instead of producing a stripped
+    // but runnable executable.
+    if !layout.args().should_strip_all() {
+        write_symbols(object, buffers, layout, symbol_writer)?;
+    }
 
     if object.owns_thunk_block
         && let Some(addresses) = layout
