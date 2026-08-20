@@ -4196,7 +4196,7 @@ fn write_symbols<'data>(
     Ok(())
 }
 
-/// Emits the minimal STABS debug map that Apple's `dsymutil` accepts for ordinary C objects.
+/// Emits the minimal STABS debug map that Apple's `dsymutil` accepts for supported loose objects.
 ///
 /// The final executable deliberately contains no copied `__DWARF` sections. `N_OSO` preserves
 /// the loose input-object path, while each paired `N_FUN` records the original function length

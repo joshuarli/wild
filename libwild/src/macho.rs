@@ -1100,8 +1100,8 @@ impl<'data> File<'data> {
     }
 }
 
-/// A source-level function entry that `dsymutil` can relocate from an input C object to the
-/// linked image. The length deliberately stays in input coordinates: that is the `N_FUN`
+/// A source-level function entry that `dsymutil` can relocate from a supported input object to
+/// the linked image. The length deliberately stays in input coordinates: that is the `N_FUN`
 /// terminator convention used by Apple's debug-map reader.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DsymutilDebugMapFunction<'data> {
@@ -1111,7 +1111,7 @@ pub(crate) struct DsymutilDebugMapFunction<'data> {
     pub(crate) input_size: u64,
 }
 
-/// The deliberately small Mach-O debug-map slice that we can prove for ordinary C objects.
+/// The deliberately small Mach-O debug-map slice that we can prove for loose C and Rust objects.
 ///
 /// Final Mach-O executables do not carry their input `__DWARF` sections. Instead, `dsymutil`
 /// reads those still-available objects through `N_OSO` and uses `N_FUN` entries to relocate CUs
@@ -3164,8 +3164,8 @@ impl platform::Platform for MachO {
         }
 
         // An executable's final image intentionally omits ordinary `__DWARF`. For the restricted
-        // C path, reserve the STABS debug map that lets `dsymutil` reopen this loose input object
-        // and do the address rewriting itself. Keep this allocation exactly in sync with
+        // C/Rust path, reserve the STABS debug map that lets `dsymutil` reopen this loose input
+        // object and do the address rewriting itself. Keep this allocation exactly in sync with
         // `write_dsymutil_debug_map` in the writer.
         if !symbol_db.args.should_strip_debug() && state.input.entry.is_none() {
             if let Some(debug_map) = state.object.dsymutil_debug_map(&state.sections, |section, offset| {
@@ -4298,11 +4298,15 @@ fn objc_selector_symbol(file: &File<'_>, selector: &[u8]) -> Result<Option<Symbo
 }
 
 impl<'data> File<'data> {
-    /// Returns the C compilation-unit path recorded in ordinary DWARF, if this object is in the
-    /// intentionally narrow debug-map subset. DWARF relocations are not applied here: extracting
-    /// `DW_AT_language` and `DW_AT_name` does not need code addresses, and applying them during
-    /// layout could make otherwise dead atoms live.
-    fn c_dwarf_source_path(&self) -> Result<Option<Vec<u8>>> {
+    /// Returns a supported compilation-unit path recorded in ordinary DWARF, if this object is
+    /// in the intentionally narrow debug-map subset. DWARF relocations are not applied here:
+    /// extracting `DW_AT_language` and `DW_AT_name` does not need code addresses, and applying
+    /// them during layout could make otherwise dead atoms live.
+    ///
+    /// ARM64 `macho/rust-debug-dwarf` establishes the Rust half of this contract with the exact
+    /// `nightly-2026-07-24` toolchain. Keep additional language forms out until their map and
+    /// `dsymutil` behavior have comparable controls.
+    fn debug_map_source_path(&self) -> Result<Option<Vec<u8>>> {
         let dwarf_sections = gimli::DwarfSections::load(&|id: gimli::SectionId| -> Result<Cow<[u8]>> {
             // Mach-O spells DWARF section names with two leading underscores, while gimli uses
             // their ELF spelling (for example `.debug_info`).
@@ -4342,6 +4346,7 @@ impl<'data> File<'data> {
                 | gimli::DW_LANG_C99
                 | gimli::DW_LANG_C11
                 | gimli::DW_LANG_C17
+                | gimli::DW_LANG_Rust
         ) {
             return Ok(None);
         }
@@ -4351,9 +4356,9 @@ impl<'data> File<'data> {
         Ok(Some(dwarf.attr_string(&unit, name)?.to_slice()?.into_owned()))
     }
 
-    /// Builds the `N_SO`/`N_OSO`/`N_FUN` payload for an ordinary C object. This only names live,
-    /// loaded executable atoms: merged sections have no linear input-to-output mapping and
-    /// unloaded/dead atoms must not get an address in the debug map.
+    /// Builds the `N_SO`/`N_OSO`/`N_FUN` payload for a supported loose input object. This only
+    /// names live, loaded executable atoms: merged sections have no linear input-to-output
+    /// mapping and unloaded/dead atoms must not get an address in the debug map.
     pub(crate) fn dsymutil_debug_map(
         &'data self,
         sections: &[resolution::SectionSlot],
@@ -4362,7 +4367,7 @@ impl<'data> File<'data> {
         if !self.uses_subsections_via_symbols() {
             return Ok(None);
         }
-        let Some(source_path) = self.c_dwarf_source_path()? else {
+        let Some(source_path) = self.debug_map_source_path()? else {
             return Ok(None);
         };
 

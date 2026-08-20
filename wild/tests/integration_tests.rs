@@ -115,6 +115,10 @@
 //! named function mapping. This is useful for asserting that `-dead_strip` atoms stay out of a
 //! dSYM map.
 //!
+//! ExpectDsymutilLldb:function={function},source={source-file},line={line} Builds a dSYM with
+//! `dsymutil`, verifies it with `dwarfdump --verify`, and makes LLDB stop in the named function
+//! at the expected source file and line.
+//!
 //! ExpectGdbIndexCuCount:{count} Checks that the `.gdb_index` section contains exactly the
 //! specified number of CU entries.
 //!
@@ -190,6 +194,9 @@
 //!
 //! RequiresNightlyRustc:{bool} Defaults to false. Set to true to disable this test if we detect
 //! that the version of rustc available to us is not nightly.
+//!
+//! RustcToolchain:{name} Runs a Rust fixture through the exact rustup toolchain `{name}` rather
+//! than the test configuration's channel. This is only meaningful for Rust sources.
 //!
 //! RequiresCompilerFlags:{flag} Checks if the compiler supports the specified flag(s) and skips the
 //! test if it doesn't. Set WILD_VERIFY_PLATFORM_REQUIREMENTS=1 to verify that all requirements are
@@ -1932,6 +1939,10 @@ struct Config {
     auto_add_objects: bool,
     remove_sections: Vec<String>,
     rustc_channel: RustcChannel,
+    /// An exact rustup toolchain selected by a Rust fixture, such as
+    /// `nightly-2026-07-24`. This is separate from the test-wide channel because a fixture can
+    /// carry a durable compiler/debug-info contract of its own.
+    rustc_toolchain: Option<String>,
     requires_rust_musl: bool,
     requires_linker_plugin: bool,
     test_update_in_place: bool,
@@ -2323,8 +2334,7 @@ impl Config {
             || (arch != get_host_architecture()
                 && self.platform == PlatformKind::Elf
                 && (self.compiler == "clang" || !self.cross_enabled))
-            || (self.test_config.rustc_channel != RustcChannel::Nightly
-                && self.requires_nightly_rustc)
+            || (!self.uses_nightly_rustc() && self.requires_nightly_rustc)
             || self.requires_glibc_version.as_ref().is_some_and(|version| {
                 let req_version: Vec<u32> = version
                     .split('.')
@@ -2334,6 +2344,20 @@ impl Config {
             })
             || (self.requires_sframe_backtrace && !is_sframe_backtrace_supported(arch))
             || (self.requires_linker_plugin && !cfg!(all(feature = "plugins", unix)))
+    }
+
+    fn uses_nightly_rustc(&self) -> bool {
+        self.rustc_toolchain
+            .as_deref()
+            .is_some_and(|toolchain| toolchain.starts_with("nightly"))
+            || self.test_config.rustc_channel == RustcChannel::Nightly
+    }
+
+    fn rustc_toolchain_arg(&self) -> Option<String> {
+        self.rustc_toolchain
+            .as_ref()
+            .map(|toolchain| format!("+{toolchain}"))
+            .or_else(|| self.test_config.rustc_channel.as_arg().map(str::to_owned))
     }
 
     fn is_linker_enabled(&self, linker: &Linker) -> bool {
@@ -2475,6 +2499,7 @@ struct Assertions {
     expected_section_bytes: Vec<ExpectedSectionBytes>,
     expected_dsymutil_symbols: Vec<String>,
     absent_dsymutil_symbols: Vec<String>,
+    expected_dsymutil_lldb: Vec<ExpectedDsymutilLldb>,
     /// Wasm: `(module, field, expected_count)` for function imports.
     expected_func_imports: Vec<(String, String, usize)>,
     /// Wasm: total number of function imports in the import section.
@@ -2488,6 +2513,14 @@ struct Assertions {
     expected_program_headers: Vec<ExpectedProgramHeaders>,
     absent_program_headers: Vec<ProgramHeaderType>,
     skip_overlap_segments_check: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExpectedDsymutilLldb {
+    function: String,
+    source: String,
+    line: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2720,6 +2753,7 @@ impl Config {
             requires_zstd_compression: false,
             auto_add_objects: true,
             rustc_channel: RustcChannel::Default,
+            rustc_toolchain: None,
             requires_rust_musl: false,
             test_update_in_place: false,
             test_relink_after_run: false,
@@ -3125,6 +3159,12 @@ fn process_directive(
             .assertions
             .absent_dsymutil_symbols
             .push(arg.to_owned()),
+        "ExpectDsymutilLldb" => config
+            .assertions
+            .expected_dsymutil_lldb
+            .push(serde_keyvalue::from_key_values(arg).context(
+                "ExpectDsymutilLldb requires function=name,source=file,line=N",
+            )?),
         "ExpectDynamic" => config
             .assertions
             .expected_dynamic_entries
@@ -3348,6 +3388,11 @@ fn process_directive(
         }
         "RequiresNightlyRustc" => {
             config.requires_nightly_rustc = arg.parse()?;
+        }
+        "RustcToolchain" => {
+            ensure!(is_rust, "RustcToolchain is only supported for Rust sources");
+            ensure!(!arg.is_empty(), "RustcToolchain must name a rustup toolchain");
+            config.rustc_toolchain = Some(arg.to_owned());
         }
         "RequiresRustMusl" => {
             config.requires_rust_musl = arg.parse()?;
@@ -4263,9 +4308,10 @@ fn build_obj(
         CompilerKind::Rust => {
             let wild = wild_path().to_str().context("Need UTF-8 path")?.to_owned();
 
-            command
-                .env("WILD_SAVE_SKIP_LINKING", "1")
-                .args(config.rustc_channel.as_arg());
+            command.env("WILD_SAVE_SKIP_LINKING", "1");
+            if let Some(toolchain) = config.rustc_toolchain_arg() {
+                command.arg(toolchain);
+            }
 
             if config.platform == PlatformKind::Wasm {
                 command
@@ -5463,7 +5509,10 @@ impl Assertions {
     }
 
     fn check_dsymutil_debug_map(&self, link_output: &LinkOutput) -> Result {
-        if self.expected_dsymutil_symbols.is_empty() && self.absent_dsymutil_symbols.is_empty() {
+        if self.expected_dsymutil_symbols.is_empty()
+            && self.absent_dsymutil_symbols.is_empty()
+            && self.expected_dsymutil_lldb.is_empty()
+        {
             return Ok(());
         }
 
@@ -5499,6 +5548,95 @@ impl Assertions {
             ensure!(
                 !stdout.contains(&unexpected),
                 "dsymutil debug map for `{}` unexpectedly contains `{unexpected}`:\n{stdout}{stderr}",
+                link_output.binary.display()
+            );
+        }
+        self.check_dsymutil_lldb(link_output)?;
+        Ok(())
+    }
+
+    fn check_dsymutil_lldb(&self, link_output: &LinkOutput) -> Result {
+        if self.expected_dsymutil_lldb.is_empty() {
+            return Ok(());
+        }
+
+        let dsym = add_to_path(&link_output.binary, ".dSYM");
+        if dsym.exists() {
+            std::fs::remove_dir_all(&dsym)
+                .with_context(|| format!("Failed to remove stale dSYM {}", dsym.display()))?;
+        }
+        let output = Command::new("dsymutil")
+            .arg(&link_output.binary)
+            .output()
+            .with_context(|| format!("Failed to build dSYM for {}", link_output.binary.display()))?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        ensure!(
+            output.status.success(),
+            "dsymutil failed to build {}:\n{stdout}{stderr}",
+            dsym.display()
+        );
+
+        let dwarf = dsym
+            .join("Contents")
+            .join("Resources")
+            .join("DWARF")
+            .join(link_output.binary.file_name().context("dSYM output has no binary name")?);
+        let output = Command::new("dwarfdump")
+            .arg("--verify")
+            .arg(&dwarf)
+            .output()
+            .with_context(|| format!("Failed to verify dSYM DWARF {}", dwarf.display()))?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        ensure!(
+            output.status.success(),
+            "dwarfdump failed to verify {}:\n{stdout}{stderr}",
+            dwarf.display()
+        );
+
+        for expected in &self.expected_dsymutil_lldb {
+            let output = Command::new("lldb")
+                .arg("--batch")
+                .arg("--file")
+                .arg(&link_output.binary)
+                .arg("--one-line")
+                .arg(format!("breakpoint set --name {}", expected.function))
+                .arg("--one-line")
+                .arg("process launch")
+                .arg("--one-line")
+                .arg("frame info")
+                .output()
+                .with_context(|| {
+                    format!(
+                        "Failed to run LLDB against dSYM {} for {}",
+                        dsym.display(),
+                        link_output.binary.display()
+                    )
+                })?;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            ensure!(
+                output.status.success(),
+                "LLDB failed for {}:\n{stdout}{stderr}",
+                link_output.binary.display()
+            );
+            ensure!(
+                stdout.contains("stop reason = breakpoint"),
+                "LLDB did not stop at {} in {}:\n{stdout}{stderr}",
+                expected.function,
+                link_output.binary.display()
+            );
+            ensure!(
+                stdout.contains(&expected.function),
+                "LLDB frame lacks function {} for {}:\n{stdout}{stderr}",
+                expected.function,
+                link_output.binary.display()
+            );
+            let expected_source = format!("{}:{}", expected.source, expected.line);
+            ensure!(
+                stdout.contains(&expected_source),
+                "LLDB frame lacks source location {expected_source} for {}:\n{stdout}{stderr}",
                 link_output.binary.display()
             );
         }
@@ -5601,6 +5739,7 @@ impl Assertions {
             expected_section_bytes: self.expected_section_bytes.clone(),
             expected_dsymutil_symbols: self.expected_dsymutil_symbols.clone(),
             absent_dsymutil_symbols: self.absent_dsymutil_symbols.clone(),
+            expected_dsymutil_lldb: self.expected_dsymutil_lldb.clone(),
             output_file_matches: self.output_file_matches.clone(),
             ..Default::default()
         };
@@ -8245,7 +8384,9 @@ fn verify_linker_plugin_requirements(
             // platforms where the LLVM version used by clang doesn't match the version used by
             // rustc.
             let mut command = Command::new(&compiler);
-            command.args(config.rustc_channel.as_arg());
+            if let Some(toolchain) = config.rustc_toolchain_arg() {
+                command.arg(toolchain);
+            }
             command.arg(verifier_path);
             command.args([
                 "-Clinker=clang",

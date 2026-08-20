@@ -25,7 +25,6 @@ pub struct MachOArgs {
     pub(crate) sysroot: Option<Box<Path>>,
     pub(crate) lib_search_path: Vec<Box<Path>>,
     pub(crate) framework_search_path: Vec<Box<Path>>,
-    pub(crate) plugin_path: Option<String>,
     pub(crate) dead_strip_dylibs: bool,
     pub(crate) gc_sections: bool,
     /// Place linker-synthesized Objective-C selector references in the immutable-after-fixups
@@ -119,7 +118,6 @@ impl Default for MachOArgs {
             sysroot: None,
             lib_search_path: Vec::new(),
             framework_search_path: Vec::new(),
-            plugin_path: None,
             dead_strip_dylibs: false,
             gc_sections: false,
             const_selrefs: false,
@@ -309,10 +307,27 @@ fn setup_argument_parser() -> ArgumentParser<MachOArgs> {
     parser
         .declare_with_param()
         .long("lto_library")
-        .help("Load plugin")
-        .execute(|args, _modifier_stack, value| {
-            args.plugin_path = Some(value.to_owned());
+        .help("Recognize ld64's native-object LTO library argument")
+        .execute(|_args, _modifier_stack, value| {
+            ensure!(!value.is_empty(), "-lto_library requires a library path");
+
+            // The dated Rust toolchain passes this to every ld64 invocation, including ordinary
+            // and Rust ThinLTO links where rustc has already materialized native ARM64 Mach-O
+            // objects. Loading or saving the plugin here would falsely imply that Wild supports
+            // linker-plugin LTO. The plugin has no remaining work for those native inputs, so
+            // recognizing this argument is the correct ld64-compatible behavior. A later
+            // `-plugin-opt` is the concrete signal that the invocation needs plugin semantics.
             Ok(())
+        });
+    parser
+        .declare_with_param()
+        .long("plugin-opt")
+        .help("Diagnose unsupported linker-plugin LTO options")
+        .execute(|_args, _modifier_stack, value| {
+            bail!(
+                "ARM64 Mach-O linker-plugin LTO is not supported (-plugin-opt={value}); \
+                 ordinary Rust -C lto=thin or -C lto=fat links native ARM64 Mach-O objects"
+            )
         });
     parser
         .declare_with_param()
@@ -618,7 +633,6 @@ mod tests {
                 .iter()
                 .any(|p| p.as_ref() == Path::new("/bar/lib"))
         );
-        assert_eq!(args.plugin_path, Some("/foo/bar/libLTO.dylib".to_owned()));
     }
 
     #[test]
@@ -808,5 +822,27 @@ mod tests {
             let mut args = MachOArgs::new().unwrap();
             assert!(args.parse([option].iter()).is_err(), "accepted {option}");
         }
+    }
+
+    #[test]
+    fn diagnoses_rustc_linker_plugin_lto_options() {
+        let mut args = MachOArgs::new().unwrap();
+        let err = args
+            .parse(
+                [
+                    "-arch",
+                    "arm64",
+                    "-lto_library",
+                    "/toolchain/libLTO.dylib",
+                    "-plugin-opt=O0",
+                ]
+                .iter(),
+            )
+            .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("ARM64 Mach-O linker-plugin LTO is not supported"));
+        assert!(err.to_string().contains("-plugin-opt=O0"));
     }
 }
