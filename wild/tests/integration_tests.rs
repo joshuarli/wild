@@ -2782,6 +2782,32 @@ fn process_directive(
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+fn verify_code_signature(binary: &Path) -> Result {
+    let output = Command::new("codesign")
+        .args(["--verify", "--strict", "--verbose=2"])
+        .arg(binary)
+        .output()
+        .with_context(|| format!("Failed to verify code signature for {}", binary.display()))?;
+
+    ensure!(
+        output.status.success(),
+        "codesign verification failed for {}:\n{}{}",
+        binary.display(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    Ok(())
+}
+
+// Relink-after-run is shared with non-Mach-O integration coverage. Code signatures are a
+// macOS-only contract, so preserve that coverage without requiring Apple's `codesign` tool on
+// other hosts.
+#[cfg(not(target_os = "macos"))]
+fn verify_code_signature(_binary: &Path) -> Result {
+    Ok(())
+}
+
 impl ProgramInputs {
     fn new(source_file: PathBuf) -> Result<Self> {
         Ok(Self { source_file })
@@ -2934,11 +2960,13 @@ impl ProgramInputs {
         let file = std::fs::File::open(&reference_output.binary)
             .with_context(|| format!("Failed to open {}", reference_output.binary.display()))?;
 
+        verify_code_signature(&reference_output.binary)?;
         reference_output
             .run(cross_arch)
             .with_context(|| format!("Failed to run {}", reference_output.binary.display()))?;
 
         let reference_output = linker.link(self.name(), inputs, config, cross_arch)?;
+        verify_code_signature(&reference_output.binary)?;
         let metadata = file.metadata()?;
         let relinked_metadata = std::fs::metadata(&reference_output.binary)?;
 
@@ -2947,6 +2975,10 @@ impl ProgramInputs {
             "Reused inode for {} when relinking",
             reference_output.binary.display()
         );
+
+        reference_output
+            .run(cross_arch)
+            .with_context(|| format!("Failed to run {}", reference_output.binary.display()))?;
 
         Ok(())
     }
@@ -6155,6 +6187,16 @@ fn verify_uuid(obj: &object::File, bytes: &[u8]) -> Result {
         .context("Invalid UUID size")?;
 
     let code_signature_offset = usize::try_from(code_signature.dataoff.get(e))?;
+    let code_signature_size = usize::try_from(code_signature.datasize.get(e))?;
+    let code_signature_end = code_signature_offset
+        .checked_add(code_signature_size)
+        .context("Invalid code signature range")?;
+    ensure!(
+        code_signature_end == bytes.len(),
+        "Code signature range {code_signature_offset:#x}..{code_signature_end:#x} does not end at file size {file_size:#x}",
+        file_size = bytes.len(),
+    );
+
     let hashes_size = code_signature_offset
         .div_ceil(CS_BLOCK_SIZE)
         .checked_mul(CS_HASH_SIZE)
@@ -6163,6 +6205,10 @@ fn verify_uuid(obj: &object::File, bytes: &[u8]) -> Result {
         .len()
         .checked_sub(hashes_size)
         .context("Invalid code signature hashes range")?;
+    ensure!(
+        hashes_start >= code_signature_offset,
+        "Code signature hashes start at {hashes_start:#x}, before code signature at {code_signature_offset:#x}"
+    );
     let zero_hashes = vec![0; hashes_size];
 
     ensure!(
