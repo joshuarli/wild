@@ -161,81 +161,101 @@ pub(crate) fn write<'data, A: Arch<Platform = MachO>>(
     layout: &MachOLayout<'data>,
 ) -> Result {
     timing_phase!("Write data to file");
-    let exports_trie = build_exports_trie(layout)?;
+    let exports_trie = {
+        timing_phase!("Build Mach-O exports trie");
+        build_exports_trie(layout)?
+    };
     let (mut section_buffers, mut padding) =
         split_output_into_sections(layout, &mut sized_output.out);
     padding.fill_zero();
 
-    let mut writable_buckets = split_buffers_by_alignment(&mut section_buffers, layout);
-    let groups_and_buffers = split_output_by_group(layout, &mut writable_buckets);
-    groups_and_buffers
-        .into_par_iter()
-        .try_for_each(|(group, mut buffers)| -> Result {
-            verbose_timing_phase!("Write group");
+    {
+        timing_phase!("Copy Mach-O object data");
+        let mut writable_buckets = split_buffers_by_alignment(&mut section_buffers, layout);
+        let groups_and_buffers = split_output_by_group(layout, &mut writable_buckets);
+        groups_and_buffers
+            .into_par_iter()
+            .try_for_each(|(group, mut buffers)| -> Result {
+                verbose_timing_phase!("Write group");
 
-            let mut symbol_writer = MachOSymbolTableWriter {
-                next_strtab_offset: group.strtab_start_offset,
-            };
-            for file in &group.files {
-                write_file::<A>(
-                    file,
-                    &mut buffers,
-                    layout,
-                    &sized_output.trace,
-                    &mut symbol_writer,
-                    &exports_trie,
-                )
-                .with_context(|| format!("Failed copying from {file} to output file"))?;
-            }
-            Ok(())
-        })?;
+                let mut symbol_writer = MachOSymbolTableWriter {
+                    next_strtab_offset: group.strtab_start_offset,
+                };
+                for file in &group.files {
+                    write_file::<A>(
+                        file,
+                        &mut buffers,
+                        layout,
+                        &sized_output.trace,
+                        &mut symbol_writer,
+                        &exports_trie,
+                    )
+                    .with_context(|| format!("Failed copying from {file} to output file"))?;
+                }
+                Ok(())
+            })?;
+    }
 
-    let mut section_buffers = split_output_into_sections(layout, &mut sized_output.out).0;
-    write_plt_entries::<A>(layout, section_buffers.get_mut(output_section_id::PLT_GOT))?;
-    let objc_selector_rebases = write_objc_message_stubs(
-        layout,
-        section_buffers.get_mut(output_section_id::OBJC_MESSAGE_STUBS),
-    )?;
-    write_objc_selector_references(
-        layout,
-        &objc_selector_rebases,
-        section_buffers.get_mut(objc_selector_references_output_section_id(
-            layout.symbol_db.args,
-        )),
-    )?;
-    let mut merged_string_buffers = split_buffers_by_alignment(&mut section_buffers, layout);
-    write_merged_strings(layout, &mut merged_string_buffers);
-    drop(merged_string_buffers);
-    drop(section_buffers);
+    let objc_selector_rebases = {
+        timing_phase!("Write Mach-O dynamic tables");
+        let mut section_buffers = split_output_into_sections(layout, &mut sized_output.out).0;
+        write_plt_entries::<A>(layout, section_buffers.get_mut(output_section_id::PLT_GOT))?;
+        let objc_selector_rebases = write_objc_message_stubs(
+            layout,
+            section_buffers.get_mut(output_section_id::OBJC_MESSAGE_STUBS),
+        )?;
+        write_objc_selector_references(
+            layout,
+            &objc_selector_rebases,
+            section_buffers.get_mut(objc_selector_references_output_section_id(
+                layout.symbol_db.args,
+            )),
+        )?;
+        let mut merged_string_buffers = split_buffers_by_alignment(&mut section_buffers, layout);
+        write_merged_strings(layout, &mut merged_string_buffers);
+        objc_selector_rebases
+    };
 
-    let mut section_buffers = split_output_into_sections(layout, &mut sized_output.out).0;
-    let eh_frame_plan = write_eh_frame(layout, section_buffers.get_mut(output_section_id::EH_FRAME))?;
-    write_compact_unwind_info(
-        layout,
-        section_buffers.get_mut(output_section_id::UNWIND_INFO),
-        &eh_frame_plan.fde_offsets,
-    )?;
-    drop(section_buffers);
+    let eh_frame_plan = {
+        timing_phase!("Write Mach-O unwind tables");
+        let mut section_buffers = split_output_into_sections(layout, &mut sized_output.out).0;
+        let eh_frame_plan =
+            write_eh_frame(layout, section_buffers.get_mut(output_section_id::EH_FRAME))?;
+        write_compact_unwind_info(
+            layout,
+            section_buffers.get_mut(output_section_id::UNWIND_INFO),
+            &eh_frame_plan.fde_offsets,
+        )?;
+        eh_frame_plan
+    };
 
     // Plan before encoding: local relocations still contain their link-time target addresses.
     // The same plan drives both the starts table and the in-place chained pointer words.
-    let chained_fixups = chained_fixups(
-        layout,
-        &sized_output.out,
-        &eh_frame_plan.personality_got_rebases,
-        &objc_selector_rebases,
-    )?;
-    let mut section_buffers = split_output_into_sections(layout, &mut sized_output.out).0;
-    write_chained_fixup_table(
-        layout,
-        &chained_fixups,
-        section_buffers.get_mut(output_section_id::CHAINED_FIXUP_TABLE),
-    )?;
-    drop(section_buffers);
+    let chained_fixups = {
+        timing_phase!("Build Mach-O chained fixups");
+        chained_fixups(
+            layout,
+            &sized_output.out,
+            &eh_frame_plan.personality_got_rebases,
+            &objc_selector_rebases,
+        )?
+    };
+    {
+        timing_phase!("Write Mach-O chained fixup table");
+        let mut section_buffers = split_output_into_sections(layout, &mut sized_output.out).0;
+        write_chained_fixup_table(
+            layout,
+            &chained_fixups,
+            section_buffers.get_mut(output_section_id::CHAINED_FIXUP_TABLE),
+        )?;
+    }
 
     // All object relocations have now written their link-time pointer values. Rewrite the
     // locations dyld owns as chained bind/rebase words before UUID and code-signature hashing.
-    write_chained_fixup_pointers(layout, &chained_fixups, &mut sized_output.out)?;
+    {
+        timing_phase!("Write Mach-O chained pointers");
+        write_chained_fixup_pointers(layout, &chained_fixups, &mut sized_output.out)?;
+    }
 
     write_code_signature_metadata(layout, sized_output)?;
     write_uuid(layout, sized_output)?;
@@ -3360,12 +3380,10 @@ fn write_section_raw<'out, 'data>(
                     .context("Mach-O subsection start does not fit usize")?;
                 let input_end = usize::try_from(range.end)
                     .context("Mach-O subsection end does not fit usize")?;
-                let output_offset = usize::try_from(
-                    object
-                        .output_offset_for_input(section_index, range.start)
-                        .context("live Mach-O subsection has no compacted output offset")?,
-                )
-                .context("Mach-O subsection output offset does not fit usize")?;
+                // `ranges` are sorted in input order and `copied_end` is the compacted end of
+                // the preceding range. Advancing that cursor avoids re-scanning every earlier
+                // atom through `output_offset_for_input` for each copied range.
+                let output_offset = subsection.alignment.align_up_usize(copied_end);
                 let span_size = input_end
                     .checked_sub(input_start)
                     .context("Mach-O subsection has an invalid range")?;
@@ -3800,7 +3818,7 @@ fn write_chained_fixup_table(
 }
 
 fn write_uuid(layout: &MachOLayout, sized_output: &mut SizedOutput<impl OutputFileData>) -> Result {
-    verbose_timing_phase!("Write UUID");
+    timing_phase!("Hash Mach-O UUID");
 
     let hash = blake3::Hasher::new()
         .update_rayon(&sized_output.out)
@@ -3838,7 +3856,7 @@ fn write_code_signature_metadata(
     layout: &MachOLayout,
     sized_output: &mut SizedOutput<impl OutputFileData>,
 ) -> Result {
-    verbose_timing_phase!("Write code signature metadata");
+    timing_phase!("Write Mach-O code signature metadata");
 
     let code_signature_section = layout
         .section_layouts
@@ -3905,7 +3923,7 @@ fn write_code_signature_hashes(
     layout: &MachOLayout,
     sized_output: &mut SizedOutput<impl OutputFileData>,
 ) -> Result {
-    verbose_timing_phase!("Write code signature hashes");
+    timing_phase!("Hash Mach-O code signature");
 
     let code_signature_section = layout
         .section_layouts

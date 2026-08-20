@@ -1,5 +1,10 @@
 use crate::args::CounterKind;
 
+pub(crate) struct CounterReading {
+    pub(crate) kind: CounterKind,
+    pub(crate) value: u64,
+}
+
 pub(crate) struct CounterList {}
 
 impl CounterList {
@@ -12,7 +17,7 @@ impl CounterList {
     }
 
     #[allow(clippy::unused_self)]
-    pub(crate) fn disable_and_read(&self) -> Vec<u64> {
+    pub(crate) fn disable_and_read(&self) -> Vec<CounterReading> {
         let _ = self;
         Vec::new()
     }

@@ -17,6 +17,40 @@ manifest and separate wall-time versus resource measurements, see
 [`benchmarks/macos-arm64.md`](benchmarks/macos-arm64.md). It intentionally records no benchmark
 values until durable capture inputs and complete measurements exist.
 
+For repeatable source-build comparisons, use the standard-library Python runner in
+[`benchmarks/cargo_link_benchmark.py`](benchmarks/cargo_link_benchmark.py) with a checked-in
+workload profile such as [`benchmarks/pi-agent-headless.benchmark.json`](benchmarks/pi-agent-headless.benchmark.json)
+or [`benchmarks/e.benchmark.json`](benchmarks/e.benchmark.json).
+It measures a fresh Cargo target, a Cargo incremental rebuild after a controlled source edit, and
+direct replays of that incremental final-link argv. This separates Rust/LTO rebuild time from the
+incremental linker target. It records Apple-ld64/Wild linker-selection evidence and validates the
+resulting ARM64 Mach-O header. The runner copies the source checkout to a disposable sibling and
+never mutates it. Rustc deletes the final temporary codegen object after ordinary links, so the
+unmeasured direct-link capture uses a separate disposable `-C save-temps` rebuild. See
+`python3 benchmarks/cargo_link_benchmark.py --help` for the required result path and opt-in goal
+enforcement. Its default Wild path is `target/release/wild`; do not use the unoptimized `ci`
+profile for a wall-time comparison.
+
+Each workload's `incremental_mutation` is an exact append or exact one-occurrence replacement.
+Prefer a same-size replacement that changes a real emitted byte over a comment-only edit; that
+keeps the incremental target representative while allowing a future stable-layout linker fast path
+to prove that layout, rather than source semantics, remains unchanged.
+
+For the current fast-iteration workload, build the optimized linker and run `e` as follows:
+
+```sh
+cargo +nightly-2026-07-24 build --release -p wild-linker --features macho --bin wild
+python3 benchmarks/cargo_link_benchmark.py \
+  --config benchmarks/e.benchmark.json \
+  --workspace ~/d/e \
+  --output ~/d/wild-benchmark-data/e-$(date +%F).json
+```
+
+Use `--enforce-goals` only in a gating job: it requires Wild's fresh-Cargo wall time to be at most
+1.05× Apple ld64 and Wild's direct changed-source final link to be at most 0.50× Apple ld64. The
+Cargo-incremental ratio remains in the report as context, but does not conflate compiler/LTO work
+with the linker's own target.
+
 ### Preparing the "run-with" files
 
 For benchmarking the linker, it's preferable to run just the linker, not the whole build process.
@@ -307,6 +341,19 @@ If a benchmark has shown a significant increase in say CPU cycles or instruction
 useful to check which phase or phases that increase has occurred in. You can get per-phase cycle and
 instruction counts by running with `--time=cycles,instructions`. To see the full list of counters,
 search `args.rs` for "branch-misses".
+
+For a scriptable report, use `--time=json` (or, for example,
+`--time=json,cycles,instructions`). It writes one JSON Lines record to stdout as each phase
+completes. Each record has a stable `schema_version`, `event`, `output`, `name`, `wall_time_ns`,
+and `counters` array. Each counter is an object with stable
+`name` and `value` fields; unavailable counters are omitted. Parallel phase records can complete
+in a different order between runs. The output path makes a mixed Cargo log distinguish the final
+`pi-agent-headless` link from build-script, dependency, and incremental relinks. This is
+intentionally opt-in, like the existing human timing tree.
+
+The ARM64 Mach-O writer has specific phases for export-trie construction, object copying, dynamic
+tables, unwind tables, chained fixups, UUID hashing, and code-signature hashing. Start with this
+view for a saved Cargo replay before collecting a Perfetto trace or a sampled profile.
 
 ### Perfetto
 

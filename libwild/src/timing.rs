@@ -1,10 +1,14 @@
 //! Code for reporting how long each phase of linking takes when the --time argument is supplied.
 
+#[cfg(test)]
 use crate::args::CounterKind;
+use crate::args::TimingOptions;
+use crate::args::TimingOutput;
 use crate::env;
 use crate::error::AlreadyInitialised;
 use crate::error::Result;
 use crate::perf::CounterList;
+use crate::perf::CounterReading;
 use anyhow::Context;
 use anyhow::anyhow;
 use crossbeam_queue::ArrayQueue;
@@ -55,6 +59,8 @@ macro_rules! verbose_timing_phase {
 
 struct TimingLayer {
     counter_pool: Option<ArrayQueue<CounterList>>,
+    output: TimingOutput,
+    output_path: String,
 }
 
 struct Data {
@@ -189,17 +195,25 @@ where
                 parent_child_count,
             };
 
-            println!("{indent}{reading} {name}{}", data.attributes_string);
+            match self.output {
+                TimingOutput::Text => {
+                    println!("{indent}{reading} {name}{}", data.attributes_string);
+                }
+                TimingOutput::Json => print_json_phase(&self.output_path, name, &reading),
+            }
         }
     }
 }
 
-pub(crate) fn init_tracing(opts: &[CounterKind]) -> Result<(), AlreadyInitialised> {
+pub(crate) fn init_tracing(
+    options: &TimingOptions,
+    output_path: &std::path::Path,
+) -> Result<(), AlreadyInitialised> {
     use tracing_subscriber::prelude::*;
 
     let mut counter_pool = None;
 
-    if !opts.is_empty() {
+    if !options.counters.is_empty() {
         // Our pool size limits the depth of nested measurements. At the time of writing, we don't
         // have more than 4 levels. Note, we need to create all counters now and can't create more
         // on-demand, since once our worker threads are started, any newly created counters won't
@@ -208,21 +222,83 @@ pub(crate) fn init_tracing(opts: &[CounterKind]) -> Result<(), AlreadyInitialise
 
         let pool = ArrayQueue::new(pool_size);
         for _ in 0..pool_size {
-            let _ = pool.push(CounterList::from_kinds(opts));
+            let _ = pool.push(CounterList::from_kinds(&options.counters));
         }
 
         counter_pool = Some(pool);
     }
 
-    let layer = TimingLayer { counter_pool };
+    let layer = TimingLayer {
+        counter_pool,
+        output: options.output,
+        output_path: output_path.to_string_lossy().into_owned(),
+    };
 
     let subscriber = tracing_subscriber::Registry::default().with(layer);
     tracing::subscriber::set_global_default(subscriber).map_err(|_| AlreadyInitialised)
 }
 
+/// Writes one `--time=json` record. The field names and their order are part of the command-line
+/// contract: downstream tools may parse these JSON Lines without scraping the human timing tree.
+fn print_json_phase(output_path: &str, name: &str, reading: &Reading) {
+    println!("{}", json_phase_record(output_path, name, reading));
+}
+
+fn json_phase_record(output_path: &str, name: &str, reading: &Reading) -> String {
+    use std::fmt::Write as _;
+
+    let mut line = String::from("{\"schema_version\":1,\"event\":\"phase\",\"output\":");
+    write_json_string(&mut line, output_path).unwrap();
+    line.push_str(",\"name\":");
+    write_json_string(&mut line, name).unwrap();
+    write!(
+        line,
+        ",\"wall_time_ns\":{},\"counters\":[",
+        reading.wall.as_nanos()
+    )
+    .unwrap();
+    for (index, value) in reading.counter_values.iter().enumerate() {
+        if index != 0 {
+            line.push(',');
+        }
+        write!(
+            line,
+            "{{\"name\":\"{}\",\"value\":{}}}",
+            value.kind.name(),
+            value.value
+        )
+        .unwrap();
+    }
+    line.push_str("]}");
+    line
+}
+
+/// Escapes a string according to JSON's string grammar without bringing a serialization
+/// dependency into the linker's hot dependency graph.
+fn write_json_string(out: &mut String, value: &str) -> std::fmt::Result {
+    use std::fmt::Write as _;
+
+    out.push('\"');
+    for character in value.chars() {
+        match character {
+            '\"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0C}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            character if character.is_control() => write!(out, "\\u{:04x}", character as u32)?,
+            character => out.push(character),
+        }
+    }
+    out.push('\"');
+    Ok(())
+}
+
 struct Reading {
     wall: Duration,
-    counter_values: Vec<u64>,
+    counter_values: Vec<CounterReading>,
 }
 
 struct Indent {
@@ -268,7 +344,7 @@ impl Display for Reading {
                 } else {
                     write!(f, ", ")?;
                 }
-                write!(f, "{value}")?;
+                write!(f, "{}", value.value)?;
             }
             write!(f, ")")?;
         }
@@ -279,6 +355,34 @@ impl Display for Reading {
 
 fn perfetto_output_file() -> Option<PathBuf> {
     env::var(PERFETTO_ENV_VAR).ok().map(PathBuf::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_string_uses_json_escapes() {
+        let mut out = String::new();
+        write_json_string(&mut out, "Mach-O \"phase\"\\\n\u{0008}").unwrap();
+        assert_eq!(out, "\"Mach-O \\\"phase\\\"\\\\\\n\\b\"");
+    }
+
+    #[test]
+    fn json_phase_record_has_stable_fields() {
+        let reading = Reading {
+            wall: Duration::from_nanos(42),
+            counter_values: vec![CounterReading {
+                kind: CounterKind::Cycles,
+                value: 7,
+            }],
+        };
+
+        assert_eq!(
+            json_phase_record("target/release/pi-agent-headless", "Hash Mach-O UUID", &reading),
+            "{\"schema_version\":1,\"event\":\"phase\",\"output\":\"target/release/pi-agent-headless\",\"name\":\"Hash Mach-O UUID\",\"wall_time_ns\":42,\"counters\":[{\"name\":\"cycles\",\"value\":7}]}"
+        );
+    }
 }
 
 pub(crate) fn finalise_perfetto_trace() -> Result {

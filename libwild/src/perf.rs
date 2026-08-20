@@ -1,7 +1,12 @@
 use crate::args::CounterKind;
 
+pub(crate) struct CounterReading {
+    pub(crate) kind: CounterKind,
+    pub(crate) value: u64,
+}
+
 pub(crate) struct CounterList {
-    counters: Vec<perf_event::Counter>,
+    counters: Vec<(CounterKind, perf_event::Counter)>,
 }
 
 impl CounterList {
@@ -14,6 +19,7 @@ impl CounterList {
                     .kind(counter_to_perf_event(*kind))
                     .build()
                     .ok()
+                    .map(|counter| (*kind, counter))
             })
             .collect();
 
@@ -21,16 +27,22 @@ impl CounterList {
     }
 
     pub(crate) fn start(&mut self) {
-        for counter in &mut self.counters {
+        for (_, counter) in &mut self.counters {
             let _ = counter.reset();
             let _ = counter.enable();
         }
     }
 
-    pub(crate) fn disable_and_read(&mut self) -> Vec<u64> {
+    pub(crate) fn disable_and_read(&mut self) -> Vec<CounterReading> {
         self.counters
             .iter_mut()
-            .filter_map(|counter| counter.disable().ok().and_then(|()| counter.read().ok()))
+            .filter_map(|(kind, counter)| {
+                counter
+                    .disable()
+                    .ok()
+                    .and_then(|()| counter.read().ok())
+                    .map(|value| CounterReading { kind: *kind, value })
+            })
             .collect()
     }
 }

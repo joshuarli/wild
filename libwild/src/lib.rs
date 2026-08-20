@@ -153,7 +153,7 @@ pub fn run(mut args: Args) -> error::Result {
 /// is optional. If it isn't called, no tracing-based features will function. e.g. --time.
 pub fn setup_tracing(args: &Args) -> Result<(), AlreadyInitialised> {
     if let Some(opts) = args.common().time_phase_options.as_ref() {
-        timing::init_tracing(opts)
+        timing::init_tracing(opts, args.common().output.as_ref())
     } else if args.common().print_allocations.is_some() {
         debug_trace::init()
     } else {

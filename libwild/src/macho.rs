@@ -48,6 +48,7 @@ use crate::program_segments::ProgramSegments;
 use crate::resolution;
 use crate::symbol_db::SymbolId;
 use crate::symbol_db::Visibility;
+use crate::timing_phase;
 use crate::value_flags::ValueFlags;
 use crate::verbose_timing_phase;
 use anyhow::Context;
@@ -396,7 +397,8 @@ pub(crate) fn paired_relocations(relocations: &[Relocation]) -> PairedRelocation
 /// Atom-level dead stripping loads one atom at a time, while Mach-O stores relocations for the
 /// whole section. Re-parsing the full relocation list for every live atom turns a section with
 /// many Rust functions into quadratic work. The input bytes cannot change while linking, so the
-/// first atom can validate and normalize the records for every later atom in the same section.
+/// first atom can validate, normalize, and address-order the records for every later atom in the
+/// same section. Each atom then selects its own relocation subrange with two binary searches.
 #[derive(Default)]
 pub(crate) struct MachORelocationCache {
     sections: Vec<Option<Vec<NormalizedRelocation>>>,
@@ -413,7 +415,13 @@ impl MachORelocationCache {
             self.sections.resize_with(section + 1, || None);
         }
         if self.sections[section].is_none() {
-            self.sections[section] = Some(paired_relocations(relocations).collect::<Result<_>>()?);
+            let mut relocations = paired_relocations(relocations).collect::<Result<Vec<_>>>()?;
+            // Mach-O commonly stores relocations in descending address order. Atom liveness is
+            // keyed by source range, so address order turns the per-atom scan into a binary-range
+            // lookup. Keep equal-address records stable: their graph effects are independent, but
+            // their input order remains useful when diagnosing malformed producer output.
+            relocations.sort_by_key(|relocation| relocation.info.r_address);
+            self.sections[section] = Some(relocations);
         }
         Ok(())
     }
@@ -423,6 +431,19 @@ impl MachORelocationCache {
             .get(section_index.0)
             .and_then(Option::as_deref)
             .expect("Mach-O relocation cache must be populated before use")
+    }
+
+    fn for_range(
+        &self,
+        section_index: object::SectionIndex,
+        range: &Range<u64>,
+    ) -> &[NormalizedRelocation] {
+        let relocations = self.for_section(section_index);
+        let start = relocations
+            .partition_point(|relocation| u64::from(relocation.info.r_address) < range.start);
+        let end = relocations
+            .partition_point(|relocation| u64::from(relocation.info.r_address) < range.end);
+        &relocations[start..end]
     }
 }
 
@@ -1184,6 +1205,35 @@ struct RegularObject<'data> {
     /// library has enough symbols that rebuilding and then coalescing this list for every graph
     /// edge turns a valid proc-macro link quadratic.
     atom_starts: Vec<Vec<u64>>,
+    /// Public definitions, grouped by input section and sorted by their input offsets.
+    ///
+    /// `-dead_strip` loads Mach-O input one atom at a time. Exporting an atom used to scan the
+    /// complete input symbol table, which made a Rust object with thousands of atoms repeatedly
+    /// revisit the same local and undefined symbols. Keep the parse-time index separate from
+    /// `atom_starts`: a relocation can coalesce atom boundaries, while this index still selects
+    /// all public symbols in the live input range.
+    exported_symbols_by_section: Vec<Vec<ExportedSymbol>>,
+}
+
+/// A public, section-defined Mach-O symbol eligible for executable export after dead stripping.
+/// The symbol index remains in input order; the containing vector is sorted only to select a
+/// live atom's input range without scanning the object's complete symbol table.
+#[derive(Debug, Clone, Copy)]
+struct ExportedSymbol {
+    input_offset: u64,
+    symbol_index: SymbolIndex,
+}
+
+fn exported_symbols_in_range<'symbols>(
+    exported_symbols: &'symbols [ExportedSymbol],
+    range: Option<&Range<u64>>,
+) -> &'symbols [ExportedSymbol] {
+    let Some(range) = range else {
+        return exported_symbols;
+    };
+    let start = exported_symbols.partition_point(|symbol| symbol.input_offset < range.start);
+    let end = exported_symbols.partition_point(|symbol| symbol.input_offset < range.end);
+    &exported_symbols[start..end]
 }
 
 impl<'data> platform::ObjectFile<'data> for File<'data> {
@@ -1267,6 +1317,7 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
             ObjectKind::Regular(RegularObject {
                 sections: sections.ok_or("Missing segment command")?,
                 atom_starts: Vec::new(),
+                exported_symbols_by_section: Vec::new(),
             })
         };
 
@@ -1277,6 +1328,13 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
             flags: header.flags(LE),
             kind,
         };
+        if !file.is_dynamic() {
+            let exported_symbols_by_section = file.compute_exported_symbols_by_section()?;
+            let ObjectKind::Regular(regular) = &mut file.kind else {
+                unreachable!("only regular Mach-O objects may have public export symbols");
+            };
+            regular.exported_symbols_by_section = exported_symbols_by_section;
+        }
         if file.uses_subsections_via_symbols() {
             let atom_starts = file.compute_atom_starts()?;
             let ObjectKind::Regular(regular) = &mut file.kind else {
@@ -2537,46 +2595,54 @@ impl platform::Platform for MachO {
                         scope,
                     );
                 }
-                let range = object.object.atom_range(section_index, start)?;
-                if !object.load_subsection::<A>(
-                    common,
-                    section_index,
-                    range.clone(),
-                    resources,
-                    queue,
-                    scope,
-                )? {
+                let range = {
+                    timing_phase!("Find Mach-O atom range");
+                    object.object.atom_range(section_index, start)?
+                };
+                let loaded = {
+                    timing_phase!("Record Mach-O live atom");
+                    object.load_subsection::<A>(
+                        common,
+                        section_index,
+                        range.clone(),
+                        resources,
+                        queue,
+                        scope,
+                    )?
+                };
+                if !loaded {
                     return Ok(());
                 }
-                export_live_symbols_in_section(
-                    object,
-                    common,
-                    resources,
-                    section_index,
-                    Some(&range),
-                )?;
+                {
+                    timing_phase!("Export Mach-O live atom symbols");
+                    export_live_symbols_in_section(
+                        object,
+                        common,
+                        resources,
+                        section_index,
+                        Some(&range),
+                    )?;
+                }
 
                 // A relocation belongs to the atom containing its source address. Do not let a
                 // dead neighbour retain targets merely because Mach-O stores relocations beside
                 // the complete input section.
-                let raw_relocations = object.relocations(section_index)?.relocations;
-                object
-                    .format_specific
-                    .cache(section_index, raw_relocations)?;
-                let relocation_count = object.format_specific.for_section(section_index).len();
-                for relocation_index in 0..relocation_count {
-                    let relocation = object.format_specific.for_section(section_index)[relocation_index];
-                    if !range.contains(&u64::from(relocation.info.r_address)) {
-                        continue;
+                {
+                    timing_phase!("Traverse Mach-O atom relocations");
+                    let raw_relocations = object.relocations(section_index)?.relocations;
+                    object
+                        .format_specific
+                        .cache(section_index, raw_relocations)?;
+                    for &relocation in object.format_specific.for_range(section_index, &range) {
+                        process_normalized_relocation::<A>(
+                            object,
+                            relocation,
+                            section_index,
+                            resources,
+                            queue,
+                            scope,
+                        )?;
                     }
-                    process_normalized_relocation::<A>(
-                        object,
-                        relocation,
-                        section_index,
-                        resources,
-                        queue,
-                        scope,
-                    )?;
                 }
                 Ok(())
             }
@@ -4326,25 +4392,13 @@ fn export_live_symbols_in_section<'data>(
         return Ok(());
     }
 
-    for (symbol_index, symbol) in object.object.enumerate_symbols() {
-        if object.object.symbol_section(symbol, symbol_index)? != Some(section_index)
-            || platform::Symbol::is_undefined(symbol)
-            || symbol.is_local()
-            || symbol.visibility() != Visibility::Default
-        {
-            continue;
-        }
-
-        let offset = object
-            .object
-            .symbol_offset_in_section(symbol, section_index)?;
-        if let Some(atom) = atom
-            && !(atom.start <= offset && offset < atom.end)
-        {
-            continue;
-        }
-
-        let symbol_id = object.symbol_id_range.input_to_id(symbol_index);
+    for exported_symbol in object
+        .object
+        .exported_symbols_in_range(section_index, atom)?
+    {
+        let symbol_id = object
+            .symbol_id_range
+            .input_to_id(exported_symbol.symbol_index);
         if !resources.symbol_db.is_canonical(symbol_id) {
             continue;
         }
@@ -4642,6 +4696,54 @@ impl<'data> File<'data> {
             .context("Mach-O subsection atom section index out of range")?)
     }
 
+    /// Returns the public definitions that belong to one live input range. Atom-level dead
+    /// stripping supplies that range for `MH_SUBSECTIONS_VIA_SYMBOLS` inputs; section-level
+    /// liveness passes `None` and receives every public definition in the section.
+    fn exported_symbols_in_range(
+        &self,
+        section_index: object::SectionIndex,
+        range: Option<&Range<u64>>,
+    ) -> Result<&[ExportedSymbol]> {
+        let ObjectKind::Regular(regular) = &self.kind else {
+            bail!("dynamic Mach-O input has no public dead-strip export index");
+        };
+        let symbols = regular
+            .exported_symbols_by_section
+            .get(section_index.0)
+            .context("Mach-O export symbol section index out of range")?;
+        Ok(exported_symbols_in_range(symbols, range))
+    }
+
+    /// Builds the structural part of `export_live_symbols_in_section` once, while parsing an
+    /// immutable object. Canonical-definition checks remain in graph traversal because they are
+    /// a property of the complete input set, not this one object.
+    fn compute_exported_symbols_by_section(&self) -> Result<Vec<Vec<ExportedSymbol>>> {
+        let mut exported_symbols_by_section = vec![Vec::new(); self.sections().len()];
+        for (symbol_index, symbol) in self.enumerate_symbols() {
+            if platform::Symbol::is_undefined(symbol)
+                || symbol.is_local()
+                || symbol.visibility() != Visibility::Default
+            {
+                continue;
+            }
+            let Some(section_index) = self.symbol_section(symbol, symbol_index)? else {
+                continue;
+            };
+            let input_offset = self.symbol_offset_in_section(symbol, section_index)?;
+            exported_symbols_by_section
+                .get_mut(section_index.0)
+                .context("Mach-O export symbol section index out of range")?
+                .push(ExportedSymbol {
+                    input_offset,
+                    symbol_index,
+                });
+        }
+        for exported_symbols in &mut exported_symbols_by_section {
+            exported_symbols.sort_by_key(|symbol| symbol.input_offset);
+        }
+        Ok(exported_symbols_by_section)
+    }
+
     fn compute_atom_starts(&self) -> Result<Vec<Vec<u64>>> {
         let mut all_starts = vec![vec![0]; self.sections().len()];
         for (symbol_index, symbol) in self.enumerate_symbols() {
@@ -4735,6 +4837,44 @@ mod tests {
     use crate::args::RelocationModel;
     use crate::output_kind::OutputKind;
     use crate::output_section_id::OutputSections;
+
+    #[test]
+    fn exported_symbol_index_selects_only_the_live_atom_range() {
+        let symbols = [
+            ExportedSymbol {
+                input_offset: 0,
+                symbol_index: SymbolIndex(8),
+            },
+            ExportedSymbol {
+                input_offset: 4,
+                symbol_index: SymbolIndex(3),
+            },
+            ExportedSymbol {
+                input_offset: 4,
+                symbol_index: SymbolIndex(7),
+            },
+            ExportedSymbol {
+                input_offset: 16,
+                symbol_index: SymbolIndex(1),
+            },
+        ];
+
+        let atom = 4..16;
+        assert_eq!(
+            exported_symbols_in_range(&symbols, Some(&atom))
+                .iter()
+                .map(|symbol| symbol.symbol_index.0)
+                .collect_vec(),
+            vec![3, 7]
+        );
+        assert_eq!(
+            exported_symbols_in_range(&symbols, None)
+                .iter()
+                .map(|symbol| symbol.symbol_index.0)
+                .collect_vec(),
+            vec![8, 3, 7, 1]
+        );
+    }
 
     /// Builds the smallest regular ARM64 Mach-O object with one indirect-symbol-backed section.
     /// Clang intentionally does not produce these sections for a relocatable object, so retain a
@@ -5129,6 +5269,36 @@ mod tests {
         assert_eq!(
             cache.for_section(section_index)[0].info.r_type,
             macho::ARM64_RELOC_BRANCH26
+        );
+    }
+
+    #[test]
+    fn relocation_cache_selects_only_the_current_atom_range() {
+        let relocations = [
+            raw_relocation(20, 1, true, 2, true, macho::ARM64_RELOC_BRANCH26),
+            raw_relocation(4, 2, true, 2, true, macho::ARM64_RELOC_BRANCH26),
+            raw_relocation(12, 3, true, 2, true, macho::ARM64_RELOC_BRANCH26),
+        ];
+        let section_index = object::SectionIndex(0);
+        let mut cache = MachORelocationCache::default();
+
+        cache.cache(section_index, &relocations).unwrap();
+
+        assert_eq!(
+            cache
+                .for_range(section_index, &(8..16))
+                .iter()
+                .map(|relocation| relocation.info.r_address)
+                .collect_vec(),
+            vec![12]
+        );
+        assert_eq!(
+            cache
+                .for_range(section_index, &(0..32))
+                .iter()
+                .map(|relocation| relocation.info.r_address)
+                .collect_vec(),
+            vec![4, 12, 20]
         );
     }
 

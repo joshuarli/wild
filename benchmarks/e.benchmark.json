@@ -1,0 +1,19 @@
+{
+  "schema_version": "cargo-link-workload/v1",
+  "name": "e",
+  "target": "aarch64-apple-darwin",
+  "profile": "release",
+  "cargo_arguments": ["--bin", "e"],
+  "artifact": "{target}/{profile}/e",
+  "macho_file_type": 2,
+  "deployment_target": "11.0",
+  "incremental_mutation": {
+    "path": "src/main.rs",
+    "replace_before": "println!(\"e {}\", env!(\"CARGO_PKG_VERSION\"));",
+    "replace_after": "println!(\"E {}\", env!(\"CARGO_PKG_VERSION\"));"
+  },
+  "goals": {
+    "cold_wild_over_apple_max": 1.05,
+    "incremental_wild_over_apple_max": 0.5
+  }
+}

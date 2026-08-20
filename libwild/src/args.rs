@@ -93,9 +93,9 @@ pub struct CommonArgs {
     pub(crate) numeric_experiments: Vec<Option<u64>>,
     pub(crate) version_mode: VersionMode,
 
-    /// If `Some`, then we'll time how long each phase takes. We'll also measure the specified
-    /// counters, if any.
-    pub(crate) time_phase_options: Option<Vec<CounterKind>>,
+    /// If `Some`, then we'll time how long each phase takes. The output format and any requested
+    /// counters are kept together so that `--time=json` has a stable, self-contained contract.
+    pub(crate) time_phase_options: Option<TimingOptions>,
 
     /// Warnings that we encountered either during argument parsing, or during subsequent linker
     /// execution based on those arguments.
@@ -288,7 +288,7 @@ pub(crate) enum VersionMode {
     ExitAfterPrint,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CounterKind {
     Cycles,
     Instructions,
@@ -299,6 +299,38 @@ pub enum CounterKind {
     PageFaultsMajor,
     L1dRead,
     L1dMiss,
+}
+
+impl CounterKind {
+    /// Stable counter name used by `--time=json` records.
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            CounterKind::Cycles => "cycles",
+            CounterKind::Instructions => "instructions",
+            CounterKind::CacheMisses => "cache-misses",
+            CounterKind::BranchMisses => "branch-misses",
+            CounterKind::PageFaults => "page-faults",
+            CounterKind::PageFaultsMinor => "page-faults-minor",
+            CounterKind::PageFaultsMajor => "page-faults-major",
+            CounterKind::L1dRead => "l1d-read",
+            CounterKind::L1dMiss => "l1d-miss",
+        }
+    }
+}
+
+/// Output and counter selection for the opt-in linker timing instrumentation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TimingOptions {
+    pub(crate) output: TimingOutput,
+    pub(crate) counters: Vec<CounterKind>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TimingOutput {
+    /// The existing indented, human-readable timing tree.
+    Text,
+    /// One stable JSON object per completed phase, written to stdout.
+    Json,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1435,8 +1467,23 @@ fn arguments_from_string(input: &str) -> Result<Vec<String>> {
     Ok(out)
 }
 
-fn parse_time_phase_options(input: &str) -> Result<Vec<CounterKind>> {
-    input.split(',').map(|s| s.parse()).collect()
+fn parse_time_phase_options(input: &str) -> Result<TimingOptions> {
+    let mut output = TimingOutput::Text;
+    let mut counters = Vec::new();
+
+    for option in input.split(',') {
+        if option == "json" {
+            ensure!(
+                output == TimingOutput::Text,
+                "Timing output format `json` was specified more than once"
+            );
+            output = TimingOutput::Json;
+        } else {
+            counters.push(option.parse()?);
+        }
+    }
+
+    Ok(TimingOptions { output, counters })
 }
 
 impl std::str::FromStr for CounterKind {
@@ -1504,11 +1551,14 @@ fn declare_common_args<T: platform::Args>(parser: &mut ArgumentParser<T>) {
     parser
         .declare_with_optional_param()
         .long("time")
-        .help("Show timing information")
+        .help("Show timing information (use --time=json for JSON Lines)")
         .execute(|args, _modifier_stack, value| {
             args.common_mut().time_phase_options = match value {
                 Some(v) => Some(parse_time_phase_options(v)?),
-                None => Some(Vec::new()),
+                None => Some(TimingOptions {
+                    output: TimingOutput::Text,
+                    counters: Vec::new(),
+                }),
             };
             Ok(())
         });
@@ -1610,5 +1660,28 @@ mod tests {
 
         assert!(Args::new(|| ["ld.wild", "-flavor", "invalid"].into_iter()).is_err());
         assert!(Args::new(|| ["ld.wild", "-flavor"].into_iter()).is_err());
+    }
+
+    #[test]
+    fn parse_json_timing_options() {
+        let mut args = Args::new(|| ["wild", "-flavor", "darwin"].into_iter()).unwrap();
+        args.parse(|| {
+            ["wild", "-flavor", "darwin", "--time=json,cycles"]
+                .into_iter()
+        })
+        .unwrap();
+
+        assert_eq!(
+            args.common().time_phase_options,
+            Some(TimingOptions {
+                output: TimingOutput::Json,
+                counters: vec![CounterKind::Cycles],
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_json_timing_option() {
+        assert!(parse_time_phase_options("json,json").is_err());
     }
 }

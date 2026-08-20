@@ -939,7 +939,14 @@ pub(crate) struct EpilogueLayout<P: Platform> {
 #[derive(Debug, Clone)]
 pub(crate) struct LiveSubsection {
     pub(crate) range: Range<u64>,
-    alignment: Alignment,
+    /// Alignment required at this atom's compacted output position. Writers that already walk
+    /// these ranges in input order can advance this cursor directly instead of repeatedly asking
+    /// `output_offset_for_input` to rescan every earlier atom.
+    pub(crate) alignment: Alignment,
+    /// Compacted output offset, assigned once after graph traversal has sorted every live atom.
+    /// Relocation and symbol writers can then locate an atom by input offset without summing all
+    /// preceding atoms for every reference.
+    output_offset: u64,
 }
 
 #[derive(Debug)]
@@ -1372,6 +1379,18 @@ pub(crate) struct ObjectLayoutState<'data, P: Platform> {
     /// See [`ObjectLayout::live_subsections`]. Entries are created only for sections whose input
     /// format explicitly opts into atom-level dead stripping.
     live_subsections: Vec<Option<Vec<LiveSubsection>>>,
+
+    /// Starts of atom ranges already queued for each dead-stripped section. Graph traversal
+    /// discovers atoms in reference order, which is usually unrelated to source order. Keep the
+    /// fast duplicate check separate from the range vector so recording a new atom stays O(1);
+    /// `finalise_live_subsection_sizes` sorts and validates the vector once after traversal.
+    live_subsection_ends_by_start: Vec<Option<HashMap<u64, u64>>>,
+
+    /// `create_finalise_sizes_ext` has a small number of format hooks that inspect live atoms
+    /// before `finalise_sizes` has sorted them. Keep that boundary explicit so those hooks retain
+    /// a correct linear membership query, while all later symbol and relocation work uses the
+    /// sorted binary-search path.
+    live_subsections_finalised: bool,
 
     /// Mapping from sections to their corresponding relocation section.
     pub(crate) relocations: P::RelocationSections,
@@ -4083,6 +4102,8 @@ fn new_object_layout_state<P: Platform>(
         object: input_state.common.object,
         sections: input_state.sections,
         live_subsections: vec![None; input_state.common.object.num_sections()],
+        live_subsection_ends_by_start: vec![None; input_state.common.object.num_sections()],
+        live_subsections_finalised: false,
         relocations: input_state.relocations,
         format_specific: P::new_object_layout_state_ext(input_state.format_specific),
         section_relax_deltas: RelaxDeltaMap::new(),
@@ -4297,9 +4318,8 @@ impl<'data, P: Platform> ObjectLayoutState<'data, P> {
     /// span. Formats that do not opt into this keep using [`Self::handle_section_load_request`]
     /// and never populate `live_subsections`.
     ///
-    /// The ranges are kept in input order even when graph traversal discovers atoms in another
-    /// order. That order is the contract used later by symbol resolution, relocation writing, and
-    /// raw-data copying.
+    /// Graph traversal records ranges in discovery order, then finalisation sorts them into input
+    /// order before symbol resolution, relocation writing, and raw-data copying consume them.
     pub(crate) fn load_subsection<'scope, A: Arch<Platform = P>>(
         &mut self,
         common: &mut CommonGroupState<'data, P>,
@@ -4319,39 +4339,43 @@ impl<'data, P: Platform> ObjectLayoutState<'data, P> {
         let subsection = LiveSubsection {
             alignment: subsection_alignment(section_alignment, range.start),
             range: range.clone(),
+            output_offset: 0,
         };
-        let new_size = {
+        {
+            let ends_by_start = self
+                .live_subsection_ends_by_start
+                .get_mut(section_index.0)
+                .context("subsection refers to a section outside the object")?
+                .get_or_insert_with(HashMap::new);
+            if let Some(previous_end) = ends_by_start.insert(range.start, range.end) {
+                ensure!(
+                    previous_end == range.end,
+                    "live input subsections with the same start have different ends"
+                );
+                return Ok(false);
+            }
+
             let ranges = self
                 .live_subsections
                 .get_mut(section_index.0)
                 .context("subsection refers to a section outside the object")?
                 .get_or_insert_with(Vec::new);
-
-            if ranges.iter().any(|existing| existing.range == range) {
-                return Ok(false);
-            }
-
-            let insertion_index = ranges.partition_point(|existing| existing.range.start < range.start);
-            if insertion_index > 0 && ranges[insertion_index - 1].range.end > range.start {
-                bail!("overlapping live input subsections are not representable");
-            }
-            if ranges
-                .get(insertion_index)
-                .is_some_and(|next| range.end > next.range.start)
-            {
-                bail!("overlapping live input subsections are not representable");
-            }
-            ranges.insert(insertion_index, subsection);
-
-            live_subsection_size(ranges)?
-        };
+            ranges.push(subsection);
+        }
 
         let part_id = self.section_part_id(section_index, &resources.symbol_db.section_part_ids);
-        let new_section = Section { size: new_size };
-        let (old_capacity, first_subsection, unloaded) = match self.sections[section_index.0] {
-            SectionSlot::Unloaded(unloaded) | SectionSlot::MustLoad(unloaded) => (0, true, unloaded),
+        let (section, first_subsection, unloaded) = match self.sections[section_index.0] {
+            SectionSlot::Unloaded(unloaded) | SectionSlot::MustLoad(unloaded) => (
+                // We do not know the compacted size until graph traversal has discovered every
+                // atom. Reserve this section's original capacity once, then shrink the common
+                // allocation in `finalise_live_subsection_sizes`. Recomputing the compacted size
+                // after every arbitrary-order atom insertion is quadratic for large Rust objects.
+                Section::create(header, self, part_id)?,
+                true,
+                unloaded,
+            ),
             SectionSlot::Loaded(section) => (
-                section.capacity(part_id, resources.output_sections),
+                section,
                 false,
                 UnloadedSection {
                     last_frame_index: None,
@@ -4364,14 +4388,14 @@ impl<'data, P: Platform> ObjectLayoutState<'data, P> {
                 self.object.section_display_name(section_index),
             ),
         };
-        let new_capacity = new_section.capacity(part_id, resources.output_sections);
-        ensure!(
-            new_capacity >= old_capacity,
-            "loading a subsection reduced its output allocation"
-        );
 
-        self.sections[section_index.0] = SectionSlot::Loaded(new_section);
-        common.allocate(part_id, new_capacity - old_capacity);
+        self.sections[section_index.0] = SectionSlot::Loaded(section);
+        if first_subsection {
+            common.allocate(
+                part_id,
+                section.capacity(part_id, resources.output_sections),
+            );
+        }
         common.store_section_attributes(part_id, header);
 
         if let Some(config) = A::thunk_config()
@@ -4381,7 +4405,7 @@ impl<'data, P: Platform> ObjectLayoutState<'data, P> {
             self.post_gc_primary_bytes += range.end - range.start;
         }
 
-        if first_subsection && new_size > 0 {
+        if first_subsection && range.start != range.end {
             P::non_empty_section_loaded::<A>(self, common, queue, unloaded, resources, scope)?;
         } else if first_subsection
             && P::is_zero_sized_section_content(part_id.output_section_id::<P>())
@@ -4410,10 +4434,15 @@ impl<'data, P: Platform> ObjectLayoutState<'data, P> {
         section_index: SectionIndex,
         input_offset: u64,
     ) -> bool {
-        input_offset_is_live(
-            self.live_subsections.get(section_index.0).and_then(Option::as_deref),
-            input_offset,
-        )
+        let subsections = self
+            .live_subsections
+            .get(section_index.0)
+            .and_then(Option::as_deref);
+        if self.live_subsections_finalised {
+            input_offset_is_live(subsections, input_offset)
+        } else {
+            input_offset_is_live_unsorted(subsections, input_offset)
+        }
     }
 
     fn load_section<'scope, A: Arch<Platform = P>>(
@@ -4525,6 +4554,11 @@ impl<'data, P: Platform> ObjectLayoutState<'data, P> {
         resources: &FinaliseSizesResources<'data, '_, P>,
     ) -> Result {
         common.mem_sizes.resize(output_sections.num_parts());
+        self.finalise_live_subsection_sizes(
+            common,
+            output_sections,
+            &resources.symbol_db.section_part_ids,
+        )?;
         if !resources.symbol_db.args.should_strip_all() {
             self.allocate_symtab_space(common, resources.symbol_db, per_symbol_flags)?;
         }
@@ -4542,6 +4576,38 @@ impl<'data, P: Platform> ObjectLayoutState<'data, P> {
 
         P::finalise_object_sizes(self, common);
 
+        Ok(())
+    }
+
+    /// Replaces the provisional full-section allocations made during atom graph traversal with
+    /// their compacted live sizes. This runs once after graph liveness has settled, avoiding a
+    /// full ordered-range size scan for every inserted atom.
+    fn finalise_live_subsection_sizes(
+        &mut self,
+        common: &mut CommonGroupState<'data, P>,
+        output_sections: &OutputSections<P>,
+        object_part_ids: &[PartId],
+    ) -> Result {
+        for section_index in 0..self.live_subsections.len() {
+            let Some(live_subsections) = self.live_subsections[section_index].as_deref_mut() else {
+                continue;
+            };
+            let compacted_size = assign_live_subsection_output_offsets(live_subsections)?;
+            let part_id = self.section_part_id(SectionIndex(section_index), object_part_ids);
+            let SectionSlot::Loaded(section) = &mut self.sections[section_index] else {
+                bail!("live Mach-O subsection has no loaded section state");
+            };
+            let provisional_capacity = section.capacity(part_id, output_sections);
+            section.size = compacted_size;
+            let compacted_capacity = section.capacity(part_id, output_sections);
+            ensure!(
+                compacted_capacity <= provisional_capacity,
+                "compacted subsection allocation grew beyond its input section"
+            );
+            common.mem_sizes.decrement(part_id, provisional_capacity - compacted_capacity);
+            self.live_subsection_ends_by_start[section_index] = None;
+        }
+        self.live_subsections_finalised = true;
         Ok(())
     }
 
@@ -6238,13 +6304,103 @@ fn subsection_alignment(section_alignment: Alignment, start: u64) -> Alignment {
     }
 }
 
-fn live_subsection_size(subsections: &[LiveSubsection]) -> Result<u64> {
-    subsections.iter().try_fold(0u64, |size, subsection| {
-        let aligned_size = size
+/// Converts graph-discovery order into input order once, immediately before any address or writer
+/// code observes the atom list. The deferred overlap check is equivalent to checking insertion
+/// neighbours in a sorted vector, without making graph traversal repeatedly move and rescan its
+/// already-recorded atoms.
+fn sort_and_validate_live_subsections(subsections: &mut [LiveSubsection]) -> Result {
+    subsections.sort_unstable_by_key(|subsection| subsection.range.start);
+    for adjacent in subsections.windows(2) {
+        ensure!(
+            adjacent[0].range.end <= adjacent[1].range.start,
+            "overlapping live input subsections are not representable"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn finalised_live_subsections_follow_input_order() {
+    let alignment = Alignment::new(1).unwrap();
+    let mut subsections = vec![
+        LiveSubsection {
+            range: 24..32,
+            alignment,
+            output_offset: 0,
+        },
+        LiveSubsection {
+            range: 0..8,
+            alignment,
+            output_offset: 0,
+        },
+        LiveSubsection {
+            range: 16..24,
+            alignment,
+            output_offset: 0,
+        },
+    ];
+
+    // Format-specific finalisation hooks run before the once-only sort, so their membership
+    // query must not mistake discovery order for input order.
+    assert!(input_offset_is_live_unsorted(Some(&subsections), 0));
+    assert!(input_offset_is_live_unsorted(Some(&subsections), 24));
+
+    assert_eq!(
+        assign_live_subsection_output_offsets(&mut subsections).unwrap(),
+        24
+    );
+
+    assert_eq!(
+        subsections
+            .iter()
+            .map(|subsection| subsection.range.clone())
+            .collect_vec(),
+        vec![0..8, 16..24, 24..32]
+    );
+    assert_eq!(
+        subsections
+            .iter()
+            .map(|subsection| subsection.output_offset)
+            .collect_vec(),
+        vec![0, 8, 16]
+    );
+    assert_eq!(output_offset_for_input(Some(&subsections), 16), Some(8));
+    assert_eq!(output_offset_for_input(Some(&subsections), 32), Some(24));
+    assert_eq!(output_offset_for_input(Some(&subsections), 8), None);
+    assert!(input_offset_is_live(Some(&subsections), 16));
+    assert!(!input_offset_is_live(Some(&subsections), 8));
+    assert!(input_range_is_live(Some(&subsections), 16..24));
+    assert!(!input_range_is_live(Some(&subsections), 7..16));
+}
+
+#[test]
+fn finalising_live_subsections_rejects_overlapping_ranges() {
+    let alignment = Alignment::new(1).unwrap();
+    let mut subsections = vec![
+        LiveSubsection {
+            range: 16..32,
+            alignment,
+            output_offset: 0,
+        },
+        LiveSubsection {
+            range: 0..24,
+            alignment,
+            output_offset: 0,
+        },
+    ];
+
+    assert!(sort_and_validate_live_subsections(&mut subsections).is_err());
+}
+
+fn assign_live_subsection_output_offsets(subsections: &mut [LiveSubsection]) -> Result<u64> {
+    sort_and_validate_live_subsections(subsections)?;
+    subsections.iter_mut().try_fold(0u64, |size, subsection| {
+        let output_offset = size
             .checked_add(subsection.alignment.mask())
             .map(|size| size & !subsection.alignment.mask())
             .context("live input subsection alignment overflows")?;
-        aligned_size
+        subsection.output_offset = output_offset;
+        output_offset
             .checked_add(subsection.range.end - subsection.range.start)
             .context("live input subsections exceed u64")
     })
@@ -6258,30 +6414,44 @@ fn output_offset_for_input(
         return Some(input_offset);
     };
 
-    let mut output_offset = 0u64;
-    for (index, subsection) in subsections.iter().enumerate() {
-        output_offset = output_offset
-            .checked_add(subsection.alignment.mask())
-            .map(|offset| offset & !subsection.alignment.mask())?;
-        let range = &subsection.range;
-        if range.start == range.end && input_offset == range.start {
-            return Some(output_offset);
-        }
-        if input_offset >= range.start && input_offset < range.end {
-            return Some(output_offset + input_offset - range.start);
-        }
-        output_offset += range.end - range.start;
-
-        // A label at the end of the final retained atom is a valid zero-size alias for the end
-        // of the compacted section. Do not let the same rule bridge a dead gap between atoms.
-        if index + 1 == subsections.len() && input_offset == range.end {
-            return Some(output_offset);
-        }
+    let index = subsections.partition_point(|subsection| subsection.range.start <= input_offset);
+    let subsection = subsections.get(index.checked_sub(1)?)?;
+    let range = &subsection.range;
+    if range.start == range.end && input_offset == range.start {
+        return Some(subsection.output_offset);
     }
-    None
+    if input_offset < range.end {
+        return Some(subsection.output_offset + input_offset - range.start);
+    }
+    // A label at the end of the final retained atom is a valid zero-size alias for the end of
+    // the compacted section. Do not let the same rule bridge a dead gap between atoms.
+    (index == subsections.len() && input_offset == range.end)
+        .then_some(subsection.output_offset + range.end - range.start)
 }
 
 fn input_offset_is_live(subsections: Option<&[LiveSubsection]>, input_offset: u64) -> bool {
+    let Some(subsections) = subsections else {
+        return true;
+    };
+    let index = subsections.partition_point(|subsection| subsection.range.start <= input_offset);
+    index
+        .checked_sub(1)
+        .and_then(|index| subsections.get(index))
+        .is_some_and(|subsection| {
+            let range = &subsection.range;
+            (range.start == range.end && input_offset == range.start)
+                || input_offset < range.end
+        })
+}
+
+/// A format-finalisation hook can inspect atom liveness before the graph's discovered ranges have
+/// been sorted. This intentionally remains linear and is used only at that early boundary; all
+/// layout and writer queries run after `assign_live_subsection_output_offsets` and use the binary
+/// search above.
+fn input_offset_is_live_unsorted(
+    subsections: Option<&[LiveSubsection]>,
+    input_offset: u64,
+) -> bool {
     let Some(subsections) = subsections else {
         return true;
     };
@@ -6299,12 +6469,14 @@ fn input_range_is_live(
     let Some(subsections) = subsections else {
         return true;
     };
-    subsections.iter().any(|subsection| {
-        let range = &subsection.range;
-        input_range.start >= range.start
-            && input_range.end >= input_range.start
-            && input_range.end <= range.end
-    })
+    let index = subsections
+        .partition_point(|subsection| subsection.range.start <= input_range.start);
+    index
+        .checked_sub(1)
+        .and_then(|index| subsections.get(index))
+        .is_some_and(|subsection| {
+            input_range.end >= input_range.start && input_range.end <= subsection.range.end
+        })
 }
 
 /// Performs layout of sections and segments then makes sure that the loadable segments don't
