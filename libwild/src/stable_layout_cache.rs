@@ -762,28 +762,39 @@ pub(crate) fn stage_after_link(layout: &Layout<'_, MachO>, output: &[u8]) {
     let Some(cache_dir) = args.incremental_cache.as_deref() else {
         return;
     };
-    if !cache_is_eligible(args) || !layout.symbol_db.output_kind.is_executable() {
+    if !cache_is_eligible(args) {
+        let _ = cache_miss("normal link is not eligible to stage a stable-layout baseline");
+        return;
+    }
+    if !layout.symbol_db.output_kind.is_executable() {
+        let _ = cache_miss("normal link did not produce an executable baseline");
         return;
     }
 
     let Some(inputs) = input_digests(args) else {
+        let _ = cache_miss("unable to fingerprint every link-visible input for a baseline");
         return;
     };
     let cache_approved_rustc_temporary_archives =
         cache_approved_rustc_temporary_archives(args, &inputs, output);
     let Some(signature) = signature_info(layout, output) else {
+        let _ = cache_miss("normal-link code signature is not usable as a cache baseline");
         return;
     };
     let Some(output_identity) = output_identity(output, &signature) else {
+        let _ = cache_miss("normal-link output identity is not usable as a cache baseline");
         return;
     };
     let Some(objects) = object_records(layout, &inputs, output) else {
+        let _ = cache_miss("unable to construct cache patch records for direct objects");
         return;
     };
     if objects.is_empty() {
+        let _ = cache_miss("normal link has no cacheable direct-object patch record");
         return;
     }
     let Some(baseline_output_path) = args.output().to_str().map(str::to_owned) else {
+        let _ = cache_miss("normal-link output path is not valid UTF-8 for the cache baseline");
         return;
     };
 
@@ -810,10 +821,14 @@ pub(crate) fn stage_after_link(layout: &Layout<'_, MachO>, output: &[u8]) {
     };
     // Stage the image first. `publish_staged` exposes it only after generic linking confirms no
     // input was replaced during layout/writing.
-    if write_staged_image_atomic(cache_dir, args, output).is_ok()
-        && write_staged_image_state_atomic(cache_dir, args, &state).is_ok()
+    if write_staged_image_atomic(cache_dir, args, output).is_err()
+        || write_staged_image_state_atomic(cache_dir, args, &state).is_err()
     {
-        let _ = write_staged_manifest_atomic(cache_dir, args, &manifest);
+        let _ = cache_miss("unable to stage the baseline image or state");
+        return;
+    }
+    if write_staged_manifest_atomic(cache_dir, args, &manifest).is_err() {
+        let _ = cache_miss("unable to stage the baseline manifest");
     }
 }
 
@@ -831,17 +846,20 @@ pub(crate) fn publish_staged(args: &MachOArgs) {
         return;
     };
     let Ok(manifest) = Manifest::decode(&bytes) else {
+        let _ = cache_miss("staged baseline manifest is corrupt or incompatible");
         let _ = fs::remove_file(staged);
         let _ = fs::remove_file(staged_image);
         let _ = fs::remove_file(staged_state);
         return;
     };
     let Ok(state_bytes) = fs::read(&staged_state) else {
+        let _ = cache_miss("staged baseline image state is absent");
         let _ = fs::remove_file(staged);
         let _ = fs::remove_file(staged_image);
         return;
     };
     let Ok(state) = ImageState::decode(&state_bytes) else {
+        let _ = cache_miss("staged baseline image state is corrupt or incompatible");
         let _ = fs::remove_file(staged);
         let _ = fs::remove_file(staged_image);
         let _ = fs::remove_file(staged_state);
@@ -858,21 +876,26 @@ pub(crate) fn publish_staged(args: &MachOArgs) {
         || state.output_len != manifest.output_len
         || input_digests(args).as_ref() != Some(&manifest.inputs)
     {
+        let _ = cache_miss("link-visible inputs changed before baseline publication");
         let _ = fs::remove_file(staged);
         let _ = fs::remove_file(staged_image);
         let _ = fs::remove_file(staged_state);
         return;
     }
     if fs::rename(staged_image, cache_image_path(cache_dir, args)).is_err() {
+        let _ = cache_miss("unable to publish the staged baseline image");
         let _ = fs::remove_file(staged);
         let _ = fs::remove_file(staged_state);
         return;
     }
     if fs::rename(&staged_state, cache_state_path(cache_dir, args)).is_err() {
+        let _ = cache_miss("unable to publish the staged baseline image state");
         let _ = fs::remove_file(staged);
         return;
     }
-    let _ = fs::rename(staged, cache_path(cache_dir, args));
+    if fs::rename(staged, cache_path(cache_dir, args)).is_err() {
+        let _ = cache_miss("unable to publish the staged baseline manifest");
+    }
 }
 
 fn cache_is_eligible(args: &MachOArgs) -> bool {
