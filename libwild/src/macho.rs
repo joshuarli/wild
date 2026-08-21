@@ -86,6 +86,8 @@ use object::read::macho::MachHeader;
 use object::read::macho::Nlist;
 use object::read::macho::Section;
 use object::read::macho::Segment;
+use rayon::iter::IntoParallelRefIterator;
+use rayon::iter::ParallelIterator as _;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -391,6 +393,37 @@ fn selected_eh_frame_record_size(
     }
 
     Ok((has_input, selected_size))
+}
+
+fn object_finalise_metadata<'data>(
+    object: &layout::ObjectLayoutState<'data, MachO>,
+) -> Result<ObjectFinaliseMetadata<'data>> {
+    let mut compact_unwind_entry_count = 0usize;
+    for slot in &object.sections {
+        let resolution::SectionSlot::FrameData(section_index) = slot else {
+            continue;
+        };
+        let section = object.object.section(*section_index)?;
+        let data = object.object.raw_section_data(section)?;
+        ensure!(
+            data.len() % COMPACT_UNWIND_ENTRY_SIZE == 0,
+            "{} has malformed __compact_unwind data: {} bytes is not a multiple of {}",
+            object.input,
+            data.len(),
+            COMPACT_UNWIND_ENTRY_SIZE
+        );
+        compact_unwind_entry_count = compact_unwind_entry_count
+            .checked_add(data.len() / COMPACT_UNWIND_ENTRY_SIZE)
+            .context("too many Mach-O compact unwind entries")?;
+    }
+    let (has_eh_frame_input, selected_eh_frame_record_size) = selected_eh_frame_record_size(object)?;
+
+    Ok(ObjectFinaliseMetadata {
+        objc_message_references: objc_message_references_for_object(object)?,
+        compact_unwind_entry_count,
+        has_eh_frame_input,
+        selected_eh_frame_record_size,
+    })
 }
 
 /// Return true only for an FDE whose unsigned target is conclusively absent from the final
@@ -1231,6 +1264,17 @@ pub(crate) struct ObjcMessageStub<'data> {
     pub(crate) message_symbol: ObjcMessageSymbol,
     /// One input method-name symbol whose merged output address backs the synthetic selref.
     pub(crate) selector_symbol: ObjcMessageSymbol,
+}
+
+/// The immutable per-object work that final layout needs before it allocates synthetic Mach-O
+/// sections. Keep collection separate from aggregation: the latter retains input order for
+/// diagnostics and for the first selector spelling that wins.
+#[derive(Debug)]
+struct ObjectFinaliseMetadata<'data> {
+    objc_message_references: Vec<(ObjcMessageSymbol, &'data [u8], ObjcMessageSymbol)>,
+    compact_unwind_entry_count: usize,
+    has_eh_frame_input: bool,
+    selected_eh_frame_record_size: usize,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -3169,46 +3213,50 @@ impl platform::Platform for MachO {
             }
         };
 
+        // These inspections only read parsed input and graph decisions, so run them in parallel
+        // before mutating the epilogue allocation. Rayon preserves the indexed group order when
+        // collecting a Vec; applying errors and merging afterward therefore keeps the prior
+        // first-error and first-selector behavior. Dylib ordering remains below on the
+        // sequential input-order path.
+        let object_metadata = groups
+            .par_iter()
+            .map(|group| {
+                group
+                    .files
+                    .iter()
+                    .filter_map(|file| match file {
+                        layout::FileLayoutState::Object(object) => Some(object_finalise_metadata(&object)),
+                        _ => None,
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })
+            .collect::<Vec<_>>();
+        for group_metadata in object_metadata {
+            for metadata in group_metadata? {
+                for (message_symbol, selector, selector_symbol) in metadata.objc_message_references {
+                    objc_message_stubs_by_selector
+                        .entry(selector)
+                        .or_insert(ObjcMessageStub {
+                            selector,
+                            message_symbol,
+                            selector_symbol,
+                        });
+                    objc_message_selectors.insert(message_symbol, selector);
+                }
+                compact_unwind_entry_count = compact_unwind_entry_count
+                    .checked_add(metadata.compact_unwind_entry_count)
+                    .context("too many Mach-O compact unwind entries")?;
+                has_eh_frame_input |= metadata.has_eh_frame_input;
+                selected_eh_frame_record_total_size = selected_eh_frame_record_total_size
+                    .checked_add(metadata.selected_eh_frame_record_size)
+                    .context("selected Mach-O __eh_frame data is too large")?;
+            }
+        }
+
         for group in groups.iter() {
             for file in &group.files {
                 match file {
-                    layout::FileLayoutState::Object(object) => {
-                        for (message_symbol, selector, selector_symbol) in
-                            objc_message_references_for_object(object)?
-                        {
-                            objc_message_stubs_by_selector
-                                .entry(selector)
-                                .or_insert(ObjcMessageStub {
-                                    selector,
-                                    message_symbol,
-                                    selector_symbol,
-                                });
-                            objc_message_selectors.insert(message_symbol, selector);
-                        }
-                        for slot in &object.sections {
-                            let resolution::SectionSlot::FrameData(section_index) = slot else {
-                                continue;
-                            };
-                            let section = object.object.section(*section_index)?;
-                            let data = object.object.raw_section_data(section)?;
-                            ensure!(
-                                data.len() % COMPACT_UNWIND_ENTRY_SIZE == 0,
-                                "{} has malformed __compact_unwind data: {} bytes is not a multiple of {}",
-                                object.input,
-                                data.len(),
-                                COMPACT_UNWIND_ENTRY_SIZE
-                            );
-                            compact_unwind_entry_count = compact_unwind_entry_count
-                                .checked_add(data.len() / COMPACT_UNWIND_ENTRY_SIZE)
-                                .context("too many Mach-O compact unwind entries")?;
-                        }
-                        let (object_has_eh_frame_input, object_eh_frame_record_size) =
-                            selected_eh_frame_record_size(object)?;
-                        has_eh_frame_input |= object_has_eh_frame_input;
-                        selected_eh_frame_record_total_size = selected_eh_frame_record_total_size
-                            .checked_add(object_eh_frame_record_size)
-                            .context("selected Mach-O __eh_frame data is too large")?;
-                    }
+                    layout::FileLayoutState::Object(_) => {}
                     layout::FileLayoutState::StubLibrary(state) => {
                         if state.format_specific.loaded {
                             add_imported_library(state.file_id());
