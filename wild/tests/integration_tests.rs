@@ -445,6 +445,8 @@ fn main() -> Result<std::process::ExitCode> {
     collect_real_cargo_macho_corpus(&mut tests, &filter)?;
     #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
     collect_macho_dylib_dependency_qualification(&mut tests, &filter)?;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+    collect_macho_stable_layout_cache_qualification(&mut tests, &filter)?;
     Ok(libtest_mimic::run(&args, tests).exit_code())
 }
 
@@ -1427,6 +1429,208 @@ fn run_native_staticlib_consumer(binary: &Path, expected_exit: i32) -> Result {
         String::from_utf8_lossy(&output.stderr),
     );
     Ok(())
+}
+
+/// Covers the one stable-layout-cache expansion that is safe without changing the writer's
+/// section-allocation contract: a linker-private symbol moves within an otherwise equal-sized,
+/// relocation-free direct object. The cache must update the final `n_value`, retain the other
+/// layout, re-sign the executable, and run it without invoking a normal link.
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+fn collect_macho_stable_layout_cache_qualification(
+    tests: &mut Vec<Trial>,
+    filter: &Filter,
+) -> Result {
+    const NAME: &str = "macho/aarch64/stable-layout-cache-local-symbol/default";
+    if filter.excludes(NAME) {
+        return Ok(());
+    }
+    tests.push(Trial::test(NAME, || {
+        run_macho_stable_layout_cache_qualification()
+            .map_err(|error| libtest_mimic::Failed::from(error.to_string()))
+    }));
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+fn run_macho_stable_layout_cache_qualification() -> Result {
+    let fixture_dir = base_dir().join("tests").join("macho_stable_layout_cache");
+    let main_source = fixture_dir.join("main.s");
+    let local_source = fixture_dir.join("local.s");
+    let moved_local_source = fixture_dir.join("local-moved.s");
+    for source in [&main_source, &local_source, &moved_local_source] {
+        ensure!(source.is_file(), "missing stable-layout-cache fixture {}", source.display());
+    }
+    let output_dir_guard = tempfile::Builder::new()
+        .prefix("wild-macho-stable-layout-cache-")
+        .tempdir_in("/tmp")
+        .context("failed to create stable-layout-cache qualification directory")?;
+    let output_dir = output_dir_guard.path();
+    let main_object = output_dir.join("main.o");
+    let local_object = output_dir.join("local.o");
+    let binary = output_dir.join("stable-layout-cache");
+    let cache_dir = output_dir.join("cache");
+
+    compile_macho_stable_layout_cache_fixture(&main_source, &main_object)?;
+    compile_macho_stable_layout_cache_fixture(&local_source, &local_object)?;
+    let sdk = macos_sdk_path()?;
+    link_macho_stable_layout_cache_fixture(
+        &binary,
+        &cache_dir,
+        &sdk,
+        &main_object,
+        &local_object,
+        false,
+    )?;
+    ensure!(
+        cache_dir.read_dir()?.next().is_some(),
+        "stable-layout cache baseline did not publish sidecars in {}",
+        cache_dir.display()
+    );
+    let baseline_main = macho_symbol_address(&binary, b"_main")?;
+    let baseline_target = macho_symbol_address(&binary, b"_stable_layout_local_target")?;
+    verify_code_signature(&binary)?;
+
+    // The replacement object has the same `__text` length and no relocations, but moves its
+    // linker-private nlist value by one ARM64 instruction. Reusing the old output value would
+    // leave stale symbol metadata despite a bytewise-valid code patch.
+    compile_macho_stable_layout_cache_fixture(&moved_local_source, &local_object)?;
+    let transcript = link_macho_stable_layout_cache_fixture(
+        &binary,
+        &cache_dir,
+        &sdk,
+        &main_object,
+        &local_object,
+        true,
+    )?;
+    ensure!(
+        transcript.contains("wild: Mach-O stable-layout cache hit:"),
+        "private-symbol offset rebuild did not take the cache path:\n{transcript}"
+    );
+    ensure!(
+        macho_symbol_address(&binary, b"_main")? == baseline_main,
+        "private-symbol cache patch changed _main's address"
+    );
+    ensure!(
+        macho_symbol_address(&binary, b"_stable_layout_local_target")?
+            == baseline_target + 4,
+        "cached executable retained a stale private-symbol n_value"
+    );
+    verify_code_signature(&binary)?;
+    let run = Command::new(&binary)
+        .output()
+        .with_context(|| format!("failed to run cached stable-layout executable {}", binary.display()))?;
+    ensure!(
+        run.status.code() == Some(42),
+        "cached stable-layout executable exited with {}:\n{}{}",
+        run.status,
+        String::from_utf8_lossy(&run.stdout),
+        String::from_utf8_lossy(&run.stderr),
+    );
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+fn compile_macho_stable_layout_cache_fixture(source: &Path, output: &Path) -> Result {
+    let result = Command::new("clang")
+        .args(["-arch", "arm64", "-c"])
+        .arg(source)
+        .arg("-o")
+        .arg(output)
+        .output()
+        .with_context(|| format!("failed to compile stable-layout-cache fixture {}", source.display()))?;
+    ensure!(
+        result.status.success(),
+        "failed to compile stable-layout-cache fixture {}:\n{}{}",
+        source.display(),
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr),
+    );
+    Ok(())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+fn macos_sdk_path() -> Result<PathBuf> {
+    let output = Command::new("xcrun")
+        .arg("--show-sdk-path")
+        .output()
+        .context("failed to locate the macOS SDK")?;
+    ensure!(
+        output.status.success(),
+        "xcrun --show-sdk-path failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let path = std::str::from_utf8(&output.stdout)
+        .context("macOS SDK path is not UTF-8")?
+        .trim();
+    ensure!(!path.is_empty(), "xcrun returned an empty macOS SDK path");
+    Ok(PathBuf::from(path))
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+fn link_macho_stable_layout_cache_fixture(
+    binary: &Path,
+    cache_dir: &Path,
+    sdk: &Path,
+    main_object: &Path,
+    local_object: &Path,
+    expect_cache_hit: bool,
+) -> Result<String> {
+    let mut command = Command::new(wild_path());
+    command
+        .args([
+            "-arch",
+            "arm64",
+            "-platform_version",
+            "macos",
+            "13.0",
+            "13.0",
+            "-syslibroot",
+        ])
+        .arg(sdk)
+        .args(["-o"])
+        .arg(binary)
+        .args(["-incremental_cache"])
+        .arg(cache_dir)
+        .arg("-S")
+        .arg(main_object)
+        .arg(local_object)
+        .arg("-lSystem");
+    if expect_cache_hit {
+        command.env("WILD_MACHO_INCREMENTAL_CACHE_DIAGNOSTICS", "1");
+    }
+    let output = command
+        .output()
+        .with_context(|| format!("failed to link stable-layout-cache fixture {}", binary.display()))?;
+    let transcript = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    ensure!(
+        output.status.success(),
+        "stable-layout-cache link failed for {}:\n{transcript}",
+        binary.display()
+    );
+    Ok(transcript)
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+fn macho_symbol_address(binary: &Path, expected_name: &[u8]) -> Result<u64> {
+    let bytes = std::fs::read(binary)
+        .with_context(|| format!("failed to read cached Mach-O executable {}", binary.display()))?;
+    let object = object::File::parse(bytes.as_slice())
+        .with_context(|| format!("failed to parse cached Mach-O executable {}", binary.display()))?;
+    object
+        .symbols()
+        .find(|symbol| symbol.name_bytes().ok() == Some(expected_name))
+        .map(|symbol| symbol.address())
+        .with_context(|| {
+            format!(
+                "cached Mach-O executable {} has no symbol {}",
+                binary.display(),
+                String::from_utf8_lossy(expected_name)
+            )
+        })
 }
 
 /// A dylib's own dependency list is a separate dyld contract from an executable loading one

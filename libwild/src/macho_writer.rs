@@ -4217,6 +4217,35 @@ fn write_symbols<'data>(
             } else {
                 res.value_for_symbol_table()
             }
+        } else if let Some(section_index) = object.object.symbol_section(sym, sym_index)?
+            && matches!(object.sections.get(section_index.0), Some(SectionSlot::Loaded(_)))
+        {
+            // A section-defined private/local nlist can be copied even when no relocation or
+            // externally visible resolution caused it to acquire a `Resolution`. It still names
+            // a concrete output byte: leaving its value at the writer's zero initializer makes
+            // the final symtab lie about a valid address and prevents stable-layout cache hits
+            // that preserve the section footprint. Use the same input-to-output mapping as the
+            // initial liveness check, including its subsection-compaction rule.
+            let input_offset = object
+                .object
+                .symbol_offset_in_section(sym, section_index)?;
+            let output_offset = object.output_offset_for_input(section_index, input_offset).with_context(|| {
+                format!(
+                    "Mach-O symbol {} is live but has no output offset",
+                    layout.symbol_debug(symbol_id)
+                )
+            })?;
+            object
+                .section_resolutions
+                .get(section_index.0)
+                .and_then(|resolution| resolution.address())
+                .and_then(|address| address.checked_add(output_offset))
+                .with_context(|| {
+                    format!(
+                        "Mach-O symbol {} output address overflows",
+                        layout.symbol_debug(symbol_id)
+                    )
+                })?
         } else {
             value
         };

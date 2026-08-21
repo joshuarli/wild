@@ -21,6 +21,7 @@ use crate::platform::Args as _;
 use crate::platform::ObjectFile as _;
 use crate::resolution::SectionSlot;
 use crate::timing_phase;
+use object::Endianness;
 use object::macho::LC_UUID;
 use rayon::prelude::*;
 use std::collections::BTreeMap;
@@ -41,16 +42,16 @@ use std::time::SystemTime;
 
 const MAGIC: &[u8; 16] = b"WILD-MACHO-INC\0\0";
 const STATE_MAGIC: &[u8; 16] = b"WILD-MACHO-STATE";
-const VERSION: u32 = 7;
+const VERSION: u32 = 8;
 const STATE_VERSION: u32 = 2;
 const HASH_SIZE: usize = 32;
 const MAX_RECORDS: usize = 100_000;
 const DIAGNOSTICS_ENV: &str = "WILD_MACHO_INCREMENTAL_CACHE_DIAGNOSTICS";
-/// Domains the v4 structural digest away from ordinary byte hashes and older cache layouts.
-const STRUCTURE_DIGEST_DOMAIN: &[u8] = b"wild-macho-stable-layout-structure-v4\0";
+/// Domains the v5 structural digest away from ordinary byte hashes and older cache layouts.
+const STRUCTURE_DIGEST_DOMAIN: &[u8] = b"wild-macho-stable-layout-structure-v5\0";
 /// The sidecar is not an authenticated input, but random or torn sidecar corruption must become
 /// a conservative cache miss before any persisted patch mapping is used.
-const MANIFEST_CHECKSUM_DOMAIN: &[u8] = b"wild-macho-stable-layout-manifest-v7\0";
+const MANIFEST_CHECKSUM_DOMAIN: &[u8] = b"wild-macho-stable-layout-manifest-v8\0";
 const STATE_CHECKSUM_DOMAIN: &[u8] = b"wild-macho-stable-layout-state-v2\0";
 
 #[derive(Clone, Debug)]
@@ -113,6 +114,44 @@ struct PatchRange {
     len: u64,
 }
 
+/// An input-byte range excluded from the direct object's structural digest. Unlike a
+/// [`PatchRange`], this has no raw-byte output mapping: linker-private nlist values are
+/// recomputed from their containing section rather than copied from the input.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InputRange {
+    input_offset: u64,
+    len: u64,
+}
+
+/// A fixed-width `n_value` rewrite for an otherwise structurally identical linker-private Mach-O
+/// symbol.
+///
+/// The stable-layout cache normally treats every input nlist value as structural because moving a
+/// symbol can also move an export, relocation target, unwind record, or debug-map function. A
+/// record is emitted only for the deliberately narrow no-relocation, no-STABS case where the
+/// symbol is local, its containing input section keeps its footprint, and the final nlist entry
+/// has one independently identified baseline location. The source and destination values are
+/// checked again on a hit before this eight-byte patch is applied.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SymbolValuePatch {
+    input_value_offset: u64,
+    input_section_address: u64,
+    input_section_size: u64,
+    output_value_offset: u64,
+    output_section_address: u64,
+    baseline_value: u64,
+}
+
+impl SymbolValuePatch {
+    fn signature_range(self) -> PatchRange {
+        PatchRange {
+            input_offset: 0,
+            output_offset: self.output_value_offset,
+            len: size_of::<u64>() as u64,
+        }
+    }
+}
+
 /// A byte range in the cache-owned output whose meaning is independently checked before a cache
 /// hit changes it. This is intentionally distinct from [`PatchRange`], which maps bytes from a
 /// changed direct object into the old output layout.
@@ -147,6 +186,8 @@ struct ObjectRecord {
     input_index: u32,
     structure_digest: [u8; HASH_SIZE],
     patches: Vec<PatchRange>,
+    structure_masks: Vec<InputRange>,
+    symbol_values: Vec<SymbolValuePatch>,
     protected: Vec<ProtectedRange>,
 }
 
@@ -202,12 +243,19 @@ struct ObjectRecordView<'a> {
     input_index: u32,
     structure_digest: [u8; HASH_SIZE],
     patch_bytes: &'a [u8],
+    structure_mask_bytes: &'a [u8],
+    symbol_value_bytes: &'a [u8],
     protected_bytes: &'a [u8],
     protected_count: usize,
 }
 
 #[derive(Clone)]
 struct PatchRangeIter<'a> {
+    bytes: std::slice::ChunksExact<'a, u8>,
+}
+
+#[derive(Clone)]
+struct InputRangeIter<'a> {
     bytes: std::slice::ChunksExact<'a, u8>,
 }
 
@@ -241,6 +289,8 @@ struct ImageState {
 struct Candidate {
     bytes: Vec<u8>,
     patches: Vec<PatchRange>,
+    structure_masks: Vec<InputRange>,
+    symbol_values: Vec<SymbolValuePatch>,
     protected: Vec<ProtectedRange>,
 }
 
@@ -487,7 +537,7 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
         // publish its patched output.
         let structure_matches = {
             timing_phase!("Mach-O stable-layout cache: compute object structure digest");
-            object.structure_digest == masked_digest_from_iter(current_object, object.patches())
+            object.structure_digest == masked_digest_from_iter(current_object, object.structure_masks())
         };
         if !structure_matches {
             return cache_miss("changed object structural digest differs");
@@ -546,12 +596,18 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
         timing_phase!("Mach-O stable-layout cache: patch and sign");
         if !apply_output_path_patches(output.bytes_mut(), &archive_path_patches)
             || !apply_patches_from_iter(output.bytes_mut(), current_object, object.patches())
+            || !apply_symbol_value_patches_from_iter(
+                output.bytes_mut(),
+                current_object,
+                object.symbol_values(),
+            )
             || !refresh_uuid_and_signature(
                 output.bytes_mut(),
                 &manifest.signature,
                 args,
                 object
                     .patches()
+                    .chain(object.symbol_values().map(SymbolValuePatch::signature_range))
                     .chain(archive_path_patches.iter().map(OutputPathPatch::signature_range)),
             )
         {
@@ -678,7 +734,7 @@ pub(crate) fn stage_after_link(layout: &Layout<'_, MachO>, output: &[u8]) {
     let Some(signature) = signature_info(layout, output) else {
         return;
     };
-    let Some(objects) = object_records(layout, &inputs) else {
+    let Some(objects) = object_records(layout, &inputs, output) else {
         return;
     };
     if objects.is_empty() {
@@ -1033,6 +1089,109 @@ fn cache_approved_rustc_temporary_archives(
         .collect()
 }
 
+/// The stable-layout cache needs only the fixed-width 64-bit nlist records. This deliberately
+/// rejects malformed or duplicate `LC_SYMTAB` commands rather than relying on a permissive
+/// object parser while patching a cache-owned executable.
+#[derive(Clone, Copy)]
+struct MachOSymtab {
+    symbol_offset: usize,
+    symbol_count: usize,
+    string_offset: usize,
+    string_size: usize,
+}
+
+impl MachOSymtab {
+    fn has_stabs(self, bytes: &[u8]) -> bool {
+        (0..self.symbol_count).any(|index| {
+            self.entry_offset(index)
+                .and_then(|offset| bytes.get(offset.checked_add(4)?))
+                .is_some_and(|n_type| *n_type & object::macho::N_STAB != 0)
+        })
+    }
+
+    fn value_offset_for_symbol(self, index: usize) -> Option<usize> {
+        self.entry_offset(index)?.checked_add(8)
+    }
+
+    fn unique_symbol_value_offset(
+        self,
+        bytes: &[u8],
+        expected_name: &[u8],
+        expected_type: u8,
+        expected_desc: u16,
+        expected_value: u64,
+    ) -> Option<usize> {
+        let mut matched = None;
+        for index in 0..self.symbol_count {
+            let entry_offset = self.entry_offset(index)?;
+            if bytes.get(entry_offset.checked_add(4)?) != Some(&expected_type)
+                || bytes.get(entry_offset.checked_add(5)?) == Some(&0)
+                || read_u16(bytes, entry_offset.checked_add(6)?)? != expected_desc
+                || read_u64(bytes, entry_offset.checked_add(8)?)? != expected_value
+            {
+                continue;
+            }
+            let string_index = usize::try_from(read_u32(bytes, entry_offset)?).ok()?;
+            if string_index >= self.string_size {
+                return None;
+            }
+            let name_offset = self.string_offset.checked_add(string_index)?;
+            let string_end = self.string_offset.checked_add(self.string_size)?;
+            let name = bytes.get(name_offset..string_end)?;
+            let name_end = name.iter().position(|byte| *byte == 0)?;
+            if &name[..name_end] != expected_name {
+                continue;
+            }
+            if matched.replace(entry_offset.checked_add(8)?).is_some() {
+                return None;
+            }
+        }
+        matched
+    }
+
+    fn entry_offset(self, index: usize) -> Option<usize> {
+        (index < self.symbol_count)
+            .then(|| index.checked_mul(16))
+            .flatten()
+            .and_then(|offset| self.symbol_offset.checked_add(offset))
+    }
+}
+
+fn macho_symtab(bytes: &[u8]) -> Option<MachOSymtab> {
+    if read_u32(bytes, 0)? != object::macho::MH_MAGIC_64 {
+        return None;
+    }
+    let ncmds = usize::try_from(read_u32(bytes, 16)?).ok()?;
+    let mut command_offset = 32usize;
+    let mut symtab = None;
+    for _ in 0..ncmds {
+        let command = read_u32(bytes, command_offset)?;
+        let command_size = usize::try_from(read_u32(bytes, command_offset.checked_add(4)?)?).ok()?;
+        let command_end = command_offset.checked_add(command_size)?;
+        if command_size < 8 || command_end > bytes.len() {
+            return None;
+        }
+        if command == object::macho::LC_SYMTAB.0 {
+            if command_size < 24 || symtab.is_some() {
+                return None;
+            }
+            symtab = Some(MachOSymtab {
+                symbol_offset: usize::try_from(read_u32(bytes, command_offset.checked_add(8)?)?).ok()?,
+                symbol_count: usize::try_from(read_u32(bytes, command_offset.checked_add(12)?)?).ok()?,
+                string_offset: usize::try_from(read_u32(bytes, command_offset.checked_add(16)?)?).ok()?,
+                string_size: usize::try_from(read_u32(bytes, command_offset.checked_add(20)?)?).ok()?,
+            });
+        }
+        command_offset = command_end;
+    }
+    let symtab = symtab?;
+    let symbol_table_end = symtab
+        .symbol_offset
+        .checked_add(symtab.symbol_count.checked_mul(16)?)?;
+    let string_end = symtab.string_offset.checked_add(symtab.string_size)?;
+    (symbol_table_end <= bytes.len() && string_end <= bytes.len()).then_some(symtab)
+}
+
 /// Produces equal-width output patches for Rustc archive paths that moved between compiler-owned
 /// temporary directories. The parser is deliberately small and fail-closed: it accepts exactly
 /// one 64-bit Mach-O symbol table, matches only `N_OSO` strings of the form
@@ -1377,6 +1536,7 @@ fn resolve_input_path(
 fn object_records(
     layout: &Layout<'_, MachO>,
     inputs: &[InputDigest],
+    output: &[u8],
 ) -> Option<Vec<ObjectRecord>> {
     let mut direct_object_indices = BTreeMap::new();
     for (index, input) in inputs
@@ -1402,7 +1562,7 @@ fn object_records(
                 continue;
             };
             if candidates
-                .insert(input_index, object_candidate(layout, object)?)
+                .insert(input_index, object_candidate(layout, object, output)?)
                 .is_some()
             {
                 return None;
@@ -1417,11 +1577,32 @@ fn object_records(
                 return None;
             }
             normalise_ranges(&mut candidate.patches)?;
+            candidate.structure_masks = candidate
+                .patches
+                .iter()
+                .map(|patch| InputRange {
+                    input_offset: patch.input_offset,
+                    len: patch.len,
+                })
+                .collect();
+            candidate
+                .structure_masks
+                .extend(candidate.symbol_values.iter().map(|symbol| InputRange {
+                    input_offset: symbol.input_value_offset,
+                    len: size_of::<u64>() as u64,
+                }));
+            normalise_input_ranges(&mut candidate.structure_masks)?;
+            normalise_symbol_value_patches(&mut candidate.symbol_values)?;
             normalise_protected_ranges(&mut candidate.protected)?;
             Some(ObjectRecord {
                 input_index: u32::try_from(input_index).ok()?,
-                structure_digest: masked_digest(&candidate.bytes, &candidate.patches),
+                structure_digest: masked_digest_for_input_ranges(
+                    &candidate.bytes,
+                    &candidate.structure_masks,
+                ),
                 patches: candidate.patches,
+                structure_masks: candidate.structure_masks,
+                symbol_values: candidate.symbol_values,
                 protected: candidate.protected,
             })
         })
@@ -1431,6 +1612,7 @@ fn object_records(
 fn object_candidate(
     layout: &Layout<'_, MachO>,
     object: &ObjectLayout<'_, MachO>,
+    output: &[u8],
 ) -> Option<Candidate> {
     let mut patches = Vec::new();
     let mut protected = Vec::new();
@@ -1512,11 +1694,125 @@ fn object_candidate(
         }
     }
 
+    let symbol_values = linker_private_symbol_value_patches(layout, object, output);
     Some(Candidate {
         bytes: data.to_vec(),
         patches,
+        structure_masks: Vec::new(),
+        symbol_values,
         protected,
     })
+}
+
+/// Finds the linker-private-symbol updates for the one cache shape whose address calculation
+/// remains entirely section-relative. Requiring no relocations, no STABS, no subsection
+/// compaction, and a private-external symbol intentionally leaves exports, unwind metadata,
+/// chained fixups, and debug maps on the normal link path. A missing or ambiguous output nlist
+/// simply declines this optional extension; the ordinary raw-section cache record remains valid
+/// for unchanged symbol values.
+fn linker_private_symbol_value_patches(
+    layout: &Layout<'_, MachO>,
+    object: &ObjectLayout<'_, MachO>,
+    output: &[u8],
+) -> Vec<SymbolValuePatch> {
+    if !layout.args().should_strip_debug() {
+        return Vec::new();
+    }
+    let Some(input_symtab) = macho_symtab(object.object.data) else {
+        return Vec::new();
+    };
+    let Some(output_symtab) = macho_symtab(output) else {
+        return Vec::new();
+    };
+    if output_symtab.has_stabs(output) {
+        return Vec::new();
+    }
+    for (section_index, _) in object.object.enumerate_sections() {
+        if object.live_input_ranges(section_index).is_some()
+            || !object
+                .relocations(section_index)
+                .is_ok_and(|relocations| relocations.relocations.is_empty())
+        {
+            return Vec::new();
+        }
+    }
+
+    let mut patches = Vec::new();
+    for (symbol_index, symbol) in object.object.enumerate_symbols() {
+        if symbol.n_type.is_stab()
+            || symbol.n_type.typ() != object::macho::N_SECT
+            || !symbol.n_type.is_pext()
+        {
+            continue;
+        }
+        let Some(section_index) = object.object.symbol_section(symbol, symbol_index).ok().flatten() else {
+            continue;
+        };
+        let Some(SectionSlot::Loaded(_)) = object.sections.get(section_index.0) else {
+            continue;
+        };
+        let Ok(input_section) = object.object.section(section_index) else {
+            continue;
+        };
+        let Ok(raw_section) = object.object.raw_section_data(input_section) else {
+            continue;
+        };
+        let input_section_address = input_section.addr.get(Endianness::Little);
+        let Ok(input_section_size) = u64::try_from(raw_section.len()) else {
+            continue;
+        };
+        if input_section_size == 0 || input_section.size.get(Endianness::Little) != input_section_size {
+            continue;
+        }
+        let Ok(input_offset) = object
+            .object
+            .symbol_offset_in_section(symbol, section_index)
+        else {
+            continue;
+        };
+        if input_offset >= input_section_size {
+            continue;
+        }
+        let Some(input_value_offset) = input_symtab.value_offset_for_symbol(symbol_index.0) else {
+            continue;
+        };
+        if read_u64(object.object.data, input_value_offset) != Some(symbol.n_value.get(Endianness::Little)) {
+            continue;
+        }
+        let Some(output_section_address) = object
+            .section_resolutions
+            .get(section_index.0)
+            .and_then(|resolution| resolution.address())
+        else {
+            continue;
+        };
+        let Some(baseline_value) = output_section_address.checked_add(input_offset) else {
+            continue;
+        };
+        let Ok(name) = object.object.symbol_name(symbol) else {
+            continue;
+        };
+        let Some(output_value_offset) = output_symtab.unique_symbol_value_offset(
+            output,
+            name,
+            symbol.n_type.0,
+            symbol.n_desc.get(Endianness::Little).0,
+            baseline_value,
+        ) else {
+            continue;
+        };
+        patches.push(SymbolValuePatch {
+            input_value_offset: input_value_offset as u64,
+            input_section_address,
+            input_section_size,
+            output_value_offset: output_value_offset as u64,
+            output_section_address,
+            baseline_value,
+        });
+    }
+    normalise_symbol_value_patches(&mut patches)
+        .map(|()| patches)
+        .unwrap_or_default()
 }
 
 fn collect_protected_relocation_ranges(
@@ -1634,6 +1930,81 @@ fn normalise_protected_ranges(ranges: &mut Vec<ProtectedRange>) -> Option<()> {
         .then_some(())
 }
 
+fn normalise_input_ranges(ranges: &mut Vec<InputRange>) -> Option<()> {
+    ranges.sort_by_key(|range| range.input_offset);
+    ranges.dedup();
+    ranges
+        .iter()
+        .all(|range| range.len != 0 && range.input_offset.checked_add(range.len).is_some())
+        .then_some(())?;
+    ranges
+        .windows(2)
+        .all(|pair| {
+            pair[0]
+                .input_offset
+                .checked_add(pair[0].len)
+                .is_some_and(|end| end <= pair[1].input_offset)
+        })
+        .then_some(())
+}
+
+fn input_ranges_are_normalized(mut ranges: impl Iterator<Item = InputRange>) -> bool {
+    let mut previous_end = 0_u64;
+    ranges.all(|range| {
+        range.len != 0
+            && range
+                .input_offset
+                .checked_add(range.len)
+                .is_some_and(|end| {
+                    let valid = range.input_offset >= previous_end;
+                    previous_end = end;
+                    valid
+                })
+    })
+}
+
+fn normalise_symbol_value_patches(patches: &mut Vec<SymbolValuePatch>) -> Option<()> {
+    patches.sort_by_key(|patch| patch.input_value_offset);
+    symbol_value_patches_are_normalized_from_iter(patches.iter().copied()).then_some(())
+}
+
+fn symbol_value_patches_are_normalized(patches: &[SymbolValuePatch]) -> bool {
+    symbol_value_patches_are_normalized_from_iter(patches.iter().copied())
+}
+
+fn symbol_value_patches_are_normalized_from_iter(
+    mut patches: impl Iterator<Item = SymbolValuePatch>,
+) -> bool {
+    let mut previous_input_end = 0_u64;
+    let mut output_offsets = Vec::new();
+    patches.all(|patch| {
+        let Some(input_end) = patch.input_value_offset.checked_add(size_of::<u64>() as u64) else {
+            return false;
+        };
+        let Some(output_end) = patch.output_value_offset.checked_add(size_of::<u64>() as u64) else {
+            return false;
+        };
+        let valid = patch.input_section_size != 0
+            && patch
+                .input_section_address
+                .checked_add(patch.input_section_size)
+                .is_some()
+            && patch
+                .output_section_address
+                .checked_add(patch.input_section_size)
+                .is_some()
+            && patch.input_value_offset >= previous_input_end;
+        previous_input_end = input_end;
+        output_offsets.push((patch.output_value_offset, output_end));
+        valid
+    }) && {
+        output_offsets.sort_unstable_by_key(|(start, _)| *start);
+        output_offsets
+            .windows(2)
+            .all(|pair| pair[0].1 <= pair[1].0)
+    }
+}
+
 fn slice_offset(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     let start = needle.as_ptr() as usize;
     let base = haystack.as_ptr() as usize;
@@ -1642,13 +2013,25 @@ fn slice_offset(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .then_some(offset)
 }
 
+#[cfg(test)]
 fn masked_digest(bytes: &[u8], ranges: &[PatchRange]) -> [u8; HASH_SIZE] {
+    let ranges = ranges
+        .iter()
+        .map(|range| InputRange {
+            input_offset: range.input_offset,
+            len: range.len,
+        })
+        .collect::<Vec<_>>();
+    masked_digest_for_input_ranges(bytes, &ranges)
+}
+
+fn masked_digest_for_input_ranges(bytes: &[u8], ranges: &[InputRange]) -> [u8; HASH_SIZE] {
     masked_digest_from_iter(bytes, ranges.iter().copied())
 }
 
 fn masked_digest_from_iter<I>(bytes: &[u8], ranges: I) -> [u8; HASH_SIZE]
 where
-    I: Clone + ExactSizeIterator<Item = PatchRange>,
+    I: Clone + ExactSizeIterator<Item = InputRange>,
 {
     // A structural digest intentionally ignores patchable input bytes. Persist all input range
     // locations before the retained bytes, then hash one contiguous preimage. Dead-strip-heavy
@@ -1765,6 +2148,65 @@ fn apply_patches_from_iter(
             return false;
         };
         destination.copy_from_slice(source);
+        true
+    })
+}
+
+#[cfg(test)]
+fn apply_symbol_value_patches(
+    output: &mut [u8],
+    input: &[u8],
+    patches: &[SymbolValuePatch],
+) -> bool {
+    apply_symbol_value_patches_from_iter(output, input, patches.iter().copied())
+}
+
+fn apply_symbol_value_patches_from_iter(
+    output: &mut [u8],
+    input: &[u8],
+    mut patches: impl Iterator<Item = SymbolValuePatch>,
+) -> bool {
+    patches.all(|patch| {
+        let Some(input_offset) = usize::try_from(patch.input_value_offset).ok() else {
+            return false;
+        };
+        let Some(output_offset) = usize::try_from(patch.output_value_offset).ok() else {
+            return false;
+        };
+        let Some(input_end) = input_offset.checked_add(size_of::<u64>()) else {
+            return false;
+        };
+        let Some(output_end) = output_offset.checked_add(size_of::<u64>()) else {
+            return false;
+        };
+        let Some(input_value) = input
+            .get(input_offset..input_end)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u64::from_le_bytes)
+        else {
+            return false;
+        };
+        let Some(current_output) = output
+            .get(output_offset..output_end)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u64::from_le_bytes)
+        else {
+            return false;
+        };
+        let Some(input_section_offset) = input_value.checked_sub(patch.input_section_address)
+        else {
+            return false;
+        };
+        if input_section_offset >= patch.input_section_size || current_output != patch.baseline_value {
+            return false;
+        }
+        let Some(output_value) = patch.output_section_address.checked_add(input_section_offset) else {
+            return false;
+        };
+        let Some(destination) = output.get_mut(output_offset..output_end) else {
+            return false;
+        };
+        destination.copy_from_slice(&output_value.to_le_bytes());
         true
     })
 }
@@ -2121,6 +2563,22 @@ fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
         .map(u32::from_le_bytes)
 }
 
+fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+    bytes
+        .get(offset..offset.checked_add(2)?)?
+        .try_into()
+        .ok()
+        .map(u16::from_le_bytes)
+}
+
+fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
+    bytes
+        .get(offset..offset.checked_add(8)?)?
+        .try_into()
+        .ok()
+        .map(u64::from_le_bytes)
+}
+
 fn write_staged_manifest_atomic(
     cache_dir: &Path,
     args: &MachOArgs,
@@ -2231,6 +2689,20 @@ impl Manifest {
                 put_u64(&mut out, patch.output_offset);
                 put_u64(&mut out, patch.len);
             }
+            put_u32(&mut out, object.structure_masks.len() as u32);
+            for mask in &object.structure_masks {
+                put_u64(&mut out, mask.input_offset);
+                put_u64(&mut out, mask.len);
+            }
+            put_u32(&mut out, object.symbol_values.len() as u32);
+            for symbol in &object.symbol_values {
+                put_u64(&mut out, symbol.input_value_offset);
+                put_u64(&mut out, symbol.input_section_address);
+                put_u64(&mut out, symbol.input_section_size);
+                put_u64(&mut out, symbol.output_value_offset);
+                put_u64(&mut out, symbol.output_section_address);
+                put_u64(&mut out, symbol.baseline_value);
+            }
             put_u32(&mut out, object.protected.len() as u32);
             for protected in &object.protected {
                 put_u64(&mut out, protected.input_offset);
@@ -2291,6 +2763,26 @@ impl Manifest {
                     len: reader.u64()?,
                 });
             }
+            let structure_mask_count = reader.count()?;
+            let mut structure_masks = Vec::with_capacity(structure_mask_count);
+            for _ in 0..structure_mask_count {
+                structure_masks.push(InputRange {
+                    input_offset: reader.u64()?,
+                    len: reader.u64()?,
+                });
+            }
+            let symbol_value_count = reader.count()?;
+            let mut symbol_values = Vec::with_capacity(symbol_value_count);
+            for _ in 0..symbol_value_count {
+                symbol_values.push(SymbolValuePatch {
+                    input_value_offset: reader.u64()?,
+                    input_section_address: reader.u64()?,
+                    input_section_size: reader.u64()?,
+                    output_value_offset: reader.u64()?,
+                    output_section_address: reader.u64()?,
+                    baseline_value: reader.u64()?,
+                });
+            }
             let protected_count = reader.count()?;
             let mut protected = Vec::with_capacity(protected_count);
             for _ in 0..protected_count {
@@ -2300,11 +2792,15 @@ impl Manifest {
                 });
             }
             anyhow::ensure!(normalise_ranges(&mut patches).is_some(), "invalid cache patch ranges");
+            anyhow::ensure!(normalise_input_ranges(&mut structure_masks).is_some(), "invalid cache structure masks");
+            anyhow::ensure!(symbol_value_patches_are_normalized(&symbol_values), "invalid cache symbol value patches");
             anyhow::ensure!(normalise_protected_ranges(&mut protected).is_some(), "invalid protected ranges");
             objects.push(ObjectRecord {
                 input_index,
                 structure_digest,
                 patches,
+                structure_masks,
+                symbol_values,
                 protected,
             });
         }
@@ -2412,6 +2908,16 @@ impl<'a> ObjectRecordView<'a> {
             .checked_mul(3 * size_of::<u64>())
             .ok_or_else(|| anyhow::anyhow!("cache patch length overflow"))?;
         let _ = reader.take(patch_bytes)?;
+        let structure_mask_count = reader.count()?;
+        let structure_mask_bytes = structure_mask_count
+            .checked_mul(2 * size_of::<u64>())
+            .ok_or_else(|| anyhow::anyhow!("cache structure-mask length overflow"))?;
+        let _ = reader.take(structure_mask_bytes)?;
+        let symbol_value_count = reader.count()?;
+        let symbol_value_bytes = symbol_value_count
+            .checked_mul(6 * size_of::<u64>())
+            .ok_or_else(|| anyhow::anyhow!("cache symbol-value length overflow"))?;
+        let _ = reader.take(symbol_value_bytes)?;
         let protected_count = reader.count()?;
         for _ in 0..protected_count {
             let _ = reader.u64()?;
@@ -2428,6 +2934,16 @@ impl<'a> ObjectRecordView<'a> {
             .checked_mul(3 * size_of::<u64>())
             .ok_or_else(|| anyhow::anyhow!("cache patch length overflow"))?;
         let patch_bytes = reader.take(patch_bytes_len)?;
+        let structure_mask_count = reader.count()?;
+        let structure_mask_bytes_len = structure_mask_count
+            .checked_mul(2 * size_of::<u64>())
+            .ok_or_else(|| anyhow::anyhow!("cache structure-mask length overflow"))?;
+        let structure_mask_bytes = reader.take(structure_mask_bytes_len)?;
+        let symbol_value_count = reader.count()?;
+        let symbol_value_bytes_len = symbol_value_count
+            .checked_mul(6 * size_of::<u64>())
+            .ok_or_else(|| anyhow::anyhow!("cache symbol-value length overflow"))?;
+        let symbol_value_bytes = reader.take(symbol_value_bytes_len)?;
         let protected_count = reader.count()?;
         let protected_start = reader.offset;
         let mut previous_protected_end = 0_u64;
@@ -2448,10 +2964,14 @@ impl<'a> ObjectRecordView<'a> {
             input_index,
             structure_digest,
             patch_bytes,
+            structure_mask_bytes,
+            symbol_value_bytes,
             protected_bytes,
             protected_count,
         };
         anyhow::ensure!(object.patches_are_normalized(), "invalid cache patch ranges");
+        anyhow::ensure!(object.structure_masks_are_normalized(), "invalid cache structure masks");
+        anyhow::ensure!(object.symbol_value_patches_are_normalized(), "invalid cache symbol value patches");
         Ok(object)
     }
 
@@ -2466,6 +2986,18 @@ impl<'a> ObjectRecordView<'a> {
             bytes: self.protected_bytes,
             offset: 0,
             remaining: self.protected_count,
+        }
+    }
+
+    fn structure_masks(&self) -> InputRangeIter<'a> {
+        InputRangeIter {
+            bytes: self.structure_mask_bytes.chunks_exact(2 * size_of::<u64>()),
+        }
+    }
+
+    fn symbol_values(&self) -> SymbolValuePatchIter<'a> {
+        SymbolValuePatchIter {
+            bytes: self.symbol_value_bytes.chunks_exact(6 * size_of::<u64>()),
         }
     }
 
@@ -2488,6 +3020,14 @@ impl<'a> ObjectRecordView<'a> {
         }
         true
     }
+
+    fn structure_masks_are_normalized(&self) -> bool {
+        input_ranges_are_normalized(self.structure_masks())
+    }
+
+    fn symbol_value_patches_are_normalized(&self) -> bool {
+        symbol_value_patches_are_normalized_from_iter(self.symbol_values())
+    }
 }
 
 impl<'a> Iterator for PatchRangeIter<'a> {
@@ -2508,6 +3048,53 @@ impl<'a> Iterator for PatchRangeIter<'a> {
 }
 
 impl ExactSizeIterator for PatchRangeIter<'_> {
+}
+
+impl<'a> Iterator for InputRangeIter<'a> {
+    type Item = InputRange;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let bytes = self.bytes.next()?;
+        Some(InputRange {
+            input_offset: u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
+            len: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+        })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.bytes.size_hint()
+    }
+}
+
+impl ExactSizeIterator for InputRangeIter<'_> {
+}
+
+#[derive(Clone)]
+struct SymbolValuePatchIter<'a> {
+    bytes: std::slice::ChunksExact<'a, u8>,
+}
+
+impl<'a> Iterator for SymbolValuePatchIter<'a> {
+    type Item = SymbolValuePatch;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let bytes = self.bytes.next()?;
+        Some(SymbolValuePatch {
+            input_value_offset: u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
+            input_section_address: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+            input_section_size: u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
+            output_value_offset: u64::from_le_bytes(bytes[24..32].try_into().unwrap()),
+            output_section_address: u64::from_le_bytes(bytes[32..40].try_into().unwrap()),
+            baseline_value: u64::from_le_bytes(bytes[40..48].try_into().unwrap()),
+        })
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.bytes.size_hint()
+    }
+}
+
+impl ExactSizeIterator for SymbolValuePatchIter<'_> {
 }
 
 impl<'a> Iterator for ProtectedRangeIter<'a> {
@@ -2717,13 +3304,16 @@ mod tests {
     use super::DirectObjectSnapshot;
     use super::InputDigest;
     use super::InputFileMetadata;
+    use super::InputRange;
     use super::ImageState;
     use super::ObjectRecord;
     use super::PatchRange;
     use super::ProtectedRange;
     use super::SignatureInfo;
+    use super::SymbolValuePatch;
     use super::add_patch_ranges_excluding_protected;
     use super::apply_patches;
+    use super::apply_symbol_value_patches;
     use super::cache_is_eligible;
     use super::cache_approved_rustc_temporary_archives;
     use super::cache_hit_input_path;
@@ -2736,6 +3326,7 @@ mod tests {
     use super::input_digests_for_cache_hit;
     use super::input_metadata_snapshots_match;
     use super::masked_digest;
+    use super::masked_digest_for_input_ranges;
     use super::protected_ranges_match;
     use super::refresh_changed_code_signature_hashes;
     use super::n_oso_archive_path_patches;
@@ -2780,6 +3371,18 @@ mod tests {
                     output_offset: 8,
                     len: 2,
                 }],
+                structure_masks: vec![InputRange {
+                    input_offset: 4,
+                    len: 2,
+                }],
+                symbol_values: vec![SymbolValuePatch {
+                    input_value_offset: 16,
+                    input_section_address: 0,
+                    input_section_size: 32,
+                    output_value_offset: 48,
+                    output_section_address: 0x1_0000_0000,
+                    baseline_value: 0x1_0000_0004,
+                }],
                 protected: vec![ProtectedRange {
                     input_offset: 4,
                     bytes: vec![9, 10],
@@ -2798,6 +3401,14 @@ mod tests {
         let object = view.object_for_input(0).unwrap().unwrap();
         assert_eq!(object.structure_digest, [3; 32]);
         assert_eq!(object.patches().collect::<Vec<_>>(), manifest.objects[0].patches);
+        assert_eq!(
+            object.structure_masks().collect::<Vec<_>>(),
+            manifest.objects[0].structure_masks
+        );
+        assert_eq!(
+            object.symbol_values().collect::<Vec<_>>(),
+            manifest.objects[0].symbol_values
+        );
         assert!(super::protected_ranges_match_from_iter(
             &[0, 0, 0, 0, 9, 10],
             object.protected()
@@ -3220,6 +3831,55 @@ mod tests {
         assert_eq!(
             masked_digest(b"abcdef", &patches),
             masked_digest(b"abcdef", &different_output_layout)
+        );
+    }
+
+    #[test]
+    fn structural_digest_can_mask_a_linker_private_symbol_value_without_masking_its_nlist_identity() {
+        let masks = [InputRange {
+            input_offset: 8,
+            len: 8,
+        }];
+        let baseline = b"symbol!!\x10\x00\x00\x00\x00\x00\x00\x00type";
+        let changed_value = b"symbol!!\x18\x00\x00\x00\x00\x00\x00\x00type";
+        let changed_identity = b"symbol?!\x18\x00\x00\x00\x00\x00\x00\x00type";
+        assert_eq!(
+            masked_digest_for_input_ranges(baseline, &masks),
+            masked_digest_for_input_ranges(changed_value, &masks)
+        );
+        assert_ne!(
+            masked_digest_for_input_ranges(baseline, &masks),
+            masked_digest_for_input_ranges(changed_identity, &masks)
+        );
+    }
+
+    #[test]
+    fn linker_private_symbol_value_patch_updates_only_a_verified_fixed_width_output_value() {
+        let mut input = [0_u8; 16];
+        input[8..16].copy_from_slice(&0x1018_u64.to_le_bytes());
+        let patch = SymbolValuePatch {
+            input_value_offset: 8,
+            input_section_address: 0x1000,
+            input_section_size: 0x20,
+            output_value_offset: 8,
+            output_section_address: 0x1_0000_0000,
+            baseline_value: 0x1_0000_0010,
+        };
+
+        let mut output = [0_u8; 16];
+        output[8..16].copy_from_slice(&patch.baseline_value.to_le_bytes());
+        assert!(apply_symbol_value_patches(&mut output, &input, &[patch]));
+        assert_eq!(
+            u64::from_le_bytes(output[8..16].try_into().unwrap()),
+            0x1_0000_0018
+        );
+
+        output[8..16].copy_from_slice(&patch.baseline_value.to_le_bytes());
+        input[8..16].copy_from_slice(&0x1020_u64.to_le_bytes());
+        assert!(!apply_symbol_value_patches(&mut output, &input, &[patch]));
+        assert_eq!(
+            u64::from_le_bytes(output[8..16].try_into().unwrap()),
+            patch.baseline_value
         );
     }
 
