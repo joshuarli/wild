@@ -113,6 +113,9 @@ class Workload:
     # A false value records a valid normal-link topology (for example a proc-macro dylib or a
     # changed static archive) without pretending its direct replays should be cache hits.
     stable_layout_cache_eligible: bool = True
+    # Workloads outside this repository (for example rust-lang/cargo) can pin the toolchain in
+    # their profile when they do not carry a rust-toolchain.toml file.
+    toolchain: str | None = None
 
 
 def load_workload(path: Path) -> Workload:
@@ -124,11 +127,16 @@ def load_workload(path: Path) -> Workload:
     goals = raw.get("goals")
     runtime = raw.get("runtime")
     artifact_entries = raw.get("artifacts")
+    configured_toolchain = raw.get("toolchain")
     if not isinstance(mutation, dict) or not isinstance(goals, dict):
         raise ValueError(f"Workload {path} needs incremental_mutation and goals objects")
     cache_eligible = raw.get("stable_layout_cache_eligible", True)
     if not isinstance(cache_eligible, bool):
         raise ValueError("stable_layout_cache_eligible must be a boolean when specified")
+    if configured_toolchain is not None and (
+        not isinstance(configured_toolchain, str) or not configured_toolchain
+    ):
+        raise ValueError("toolchain must be a non-empty string when specified")
     try:
         if "append" in mutation:
             source_mutation = SourceMutation(
@@ -238,6 +246,7 @@ def load_workload(path: Path) -> Workload:
             runtime=runtime_check,
             artifacts=artifact_specs,
             stable_layout_cache_eligible=cache_eligible,
+            toolchain=configured_toolchain,
         )
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError(f"Invalid workload {path}: {error}") from error
@@ -245,6 +254,8 @@ def load_workload(path: Path) -> Workload:
         raise ValueError(f"Workload {path} has an empty Cargo target or mutation contract")
     if workload.target == "":
         raise ValueError(f"Workload {path} has an empty target; omit target for the host")
+    if workload.toolchain == "":
+        raise ValueError(f"Workload {path} has an empty toolchain")
     return workload
 
 
@@ -406,7 +417,7 @@ def clean_git_revision(workspace: Path) -> str:
 
 
 def copy_workspace_to_sibling(source: Path) -> Path:
-    """Copies source to a sibling, preserving Pi's relative external path dependencies."""
+    """Copies source to a sibling, preserving relative external path dependencies."""
     copied = Path(tempfile.mkdtemp(prefix=".wild-cargo-link-benchmark-", dir=source.parent))
     for entry in source.iterdir():
         if entry.name in {".git", "target"}:
@@ -551,11 +562,24 @@ def final_link_command(
     final direct linker argv in shell quoting, which lets the benchmark separately measure only
     the incremental final-link operation without attributing Rust's LTO work to the linker.
     """
-    for line in reversed(log_path.read_text(errors="replace").splitlines()):
+    lines = log_path.read_text(errors="replace").splitlines()
+    for index in reversed(range(len(lines))):
+        line = lines[index]
         try:
             command = shlex.split(line.strip())
         except ValueError:
             continue
+        # Newer Xcode Clang switches long ld64 invocations to a response file in its `-v`
+        # diagnostics. The response file is temporary, but Clang prints the complete argument
+        # vector immediately afterward; reconstruct the direct linker argv from those two lines.
+        if line.strip() == "Arguments passed via response file:" and index > 0 and index + 1 < len(lines):
+            try:
+                launcher = shlex.split(lines[index - 1].strip())
+                response_arguments = shlex.split(lines[index + 1].strip())
+            except ValueError:
+                continue
+            if launcher and response_arguments:
+                command = [launcher[0], *response_arguments]
         if "-arch" not in command or "arm64" not in command or "-o" not in command:
             continue
         command_output = Path(command[command.index("-o") + 1])
@@ -1295,10 +1319,62 @@ def run_sample(
         cold_artifact = cold_artifacts[0]
         cold_evidence = linker_selection_evidence(cold_log, linker)
 
-        # The timed cold Cargo build cannot retain its final codegen object. Rebuild the same
-        # unchanged source in a separate, unmeasured target with `save-temps`, then replay just
-        # that final linker command. This is the no-cache final-link metric; it deliberately
-        # shares none of the stable-layout-cache setup used by the later incremental measurement.
+        cache_setup_log: Path | None = None
+        cache_setup_hits: list[str] = []
+        cache_setup_misses: list[str] = []
+        incremental_target_dir = target_dir
+        incremental_environment = environment
+        if cache_setup_target is not None:
+            # Cold wall time deliberately uses normal Wild. Establish the opt-in cache in a
+            # separate, unmeasured Cargo target so its baseline and its changed rebuild share a
+            # real source/object/output lineage without inflating the cold comparison.
+            cache_setup_log = logs_dir / f"{linker.name}-{sample_index}-cache-setup.log"
+            run_cargo_build(
+                command,
+                workspace=workspace,
+                environment=cache_environment,
+                target_dir=cache_setup_target,
+                log_path=cache_setup_log,
+            )
+            cache_setup_hits = stable_layout_cache_hit_evidence(cache_setup_log)
+            cache_setup_misses = stable_layout_cache_miss_evidence(cache_setup_log)
+            incremental_target_dir = cache_setup_target
+            incremental_environment = cache_environment
+
+        mutation_before, mutation_after = mutate_incremental_source(mutation_path, workload.mutation)
+        assert mutation_before == before_hash
+        _, incremental_elapsed = run_cargo_build(
+            command,
+            workspace=workspace,
+            environment=incremental_environment,
+            target_dir=incremental_target_dir,
+            log_path=incremental_log,
+        )
+        incremental_primary_output = primary_artifact_path(
+            incremental_target_dir, workload, incremental_log, linker
+        )
+        incremental_artifacts = validate_workload_artifacts(
+            incremental_target_dir,
+            workload,
+            cwd=workspace,
+            environment=incremental_environment,
+            primary_output=incremental_primary_output,
+        )
+        incremental_artifact = incremental_artifacts[0]
+        incremental_evidence = linker_selection_evidence(incremental_log, linker)
+        incremental_cache_hits = stable_layout_cache_hit_evidence(incremental_log)
+        incremental_cache_misses = stable_layout_cache_miss_evidence(incremental_log)
+        if cache_enabled and not incremental_cache_hits:
+            raise RuntimeError(
+                f"Wild stable-layout cache missed during Cargo incremental build; see {incremental_log}"
+            )
+
+        # Run the changed-source Cargo build immediately after the cold build on this target.
+        # Rustc removes the final codegen object after an ordinary link, so capture the cold
+        # direct-link inputs only after both wall-time measurements have completed. This keeps
+        # the measured cold -> incremental sequence free of an extra capture rebuild while still
+        # preserving command-equivalent Cargo timings.
+        restore_source(mutation_path, before, before_hash)
         cold_link_capture_target = target_dir / "cold-link-capture"
         cold_link_capture_log = logs_dir / f"{linker.name}-{sample_index}-cold-link-capture.log"
         cold_link_capture_environment = dict(environment)
@@ -1350,56 +1426,9 @@ def run_sample(
             "samples": cold_link,
             "resource_samples": cold_link_resources,
         }
-
-        cache_setup_log: Path | None = None
-        cache_setup_hits: list[str] = []
-        cache_setup_misses: list[str] = []
-        incremental_target_dir = target_dir
-        incremental_environment = environment
-        if cache_setup_target is not None:
-            # Cold wall time deliberately uses normal Wild. Establish the opt-in cache in a
-            # separate, unmeasured Cargo target so its baseline and its changed rebuild share a
-            # real source/object/output lineage without inflating the cold comparison.
-            cache_setup_log = logs_dir / f"{linker.name}-{sample_index}-cache-setup.log"
-            run_cargo_build(
-                command,
-                workspace=workspace,
-                environment=cache_environment,
-                target_dir=cache_setup_target,
-                log_path=cache_setup_log,
-            )
-            cache_setup_hits = stable_layout_cache_hit_evidence(cache_setup_log)
-            cache_setup_misses = stable_layout_cache_miss_evidence(cache_setup_log)
-            incremental_target_dir = cache_setup_target
-            incremental_environment = cache_environment
-
-        mutation_before, mutation_after = mutate_incremental_source(mutation_path, workload.mutation)
-        assert mutation_before == before_hash
-        _, incremental_elapsed = run_cargo_build(
-            command,
-            workspace=workspace,
-            environment=incremental_environment,
-            target_dir=incremental_target_dir,
-            log_path=incremental_log,
-        )
-        incremental_primary_output = primary_artifact_path(
-            incremental_target_dir, workload, incremental_log, linker
-        )
-        incremental_artifacts = validate_workload_artifacts(
-            incremental_target_dir,
-            workload,
-            cwd=workspace,
-            environment=incremental_environment,
-            primary_output=incremental_primary_output,
-        )
-        incremental_artifact = incremental_artifacts[0]
-        incremental_evidence = linker_selection_evidence(incremental_log, linker)
-        incremental_cache_hits = stable_layout_cache_hit_evidence(incremental_log)
-        incremental_cache_misses = stable_layout_cache_miss_evidence(incremental_log)
-        if cache_enabled and not incremental_cache_hits:
-            raise RuntimeError(
-                f"Wild stable-layout cache missed during Cargo incremental build; see {incremental_log}"
-            )
+        # The incremental direct-link capture below needs the changed source again. The final
+        # restore in the `finally` path still guarantees that the disposable workspace is clean.
+        mutate_incremental_source(mutation_path, workload.mutation)
 
         if cache_dir is None:
             # Rustc removes its temporary final codegen object after a normal Cargo link. Create a
@@ -1766,9 +1795,8 @@ def comparison(runs: list[dict[str, Any]], workload: Workload) -> dict[str, Any]
 
 
 def default_wild_path() -> Path:
-    # Linker wall-time comparisons must use an optimized Wild binary; the repository's `ci`
-    # profile disables debug info but otherwise inherits Cargo's unoptimized defaults.
-    return Path(__file__).resolve().parents[1] / "target/release/wild"
+    # Match the optimized ARM64 macOS artifact produced by the release workflow.
+    return Path(__file__).resolve().parents[1] / "target/aarch64-apple-darwin/dist/wild"
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -1833,7 +1861,14 @@ def main(argv: list[str]) -> int:
         raise FileExistsError(f"Refusing to overwrite benchmark result: {output}")
     if not wild.is_file():
         raise FileNotFoundError(f"Wild binary not found: {wild}")
-    channel = parse_toolchain_channel(workspace / "rust-toolchain.toml")
+    toolchain_file = workspace / "rust-toolchain.toml"
+    channel = workload.toolchain
+    if channel is None:
+        if not toolchain_file.is_file():
+            raise FileNotFoundError(
+                f"{workspace} has no rust-toolchain.toml; set the workload's toolchain field"
+            )
+        channel = parse_toolchain_channel(toolchain_file)
     revision = clean_git_revision(workspace)
     clang = Path(run_checked(["xcrun", "--find", "clang"]).strip()).resolve()
     sdk = run_checked(["xcrun", "--show-sdk-path"]).strip()
@@ -1906,6 +1941,7 @@ def main(argv: list[str]) -> int:
                 "cargo_arguments": list(workload.cargo_arguments),
                 "artifact": workload.artifact,
                 "profile": workload.profile,
+                "toolchain": workload.toolchain,
                 "stable_layout_cache_eligible": workload.stable_layout_cache_eligible,
                 "artifacts": [
                     {

@@ -77,14 +77,21 @@ Remaining performance problems, in order:
 Benchmark at least:
 
 1. `~/d/e` — fast iteration workload.
-2. `~/d/pi-agent-core-rs` — full release workspace, `pi-agent`, and `pi-agent-headless`.
+2. `~/d/cargo` — full workspace and the `cargo` binary, measured with its linker-stress profile.
 3. A proc-macro dylib workload.
 4. A native/C++ or staticlib workload.
 5. A large Rust archive/LTO workload.
 
-Use the generic stdlib-Python benchmark runner and checked-in workload manifests. Pin Cargo to:
+Use the generic stdlib-Python benchmark runner and checked-in workload manifests. Invoke the
+Cargo executable explicitly; `benchmarks/cargo.benchmark.json` pins the workload to
+`nightly-2026-07-24`:
 
-    /opt/homebrew/opt/rustup/bin/cargo +nightly-2026-07-24
+    /opt/homebrew/opt/rustup/bin/cargo
+
+The Cargo workload keeps its `release` profile unchanged (`opt-level = 3`, fat LTO,
+`codegen-units = 1`, `panic = "abort"`, and `strip = true`) and uses the inherited
+`linker-stress` profile for linker comparisons (`opt-level = 3`, `lto = false`,
+`codegen-units = 16`, `panic = "abort"`, and `strip = true`).
 
 Measure and report separately:
 

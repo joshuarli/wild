@@ -1,4 +1,4 @@
-"""Stdlib tests for the Pi agent build benchmark's safety-critical helpers."""
+"""Stdlib tests for the Cargo-link benchmark's safety-critical helpers."""
 
 from __future__ import annotations
 
@@ -11,15 +11,21 @@ import sys
 from unittest.mock import patch
 
 
-MODULE_PATH = Path(__file__).with_name("pi_agent_headless.py")
-SPEC = importlib.util.spec_from_file_location("pi_agent_headless", MODULE_PATH)
+MODULE_PATH = Path(__file__).with_name("cargo_link_benchmark_impl.py")
+SPEC = importlib.util.spec_from_file_location("cargo_link_benchmark_impl", MODULE_PATH)
 assert SPEC and SPEC.loader
 BENCHMARK = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = BENCHMARK
 SPEC.loader.exec_module(BENCHMARK)
 
 
-class PiAgentBenchmarkTests(unittest.TestCase):
+class CargoLinkBenchmarkTests(unittest.TestCase):
+    def test_default_wild_path_uses_arm64_dist_artifact(self) -> None:
+        self.assertEqual(
+            BENCHMARK.default_wild_path().as_posix().split("/target/")[-1],
+            "aarch64-apple-darwin/dist/wild",
+        )
+
     def test_parse_toolchain_channel(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "rust-toolchain.toml"
@@ -48,6 +54,26 @@ class PiAgentBenchmarkTests(unittest.TestCase):
             self.assertEqual(workload.cargo_arguments, ("--bin", "other"))
             self.assertEqual(workload.incremental_max, 0.5)
 
+    def test_load_workload_can_pin_toolchain_without_a_source_toolchain_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "workload.json"
+            path.write_text(
+                """{
+                  "schema_version": "cargo-link-workload/v1",
+                  "name": "cargo",
+                  "toolchain": "nightly-2026-07-24",
+                  "target": "aarch64-apple-darwin",
+                  "profile": "release",
+                  "cargo_arguments": ["--bin", "cargo"],
+                  "artifact": "{target}/{profile}/cargo",
+                  "macho_file_type": 2,
+                  "incremental_mutation": {"path": "src/version.rs", "append": "\\n// marker\\n"},
+                  "runtime": {"arguments": ["--version"], "stdout_contains": "cargo "},
+                  "goals": {"cold_wild_over_apple_max": 1.05, "incremental_wild_over_apple_max": 0.5}
+                }"""
+            )
+            self.assertEqual(BENCHMARK.load_workload(path).toolchain, "nightly-2026-07-24")
+
     def test_load_workload_can_exclude_a_normal_link_topology_from_cache_goals(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "workload.json"
@@ -71,13 +97,13 @@ class PiAgentBenchmarkTests(unittest.TestCase):
 
     def test_mutation_is_restored_byte_for_byte(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "pi-agent-headless.rs"
+            path = Path(temporary) / "cargo.rs"
             original = b"fn main() {}\n"
             path.write_bytes(original)
             before, after = BENCHMARK.mutate_incremental_source(
                 path,
                 BENCHMARK.SourceMutation(
-                    path="pi-agent-headless.rs", append=b"\n// benchmark incremental marker\n"
+                    path="cargo.rs", append=b"\n// benchmark incremental marker\n"
                 ),
             )
             self.assertEqual(before, hashlib.sha256(original).hexdigest())
@@ -367,6 +393,18 @@ class PiAgentBenchmarkTests(unittest.TestCase):
             command = BENCHMARK.final_link_command(log, BENCHMARK.Linker("apple-ld64", None))
             self.assertEqual(command[0], "/Applications/Xcode.app/usr/bin/ld")
             self.assertEqual(command[command.index("-o") + 1], "/tmp/output with spaces")
+
+    def test_extracts_response_file_final_linker_child(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            log = Path(temporary) / "cargo.log"
+            log.write_text(
+                '         "/Applications/Xcode.app/usr/bin/ld" @/tmp/response.txt\n'
+                "         Arguments passed via response file:\n"
+                '         "-dynamic" "-arch" "arm64" "-o" "/tmp/output" "/tmp/input.o"\n'
+            )
+            command = BENCHMARK.final_link_command(log, BENCHMARK.Linker("apple-ld64", None))
+            self.assertEqual(command[0], "/Applications/Xcode.app/usr/bin/ld")
+            self.assertEqual(command[command.index("-o") + 1], "/tmp/output")
 
     def test_cargo_final_output_matches_hyphenated_binary_dep_output(self) -> None:
         cargo_artifact = Path("/tmp/target/aarch64-apple-darwin/release/cargo-macho-native-cpp")

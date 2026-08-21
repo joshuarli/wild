@@ -433,8 +433,8 @@ mod tests {
         };
 
         assert_eq!(
-            json_phase_record("target/release/pi-agent-headless", "Hash Mach-O UUID", &reading),
-            "{\"schema_version\":1,\"event\":\"phase\",\"output\":\"target/release/pi-agent-headless\",\"name\":\"Hash Mach-O UUID\",\"wall_time_ns\":42,\"counters\":[{\"name\":\"cycles\",\"value\":7}]}"
+            json_phase_record("target/release/example", "Hash Mach-O UUID", &reading),
+            "{\"schema_version\":1,\"event\":\"phase\",\"output\":\"target/release/example\",\"name\":\"Hash Mach-O UUID\",\"wall_time_ns\":42,\"counters\":[{\"name\":\"cycles\",\"value\":7}]}"
         );
     }
 

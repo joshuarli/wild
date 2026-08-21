@@ -19,7 +19,7 @@ values until durable capture inputs and complete measurements exist.
 
 For repeatable source-build comparisons, use the standard-library Python runner in
 [`benchmarks/cargo_link_benchmark.py`](benchmarks/cargo_link_benchmark.py) with a checked-in
-workload profile such as [`benchmarks/pi-agent-headless.benchmark.json`](benchmarks/pi-agent-headless.benchmark.json)
+workload profile such as [`benchmarks/cargo.benchmark.json`](benchmarks/cargo.benchmark.json)
 or [`benchmarks/e.benchmark.json`](benchmarks/e.benchmark.json).
 It measures a fresh Cargo target, a no-cache cold final-link replay, a Cargo incremental rebuild
 after a controlled source edit, and direct replays of that incremental final-link argv. This
@@ -31,15 +31,17 @@ after that artifact passes all three validations. It alternates Apple ld64 and W
 avoid link-order thermal or filesystem-cache bias, and reports every per-sample Wild/Apple ratio
 alongside its median. The runner copies the source checkout to a disposable sibling and never
 mutates it. Rustc deletes the final temporary codegen object after ordinary links, so each
-unmeasured direct-link capture uses a separate disposable `-C save-temps` rebuild. With
+unmeasured direct-link capture uses a separate disposable `-C save-temps` rebuild. The timed
+cold and changed-source Cargo builds share one target and run back-to-back before those capture
+rebuilds. With
 `--wild-timing-json`, only saved direct Wild replays receive `--time=json`; cold and incremental
 Cargo wall-time runs remain command-equivalent between linkers. Matching phase records are retained
 under `wild_timing_phases` in the result JSON, and the runner rejects a requested timing capture
 that emits no records. The separate resource batch records peak RSS, CPU, final-output bytes, cache
 bytes, and observed transient-disk bytes for both cold and incremental direct replays. See
 `python3 benchmarks/cargo_link_benchmark.py --help` for the required result path and opt-in goal
-enforcement. Its default Wild path is `target/release/wild`; do not use the unoptimized `ci`
-profile for a wall-time comparison.
+enforcement. Its default Wild path is `target/aarch64-apple-darwin/dist/wild`; do not use the
+unoptimized `ci` profile for a wall-time comparison.
 
 Each executable workload manifest has a `runtime` object. Its `arguments` are passed to the produced
 ARM64 executable, `expected_exit` defaults to zero, and one of `stdout_contains` or
@@ -49,12 +51,11 @@ ARM64 executable, `expected_exit` defaults to zero, and one of `stdout_contains`
 Workspace profiles may list multiple `artifacts`; the first is the direct-link replay target and all
 listed outputs are validated after each Cargo build. Hashed Cargo outputs can use a glob path, but
 it must resolve to exactly one file. This keeps the runtime contract deterministic without requiring
-network credentials (the Pi headless profile intentionally checks its missing-key startup error).
+network credentials.
 
-The checked-in source-build matrix includes `e.benchmark.json`, `e-large-rust-lto.benchmark.json`
-(`e`'s checked-in release profile uses fat LTO and links its dependency archives),
-`pi-agent.benchmark.json`, `pi-agent-headless.benchmark.json`, and
-`pi-agent-workspace.benchmark.json`. The checked-in qualification fixtures add
+The checked-in source-build matrix includes `cargo.benchmark.json`, `e.benchmark.json`, and
+`e-large-rust-lto.benchmark.json` (`e`'s checked-in release profile uses fat LTO and links its
+dependency archives). The checked-in qualification fixtures add
 `cargo-macho-proc-macro.benchmark.json` and `cargo-macho-native-cpp.benchmark.json`; invoke those
 with `--workspace wild/tests/cargo_macho_qualification` and
 `--workspace wild/tests/cargo_macho_real_corpus`, respectively. The runner's `--workspace` argument
@@ -90,6 +91,31 @@ python3 benchmarks/cargo_link_benchmark.py \
   --cargo /opt/homebrew/opt/rustup/bin/cargo \
   --output ~/d/wild-benchmark-data/e-$(date +%F).json
 ```
+
+For the full Cargo linker-stress workload, build Wild with the same optimized ARM64 profile used by the
+release artifacts, then let the runner build `~/d/cargo` with alternating vanilla Apple ld64 and
+explicit `target/aarch64-apple-darwin/dist/wild` samples:
+
+```sh
+/opt/homebrew/opt/rustup/bin/cargo +nightly-2026-07-24 \
+  build --locked --profile dist --target aarch64-apple-darwin -p wild-linker --bin wild \
+  --no-default-features --features fork
+python3 benchmarks/cargo_link_benchmark.py \
+  --config benchmarks/cargo.benchmark.json \
+  --workspace ~/d/cargo \
+  --cargo /opt/homebrew/opt/rustup/bin/cargo \
+  --wild target/aarch64-apple-darwin/dist/wild \
+  --wild-timing-json \
+  --output ~/d/wild-benchmark-data/cargo-$(date +%F).json
+```
+
+The Cargo profile pins `nightly-2026-07-24` because the Cargo checkout does not carry a
+`rust-toolchain.toml`. The Apple samples omit Wild's linker flags entirely, so they use the host's
+vanilla macOS ld64 through Xcode Clang. The Cargo benchmark uses the separate `linker-stress`
+profile inherited from `release`: it keeps `opt-level = 3`, aborting panics, and stripping, but
+uses 16 codegen units and no LTO so rustc stays faster while the native linker receives more
+optimized object inputs. Cargo's original `release` profile remains unchanged for its production-
+like fat-LTO baseline.
 
 To measure Wild's opt-in stable-layout incremental path, supply a new, empty cache directory.
 The runner still measures cold Wild without the cache so the cold comparison stays comparable; for
@@ -423,7 +449,7 @@ record has a stable `schema_version`, `event`, `output`, `name`, `wall_time_ns`,
 array. Each counter is an object with stable
 `name` and `value` fields; unavailable counters are omitted. Parallel phase records can complete
 in a different order between runs. The output path makes a mixed Cargo log distinguish the final
-`pi-agent-headless` link from build-script, dependency, and incremental relinks. This is
+`cargo` link from build-script, dependency, and incremental relinks. This is
 intentionally opt-in, like the existing human timing tree.
 
 The ARM64 Mach-O writer has specific phases for export-trie construction, object copying, dynamic
