@@ -4264,12 +4264,7 @@ fn write_dsymutil_debug_map<'data>(
     layout: &MachOLayout<'data>,
     symbol_writer: &mut MachOSymbolTableWriter,
 ) -> Result {
-    if layout.args().should_strip_debug() {
-        return Ok(());
-    }
-    let Some(debug_map) = object.object.dsymutil_debug_map(&object.sections, |section, offset| {
-        object.input_offset_is_live(section, offset)
-    })? else {
+    let Some(debug_map) = &object.format_specific.debug_map else {
         return Ok(());
     };
 

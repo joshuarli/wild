@@ -419,10 +419,22 @@ pub(crate) struct MachORelocationCache {
 #[derive(Default)]
 pub(crate) struct MachOObjectLayoutExt<'data> {
     relocation_cache: MachORelocationCache,
+    /// The debug map is decided while nlist space is reserved and reused by the writer. Its
+    /// source path and live function list require a DWARF and symbol walk, so recomputing it
+    /// during output needlessly repeated work without changing any STABS record.
+    debug_map: Option<DsymutilDebugMap<'data>>,
     /// Exact names allocated for this object's output nlist and dSYM map records. Keeping the
-    /// already-classified spellings avoids repeating the symbol and DWARF walks just to compact
-    /// the final shared string table.
+    /// already-classified spellings lets the final shared string table intern precisely the
+    /// writer's records.
     symtab_strings: Vec<Cow<'data, [u8]>>,
+}
+
+/// The minimal per-object Mach-O state needed after generic layout has assigned addresses.
+/// Deliberately do not retain graph-time relocation or symbol-table caches here: the debug map
+/// is the sole writer input whose construction is expensive enough to reuse.
+#[derive(Debug, Default)]
+pub(crate) struct MachOObjectLayoutExtFinal<'data> {
+    pub(crate) debug_map: Option<DsymutilDebugMap<'data>>,
 }
 
 impl MachORelocationCache {
@@ -2538,11 +2550,20 @@ impl platform::Platform for MachO {
     type PreludeLayoutStateExt = PreludeLayoutExt;
     type PreludeLayoutExt = PreludeLayoutExt;
     type ObjectLayoutStateExt<'data> = MachOObjectLayoutExt<'data>;
+    type ObjectLayoutExt<'data> = MachOObjectLayoutExtFinal<'data>;
     type RawSymbolName<'data> = RawSymbolName<'data>;
     type VersionNames<'data> = ();
     type VerneedTable<'data> = VerneedTable<'data>;
     type ResolvedObjectExt<'data> = ();
     type GcUnit = MachOGcUnit;
+
+    fn finalise_object_layout_ext<'data>(
+        state: &mut Self::ObjectLayoutStateExt<'data>,
+    ) -> Self::ObjectLayoutExt<'data> {
+        MachOObjectLayoutExtFinal {
+            debug_map: state.debug_map.take(),
+        }
+    }
 
     /// Mach-O sections are associated with a SegmentName, while synthetic regions (FILE_HEADER,
     /// LOAD_COMMANDS, etc.) are not.
@@ -3622,6 +3643,7 @@ impl platform::Platform for MachO {
     ) -> Result {
         let mut num_globals = 0;
         let mut strings_size = 0;
+        state.format_specific.debug_map = None;
         state.format_specific.symtab_strings.clear();
         for ((sym_index, sym), flags) in state
             .object
@@ -3660,9 +3682,11 @@ impl platform::Platform for MachO {
         // object and do the address rewriting itself. Retain those names beside ordinary nlist
         // names so `compact_output_symbol_strings` can intern exactly the writer's output.
         if !symbol_db.args.should_strip_debug() {
-            if let Some(debug_map) = state.object.dsymutil_debug_map(&state.sections, |section, offset| {
-                state.input_offset_is_live(section, offset)
-            })? {
+            state.format_specific.debug_map = state.object.dsymutil_debug_map(
+                &state.sections,
+                |section, offset| state.input_offset_is_live(section, offset),
+            )?;
+            if let Some(debug_map) = &state.format_specific.debug_map {
                 num_globals += 3 + 2 * debug_map.functions.len() as u64;
                 strings_size += debug_map.source_path.len() + 1;
                 let object_path = state.input.dsymutil_object_path();
@@ -3675,12 +3699,12 @@ impl platform::Platform for MachO {
                 state
                     .format_specific
                     .symtab_strings
-                    .push(Cow::Owned(debug_map.source_path));
+                    .push(Cow::Owned(debug_map.source_path.clone()));
                 state.format_specific.symtab_strings.push(object_path);
                 state.format_specific.symtab_strings.extend(
                     debug_map
                         .functions
-                        .into_iter()
+                        .iter()
                         .map(|function| Cow::Borrowed(function.name)),
                 );
             }

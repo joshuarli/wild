@@ -753,6 +753,7 @@ impl<C: ElfClass> platform::Platform for Elf<C> {
     type RawSymbolName<'data> = RawSymbolName<'data>;
     type VerneedTable<'data> = VerneedTable<'data>;
     type ObjectLayoutStateExt<'data> = ObjectLayoutStateExt<'data, C>;
+    type ObjectLayoutExt<'data> = ();
     type DynamicLayoutStateExt<'data> = DynamicLayoutStateExt<'data, C>;
     type DynamicLayoutExt<'data> = DynamicLayoutExt<'data, C>;
     type LayoutResourcesExt<'data> = LayoutResourcesExt<'data>;

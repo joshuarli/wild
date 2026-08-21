@@ -383,6 +383,11 @@ pub(crate) trait Platform:
     /// Format-specific per-file state used during the layout phase.
     type ObjectLayoutStateExt<'data>: Default + Send + Sync + 'data;
 
+    /// The compact format-specific state that survives into the output writer. Keep this distinct
+    /// from `ObjectLayoutStateExt`: the latter may hold graph-only caches that would otherwise
+    /// unnecessarily extend their lifetime and peak memory use.
+    type ObjectLayoutExt<'data>: Default + std::fmt::Debug + Send + Sync + 'data;
+
     /// The name of a symbol, possibly with a version.
     type RawSymbolName<'data>: RawSymbolName<'data>;
 
@@ -1022,6 +1027,12 @@ pub(crate) trait Platform:
     fn new_object_layout_state_ext<'data>(
         _input: Self::ResolvedObjectExt<'data>,
     ) -> Self::ObjectLayoutStateExt<'data> {
+        Default::default()
+    }
+
+    fn finalise_object_layout_ext<'data>(
+        _state: &mut Self::ObjectLayoutStateExt<'data>,
+    ) -> Self::ObjectLayoutExt<'data> {
         Default::default()
     }
 

@@ -6492,6 +6492,7 @@ impl platform::Platform for Wasm {
     type PreludeLayoutStateExt = ();
     type PreludeLayoutExt = ();
     type ObjectLayoutStateExt<'data> = WasmObjectLayout<'data>;
+    type ObjectLayoutExt<'data> = ();
     type RawSymbolName<'data> = RawSymbolName<'data>;
     type VersionNames<'data> = ();
     type VerneedTable<'data> = VerneedTable<'data>;
