@@ -32,6 +32,18 @@ class CargoLinkBenchmarkTests(unittest.TestCase):
             path.write_text('[toolchain]\nchannel = "nightly-2026-07-24"\n')
             self.assertEqual(BENCHMARK.parse_toolchain_channel(path), "nightly-2026-07-24")
 
+    def test_linker_selection_accepts_xcode_response_file_diagnostic(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "link.log"
+            path.write_text(
+                '         "/Applications/Xcode.app/Contents/Developer/Toolchains/'
+                'XcodeDefault.xctoolchain/usr/bin/ld" @/var/folders/response.txt\n'
+            )
+            evidence = BENCHMARK.linker_selection_evidence(
+                path, BENCHMARK.Linker(name="apple-ld64", path=None)
+            )
+            self.assertEqual(len(evidence), 1)
+
     def test_load_workload_keeps_target_and_goals_in_data(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "workload.json"

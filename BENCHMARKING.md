@@ -73,6 +73,10 @@ cache sidecars nor use the cache-link target as a gate. The proc-macro dylib pro
 because the cache only supports executables. The native/C++ profile remains eligible: it changes a
 live fixed-width Rust data value while retaining the native static archive, so it verifies that an
 unchanged static archive does not block a safe cache baseline.
+The Cargo linker-stress profile is currently ineligible: changing a Rust codegen unit also changes
+LLVM-internal symbol disambiguators and relocation-table bytes, so the cache's fail-closed structural
+contract correctly falls back to a normal incremental link. Its benchmark therefore measures the
+ordinary Cargo incremental path against ld64.
 
 Each workload's `incremental_mutation` is an exact append or exact one-occurrence replacement.
 Prefer a same-size replacement that changes a real emitted byte over a comment-only edit. For a

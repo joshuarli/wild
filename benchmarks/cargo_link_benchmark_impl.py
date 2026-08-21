@@ -535,11 +535,19 @@ def linker_selection_evidence(log_path: Path, linker: Linker) -> list[str]:
         evidence = [
             line
             for line in lines
-            if "PROGRAM:ld PROJECT:ld64-" in line or (" -arch arm64" in line and "ld" in line)
+            if "PROGRAM:ld PROJECT:ld64-" in line
+            or (" -arch arm64" in line and "ld" in line)
+            or '/usr/bin/ld" @' in line
         ]
     else:
         marker = f"--ld-path={linker.path}"
-        evidence = [line for line in lines if marker in line or (" -arch arm64" in line and "wild" in line)]
+        evidence = [
+            line
+            for line in lines
+            if marker in line
+            or (" -arch arm64" in line and "wild" in line)
+            or f'"{linker.path}" @' in line
+        ]
     if not evidence:
         raise RuntimeError(
             f"No {linker.name} ARM64 linker invocation found in {log_path}; refusing to record a no-op build"

@@ -51,7 +51,7 @@ const MAX_RECORDS: usize = 100_000;
 /// Cache hits may compose a small group of independent direct objects. Bounding both dimensions
 /// keeps an unexpectedly broad rebuild on the normal-link path instead of retaining many mapped
 /// inputs or spending an unbounded amount of time validating their structures.
-const MAX_CHANGED_DIRECT_OBJECTS: usize = 8;
+const MAX_CHANGED_DIRECT_OBJECTS: usize = 16;
 const MAX_CHANGED_DIRECT_OBJECT_BYTES: usize = 16 * 1024 * 1024;
 const DIAGNOSTICS_ENV: &str = "WILD_MACHO_INCREMENTAL_CACHE_DIAGNOSTICS";
 /// Domains the v5 structural digest away from ordinary byte hashes and older cache layouts.
@@ -1864,8 +1864,9 @@ fn resolve_input_path(
         }
         InputSpec::Framework(name) => args.framework_search_path.iter().find_map(|directory| {
             let framework = directory.join(format!("{name}.framework"));
-            let binary = framework.join(name.as_ref());
-            binary.exists().then_some(binary)
+            [framework.join(name.as_ref()), framework.join(format!("{name}.tbd"))]
+                .into_iter()
+                .find(|path| path.exists())
         }),
     }
 }

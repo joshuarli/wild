@@ -7,12 +7,12 @@
   "cargo_arguments": ["--bin", "cargo"],
   "artifact": "{target}/{profile}/cargo",
   "macho_file_type": 2,
-  "stable_layout_cache_eligible": true,
+  "stable_layout_cache_eligible": false,
   "deployment_target": "11.0",
   "incremental_mutation": {
-    "path": "src/version.rs",
-    "replace_before": "format!(\"1.{}.{}\", minor, patch)",
-    "replace_after": "format!(\"1.{}.{}\", minor, patch + 0)"
+    "path": "src/bin/cargo/commands/search.rs",
+    "replace_before": "min(100, limit",
+    "replace_after": "min(101, limit"
   },
   "runtime": {
     "arguments": ["--version"],
