@@ -45,8 +45,9 @@ Measure and report separately:
 - median user CPU, system CPU, and peak RSS for Wild and Apple ld64 from a separate resource
   batch using the same saved inputs and linker verification;
 - final-output apparent/allocated bytes, persistent incremental-cache apparent/allocated bytes,
-  and cache bytes per final-output byte; add peak transient working-directory bytes once the
-  generic runner can sample it without perturbing link timing;
+  cache bytes per final-output byte, and peak transient working-directory apparent/allocated
+  bytes from the separate resource batch. The transient value is an observed lower bound from
+  5 ms polling and excludes both the prepared and published steady-state states;
 - ARM64 Mach-O validation, codesign, and runtime checks.
 
 Disk is a measured trade-off, not a blanket cache-growth prohibition. Retain and compare the
