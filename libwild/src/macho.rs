@@ -415,6 +415,16 @@ pub(crate) struct MachORelocationCache {
     sections: Vec<Option<Vec<NormalizedRelocation>>>,
 }
 
+/// Mach-O-specific layout state kept with one object until all output sizes are final.
+#[derive(Default)]
+pub(crate) struct MachOObjectLayoutExt<'data> {
+    relocation_cache: MachORelocationCache,
+    /// Exact names allocated for this object's output nlist and dSYM map records. Keeping the
+    /// already-classified spellings avoids repeating the symbol and DWARF walks just to compact
+    /// the final shared string table.
+    symtab_strings: Vec<Cow<'data, [u8]>>,
+}
+
 impl MachORelocationCache {
     fn cache(
         &mut self,
@@ -986,6 +996,8 @@ pub(crate) struct LayoutExt<'data> {
     /// Every synthetic input undefined symbol is remapped to the unique, lexically ordered
     /// selector stub that owns its spelling.
     pub(crate) objc_message_stub_indexes: BTreeMap<ObjcMessageSymbol, usize>,
+    /// Deduplicated `LC_SYMTAB` names, with offsets stable before the parallel writer starts.
+    pub(crate) symtab_strings: SymtabStringTable,
 }
 
 #[derive(Debug, Default)]
@@ -999,6 +1011,82 @@ pub(crate) struct FinaliseSizesExt<'data> {
     eh_frame_size: u64,
     objc_message_stubs: Vec<ObjcMessageStub<'data>>,
     objc_message_stub_indexes: BTreeMap<ObjcMessageSymbol, usize>,
+    symtab_strings: SymtabStringTable,
+}
+
+/// One Mach-O string table shared by every output nlist record.
+///
+/// The string table is a link-editor data structure, so duplicate nlist names may point to one
+/// spelling without changing their order, bindings, or debugger-visible records. We construct it
+/// after every object has decided which symbols and dSYM map records survive, then freeze it before
+/// output groups write in parallel.
+#[derive(Debug)]
+pub(crate) struct SymtabStringTable {
+    bytes: Vec<u8>,
+    offsets: HashMap<Vec<u8>, u32>,
+    uninterned_size: u64,
+}
+
+impl Default for SymtabStringTable {
+    fn default() -> Self {
+        Self {
+            // `n_strx == 0` means an unnamed nlist record, so reserve the leading NUL.
+            bytes: vec![0],
+            offsets: HashMap::new(),
+            uninterned_size: 1,
+        }
+    }
+}
+
+impl SymtabStringTable {
+    fn add(&mut self, name: &[u8]) -> Result {
+        let name_size = u64::try_from(name.len())
+            .context("Mach-O symbol name length exceeds u64")?
+            .checked_add(1)
+            .context("Mach-O symbol string-table size overflows")?;
+        self.uninterned_size = self
+            .uninterned_size
+            .checked_add(name_size)
+            .context("Mach-O symbol string-table size overflows")?;
+
+        if self.offsets.contains_key(name) {
+            return Ok(());
+        }
+
+        let offset = u32::try_from(self.bytes.len())
+            .context("Mach-O symbol string table exceeds 4 GiB")?;
+        self.bytes.extend_from_slice(name);
+        self.bytes.push(0);
+        self.offsets.insert(name.to_vec(), offset);
+        Ok(())
+    }
+
+    pub(crate) fn offset_of(&self, name: &[u8]) -> Result<u32> {
+        Ok(self
+            .offsets
+            .get(name)
+            .copied()
+            .context("Mach-O output symbol name was not allocated in the string table")?)
+    }
+
+    pub(crate) fn write_to(&self, out: &mut [u8]) -> Result {
+        ensure!(
+            out.len() == self.bytes.len(),
+            "Mach-O symbol string-table allocation is {} bytes, expected {}",
+            out.len(),
+            self.bytes.len()
+        );
+        out.copy_from_slice(&self.bytes);
+        Ok(())
+    }
+
+    fn uninterned_size(&self) -> u64 {
+        self.uninterned_size
+    }
+
+    fn size(&self) -> u64 {
+        self.bytes.len() as u64
+    }
 }
 
 /// One Clang-generated `_objc_msgSend$selector` reference whose ARM64 ABI requires linker
@@ -1724,7 +1812,7 @@ impl<'data> platform::ObjectFile<'data> for File<'data> {
 
     fn process_gnu_note_section(
         &self,
-        _state: &mut MachORelocationCache,
+        _state: &mut MachOObjectLayoutExt<'data>,
         _section_index: object::SectionIndex,
     ) -> Result {
         // GNU property notes are ELF metadata. Mach-O has neither their section type nor an
@@ -2449,7 +2537,7 @@ impl platform::Platform for MachO {
     type LayoutResourcesExt<'data> = ();
     type PreludeLayoutStateExt = PreludeLayoutExt;
     type PreludeLayoutExt = PreludeLayoutExt;
-    type ObjectLayoutStateExt<'data> = MachORelocationCache;
+    type ObjectLayoutStateExt<'data> = MachOObjectLayoutExt<'data>;
     type RawSymbolName<'data> = RawSymbolName<'data>;
     type VersionNames<'data> = ();
     type VerneedTable<'data> = VerneedTable<'data>;
@@ -2769,8 +2857,13 @@ impl platform::Platform for MachO {
                     let raw_relocations = object.relocations(section_index)?.relocations;
                     object
                         .format_specific
+                        .relocation_cache
                         .cache(section_index, raw_relocations)?;
-                    for &relocation in object.format_specific.for_range(section_index, &range) {
+                    for &relocation in object
+                        .format_specific
+                        .relocation_cache
+                        .for_range(section_index, &range)
+                    {
                         process_normalized_relocation::<A>(
                             object,
                             relocation,
@@ -3052,7 +3145,43 @@ impl platform::Platform for MachO {
                 .unwrap_or(0),
             objc_message_stubs,
             objc_message_stub_indexes,
+            symtab_strings: Default::default(),
         })
+    }
+
+    fn compact_output_symbol_strings<'data>(
+        groups: &mut [layout::GroupState<'data, Self>],
+        finalise_sizes_ext: &mut Self::FinaliseSizesExt<'data>,
+    ) -> Result {
+        let mut strings = SymtabStringTable::default();
+
+        for object in layout::objects_iter(groups) {
+            for name in &object.format_specific.symtab_strings {
+                strings.add(name)?;
+            }
+        }
+
+        let uninterned_size = groups
+            .iter()
+            .map(|group| group.common.allocated_size(part_id::STRTAB))
+            .sum::<u64>();
+        ensure!(
+            uninterned_size == strings.uninterned_size(),
+            "Mach-O symbol string-table allocation diverged from output symbols: allocated {uninterned_size} bytes, collected {} bytes",
+            strings.uninterned_size()
+        );
+
+        for group in groups.iter_mut() {
+            group.common.set_allocated_size(part_id::STRTAB, 0);
+        }
+        groups
+            .first_mut()
+            .context("missing Mach-O prelude group for symbol string table")?
+            .common
+            .allocate(part_id::STRTAB, strings.size());
+        finalise_sizes_ext.symtab_strings = strings;
+
+        Ok(())
     }
 
     fn create_layout_ext<'data>(
@@ -3100,6 +3229,7 @@ impl platform::Platform for MachO {
             .collect();
         layout_ext.objc_message_stubs = finalise_sizes_ext.objc_message_stubs;
         layout_ext.objc_message_stub_indexes = finalise_sizes_ext.objc_message_stub_indexes;
+        layout_ext.symtab_strings = finalise_sizes_ext.symtab_strings;
 
         Ok(layout_ext)
     }
@@ -3485,13 +3615,14 @@ impl platform::Platform for MachO {
     }
 
     fn allocate_object_symtab_space<'data>(
-        state: &crate::layout::ObjectLayoutState<'data, Self>,
+        state: &mut crate::layout::ObjectLayoutState<'data, Self>,
         common: &mut crate::layout::CommonGroupState<'data, Self>,
         symbol_db: &crate::symbol_db::SymbolDb<'data, Self>,
         per_symbol_flags: &crate::value_flags::AtomicPerSymbolFlags,
     ) -> Result {
         let mut num_globals = 0;
         let mut strings_size = 0;
+        state.format_specific.symtab_strings.clear();
         for ((sym_index, sym), flags) in state
             .object
             .enumerate_symbols()
@@ -3517,25 +3648,41 @@ impl platform::Platform for MachO {
             ) {
                 num_globals += 1;
                 strings_size += info.name.len() + 1;
+                state
+                    .format_specific
+                    .symtab_strings
+                    .push(Cow::Borrowed(info.name));
             }
         }
 
         // An executable's final image intentionally omits ordinary `__DWARF`. For the restricted
         // C/Rust path, reserve the STABS debug map that lets `dsymutil` reopen this loose input
-        // object and do the address rewriting itself. Keep this allocation exactly in sync with
-        // `write_dsymutil_debug_map` in the writer.
+        // object and do the address rewriting itself. Retain those names beside ordinary nlist
+        // names so `compact_output_symbol_strings` can intern exactly the writer's output.
         if !symbol_db.args.should_strip_debug() {
             if let Some(debug_map) = state.object.dsymutil_debug_map(&state.sections, |section, offset| {
                 state.input_offset_is_live(section, offset)
             })? {
                 num_globals += 3 + 2 * debug_map.functions.len() as u64;
                 strings_size += debug_map.source_path.len() + 1;
-                strings_size += state.input.dsymutil_object_path().len() + 1;
+                let object_path = state.input.dsymutil_object_path();
+                strings_size += object_path.len() + 1;
                 strings_size += debug_map
                     .functions
                     .iter()
                     .map(|function| function.name.len() + 1)
                     .sum::<usize>();
+                state
+                    .format_specific
+                    .symtab_strings
+                    .push(Cow::Owned(debug_map.source_path));
+                state.format_specific.symtab_strings.push(object_path);
+                state.format_specific.symtab_strings.extend(
+                    debug_map
+                        .functions
+                        .into_iter()
+                        .map(|function| Cow::Borrowed(function.name)),
+                );
             }
         }
         let entry_size = size_of::<RawSymtabEntry>() as u64;
@@ -5636,6 +5783,23 @@ mod tests {
             cache.for_section(section_index)[0].info.r_type,
             macho::ARM64_RELOC_BRANCH26
         );
+    }
+
+    #[test]
+    fn symtab_string_table_interns_duplicate_nlist_names() {
+        let mut strings = SymtabStringTable::default();
+        strings.add(b"_alpha").unwrap();
+        strings.add(b"_beta").unwrap();
+        strings.add(b"_alpha").unwrap();
+
+        assert_eq!(strings.offset_of(b"_alpha").unwrap(), 1);
+        assert_eq!(strings.offset_of(b"_beta").unwrap(), 8);
+        assert_eq!(strings.uninterned_size(), 21);
+        assert_eq!(strings.size(), 14);
+
+        let mut output = vec![0; strings.size() as usize];
+        strings.write_to(&mut output).unwrap();
+        assert_eq!(output, b"\0_alpha\0_beta\0");
     }
 
     #[test]

@@ -657,6 +657,16 @@ pub(crate) trait Platform:
         _resolutions: &SymbolResolutions<Self>,
     ) -> Result<Self::LayoutExt<'data>>;
 
+    /// Compacts output symbol-name storage after every per-object allocation is known, but before
+    /// output-section layout assigns file offsets. Formats that do not share symbol names keep
+    /// the default no-op implementation.
+    fn compact_output_symbol_strings<'data>(
+        _groups: &mut [layout::GroupState<'data, Self>],
+        _finalise_sizes_ext: &mut Self::FinaliseSizesExt<'data>,
+    ) -> Result {
+        Ok(())
+    }
+
     fn load_exception_frame_data<'data, 'scope, A: Arch<Platform = Self>>(
         object: &mut ObjectLayoutState<'data, Self>,
         common: &mut layout::CommonGroupState<'data, Self>,
@@ -824,7 +834,7 @@ pub(crate) trait Platform:
     );
 
     fn allocate_object_symtab_space<'data>(
-        state: &ObjectLayoutState<'data, Self>,
+        state: &mut ObjectLayoutState<'data, Self>,
         common: &mut CommonGroupState<'data, Self>,
         symbol_db: &SymbolDb<'data, Self>,
         per_symbol_flags: &AtomicPerSymbolFlags,

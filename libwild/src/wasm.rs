@@ -6940,7 +6940,7 @@ impl platform::Platform for Wasm {
     }
 
     fn allocate_object_symtab_space<'data>(
-        _state: &crate::layout::ObjectLayoutState<'data, Self>,
+        _state: &mut crate::layout::ObjectLayoutState<'data, Self>,
         _common: &mut crate::layout::CommonGroupState<'data, Self>,
         _symbol_db: &crate::symbol_db::SymbolDb<'data, Self>,
         _per_symbol_flags: &crate::value_flags::AtomicPerSymbolFlags,

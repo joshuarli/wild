@@ -180,8 +180,30 @@ pub fn compute<'data, P: Platform, A: Arch<Platform = P>, F: FileSystem>(
         num_symbols: 0,
     });
 
-    let finalise_sizes_ext =
+    let mut finalise_sizes_ext =
         P::create_finalise_sizes_ext::<A>(symbol_db.args, &mut group_states, &symbol_db)?;
+
+    {
+        let finalise_sizes_resources = FinaliseSizesResources {
+            dynamic_symbol_definitions: &dynamic_symbol_definitions,
+            symbol_db: &symbol_db,
+            merged_strings: &merged_strings,
+            format_specific: &finalise_sizes_ext,
+            script_sorted_sections: &script_sorted_sections,
+        };
+
+        finalise_all_sizes::<P, A>(
+            &mut group_states,
+            &output_sections,
+            &atomic_per_symbol_flags,
+            &finalise_sizes_resources,
+        )?;
+    }
+
+    P::compact_output_symbol_strings(
+        &mut group_states,
+        &mut finalise_sizes_ext,
+    )?;
 
     let finalise_sizes_resources = FinaliseSizesResources {
         dynamic_symbol_definitions: &dynamic_symbol_definitions,
@@ -190,13 +212,6 @@ pub fn compute<'data, P: Platform, A: Arch<Platform = P>, F: FileSystem>(
         format_specific: &finalise_sizes_ext,
         script_sorted_sections: &script_sorted_sections,
     };
-
-    finalise_all_sizes::<P, A>(
-        &mut group_states,
-        &output_sections,
-        &atomic_per_symbol_flags,
-        &finalise_sizes_resources,
-    )?;
 
     // Dropping `symbol_info_printer` will cause it to print. So we'll either print now, or, if we
     // got an error or panic, then we'll have printed at that point.
@@ -1349,6 +1364,16 @@ impl<'data, P: Platform> CommonGroupState<'data, P> {
 
     pub(crate) fn allocate(&mut self, part_id: PartId, size: u64) {
         self.mem_sizes.increment(part_id, size);
+    }
+
+    /// Returns this group's final allocation for one output part.
+    pub(crate) fn allocated_size(&self, part_id: PartId) -> u64 {
+        *self.mem_sizes.get(part_id)
+    }
+
+    /// Replaces this group's allocation for one output part before output layout assigns offsets.
+    pub(crate) fn set_allocated_size(&mut self, part_id: PartId, size: u64) {
+        *self.mem_sizes.get_mut(part_id) = size;
     }
 
     fn store_section_attributes(&mut self, part_id: PartId, header: &P::SectionHeader) {
@@ -4612,7 +4637,7 @@ impl<'data, P: Platform> ObjectLayoutState<'data, P> {
     }
 
     fn allocate_symtab_space(
-        &self,
+        &mut self,
         common: &mut CommonGroupState<'data, P>,
         symbol_db: &SymbolDb<'data, P>,
         per_symbol_flags: &AtomicPerSymbolFlags,

@@ -2040,7 +2040,7 @@ impl<C: ElfClass> platform::Platform for Elf<C> {
     }
 
     fn allocate_object_symtab_space<'data>(
-        state: &ObjectLayoutState<'data, Elf<C>>,
+        state: &mut ObjectLayoutState<'data, Elf<C>>,
         common: &mut CommonGroupState<'data, Elf<C>>,
         symbol_db: &SymbolDb<'data, Elf<C>>,
         per_symbol_flags: &AtomicPerSymbolFlags,

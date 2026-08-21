@@ -55,6 +55,7 @@ use crate::macho::RpathCommand;
 use crate::macho::SectionEntry;
 use crate::macho::SegmentCommand;
 use crate::macho::SegmentName;
+use crate::macho::SymtabStringTable;
 use crate::macho::SymtabCommand;
 use crate::macho::UuidCommand;
 use crate::macho::code_signature_identifier;
@@ -179,7 +180,7 @@ pub(crate) fn write<'data, A: Arch<Platform = MachO>>(
                 verbose_timing_phase!("Write group");
 
                 let mut symbol_writer = MachOSymbolTableWriter {
-                    next_strtab_offset: group.strtab_start_offset,
+                    strings: &layout.format_specific.symtab_strings,
                 };
                 for file in &group.files {
                     write_file::<A>(
@@ -194,6 +195,14 @@ pub(crate) fn write<'data, A: Arch<Platform = MachO>>(
                 }
                 Ok(())
             })?;
+    }
+
+    {
+        let mut section_buffers = split_output_into_sections(layout, &mut sized_output.out).0;
+        layout
+            .format_specific
+            .symtab_strings
+            .write_to(section_buffers.get_mut(output_section_id::STRTAB))?;
     }
 
     let objc_selector_rebases = {
@@ -3960,24 +3969,11 @@ fn write_code_signature_hashes(
     Ok(())
 }
 
-struct MachOSymbolTableWriter {
-    next_strtab_offset: u32,
+struct MachOSymbolTableWriter<'strings> {
+    strings: &'strings SymtabStringTable,
 }
 
-impl MachOSymbolTableWriter {
-    fn write_str(&mut self, name: &[u8], buffers: &mut OutputSectionPartMap<&mut [u8]>) -> u32 {
-        let len_with_terminator = name.len() + 1;
-        let offset = self.next_strtab_offset;
-        let out = buffers
-            .get_mut(part_id::STRTAB)
-            .split_off_mut(..len_with_terminator)
-            .unwrap();
-        out[..name.len()].copy_from_slice(name);
-        out[name.len()] = 0;
-        self.next_strtab_offset += len_with_terminator as u32;
-        offset
-    }
-
+impl MachOSymbolTableWriter<'_> {
     #[inline(always)]
     fn define_symbol(
         &mut self,
@@ -4025,7 +4021,7 @@ impl MachOSymbolTableWriter {
         name: &[u8],
         buffers: &'out mut OutputSectionPartMap<&mut [u8]>,
     ) -> Result<&'out mut SymtabEntry> {
-        let string_offset = self.write_str(name, buffers);
+        let string_offset = self.strings.offset_of(name)?;
         let entry = self.write_unnamed_entry(buffers)?;
         entry.n_strx.set(LE, string_offset);
         Ok(entry)
