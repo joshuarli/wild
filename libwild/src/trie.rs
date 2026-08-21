@@ -2,6 +2,7 @@
 
 use leb128::write::unsigned_len as uleb128_size;
 use object::macho;
+use rayon::slice::ParallelSliceMut as _;
 use smallvec::SmallVec;
 
 #[derive(Debug, Clone, Copy)]
@@ -37,7 +38,7 @@ pub(crate) fn build(symbols: &mut [Symbol<'_>]) -> Vec<u8> {
         return vec![0, 0];
     }
 
-    symbols.sort_unstable_by(|a, b| a.name.cmp(b.name));
+    symbols.par_sort_unstable_by(|a, b| a.name.cmp(b.name));
     debug_assert!(
         symbols.windows(2).all(|w| w[0].name != w[1].name),
         "duplicate Mach-O export symbol names"
