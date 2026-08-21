@@ -17,9 +17,10 @@ Primary targets:
 - Peak RSS: Wild ≤ 0.75× Apple median peak RSS and ≤ 0.90× on every tracked final-link replay.
   Measure this in the separate, comparable resource batch—not from wall-time runs or Cargo's
   process tree.
-- Final outputs: Wild's apparent and allocated output bytes must each be ≤ 1.05× Apple's for
-  equivalent inputs and link options, unless a documented format or toolchain difference makes
-  the comparison inapplicable.
+- Final outputs: record and compare Wild's apparent and allocated output bytes against Apple's for
+  equivalent inputs and link options. Output growth above 1.05× Apple's needs a documented format
+  or toolchain reason, a supported cache topology, or a verified incremental direct-link gain of
+  at least 15%; otherwise treat it as a regression. Do not trade peak-RSS regressions this way.
 - Never trade a cold or incremental speed win for an unexplained memory regression. A change
   that increases peak RSS by more than 3% on a tracked workload must retain a direct-link win of
   at least 15% or add a documented supported incremental topology.
