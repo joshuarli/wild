@@ -115,6 +115,13 @@ class PiAgentBenchmarkTests(unittest.TestCase):
                                 "output": {"apparent_bytes": 80, "allocated_bytes": 96},
                                 "incremental_cache": None,
                             },
+                            "transient_disk_usage": {
+                                "peak_transient": {
+                                    "apparent_bytes": 8,
+                                    "allocated_bytes": 16,
+                                },
+                                "complete": True,
+                            },
                         }
                     ]
                 },
@@ -136,6 +143,13 @@ class PiAgentBenchmarkTests(unittest.TestCase):
                                     "apparent_bytes": 150,
                                     "allocated_bytes": 160,
                                 },
+                            },
+                            "transient_disk_usage": {
+                                "peak_transient": {
+                                    "apparent_bytes": 20,
+                                    "allocated_bytes": 32,
+                                },
+                                "complete": True,
                             },
                         }
                     ]
@@ -185,6 +199,13 @@ class PiAgentBenchmarkTests(unittest.TestCase):
         self.assertEqual(
             result["incremental_link_wild_cache_bytes_per_output_byte"],
             {"apparent_bytes": 1.5, "allocated_bytes": 1.25},
+        )
+        self.assertEqual(
+            result["incremental_link_peak_transient_working_directory_bytes"],
+            {
+                "apparent_bytes": {"apple-ld64": 8, "wild": 20},
+                "allocated_bytes": {"apple-ld64": 16, "wild": 32},
+            },
         )
 
     def test_comparison_aggregates_cache_hit_rate_and_miss_reasons(self) -> None:
@@ -353,6 +374,42 @@ class PiAgentBenchmarkTests(unittest.TestCase):
             usage = BENCHMARK.path_disk_usage_bytes(cache)
             self.assertEqual(usage["apparent_bytes"], len(b"cache bytes"))
             self.assertGreaterEqual(usage["allocated_bytes"], usage["apparent_bytes"])
+
+    def test_direct_replay_working_roots_exclude_nested_paths(self) -> None:
+        output = Path("/tmp/target/deps/e")
+        self.assertEqual(
+            BENCHMARK.direct_replay_working_roots(output, Path("/tmp/target/deps/cache")),
+            (Path("/tmp/target/deps"),),
+        )
+        self.assertEqual(
+            BENCHMARK.direct_replay_working_roots(output, Path("/tmp/cache")),
+            (Path("/tmp/target/deps"), Path("/tmp/cache")),
+        )
+
+    def test_peak_transient_disk_usage_excludes_baseline_and_published_bytes(self) -> None:
+        self.assertEqual(
+            BENCHMARK.peak_transient_disk_usage_bytes(
+                {"apparent_bytes": 100, "allocated_bytes": 128},
+                {"apparent_bytes": 180, "allocated_bytes": 224},
+                {"apparent_bytes": 140, "allocated_bytes": 160},
+            ),
+            {"apparent_bytes": 40, "allocated_bytes": 64},
+        )
+
+    def test_incomplete_transient_disk_measurement_is_not_medianed(self) -> None:
+        self.assertEqual(
+            BENCHMARK.median_transient_disk_usage_bytes(
+                [
+                    {
+                        "transient_disk_usage": {
+                            "peak_transient": {"apparent_bytes": 8, "allocated_bytes": 16},
+                            "complete": False,
+                        }
+                    }
+                ]
+            ),
+            {"apparent_bytes": None, "allocated_bytes": None},
+        )
 
     def test_cache_baseline_replays_the_raw_linker_output_after_cargo_postprocessing(self) -> None:
         """The direct cache image must match Wild's raw output, not Cargo's stripped artifact."""

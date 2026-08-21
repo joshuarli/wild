@@ -26,6 +26,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import statistics
 import struct
 import subprocess
@@ -50,6 +51,10 @@ MACOS_TIME_MAX_RSS = re.compile(r"^\s*(\d+)\s+maximum resident set size\s*$")
 MACOS_TIME_CPU = re.compile(
     r"^\s*\d+(?:\.\d+)?\s+real\s+(\d+(?:\.\d+)?)\s+user\s+(\d+(?:\.\d+)?)\s+sys\s*$"
 )
+# Resource replays are outside the wall-time samples. Sampling their mutable output/cache roots
+# at this interval makes short atomic-replacement files visible without perturbing the reported
+# direct-link timing or child-only RSS/CPU counters.
+RESOURCE_DISK_SAMPLE_INTERVAL_SECONDS = 0.005
 
 
 @dataclass(frozen=True)
@@ -625,18 +630,64 @@ def replay_incremental_link(
             if measure_resources and sys.platform == "darwin"
             else replay
         )
+        cache_path = incremental_cache_path(replay)
+        transient_disk_usage: dict[str, Any] | None = None
+        if measure_resources:
+            temporary_directory = output_dir / f".{linker.name}-{repetition}-resource-tmp"
+            temporary_directory.mkdir(exist_ok=False)
+            working_roots = direct_replay_working_roots(output, cache_path, temporary_directory)
+            baseline_working_usage = combined_disk_usage_bytes(working_roots)
+            peak_working_usage = baseline_working_usage
+            resource_environment = dict(environment)
+            resource_environment["TMPDIR"] = str(temporary_directory)
+            samples_while_running = 0
         start = time.perf_counter_ns()
         with log_path.open("w", encoding="utf-8") as log:
-            completed = subprocess.run(
-                metered_replay,
-                env=environment,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                text=True,
-            )
+            if measure_resources:
+                process = subprocess.Popen(
+                    metered_replay,
+                    env=resource_environment,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+                while process.poll() is None:
+                    samples_while_running += 1
+                    peak_working_usage = maximum_disk_usage_bytes(
+                        peak_working_usage, combined_disk_usage_bytes(working_roots)
+                    )
+                    time.sleep(RESOURCE_DISK_SAMPLE_INTERVAL_SECONDS)
+                returncode = process.wait()
+            else:
+                completed = subprocess.run(
+                    metered_replay,
+                    env=environment,
+                    stdout=log,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+                returncode = completed.returncode
         elapsed = time.perf_counter_ns() - start
-        if completed.returncode:
+        if returncode:
             raise RuntimeError(f"{linker.name} incremental replay failed; see {log_path}")
+        if measure_resources:
+            final_working_usage = combined_disk_usage_bytes(working_roots)
+            peak_working_usage = maximum_disk_usage_bytes(peak_working_usage, final_working_usage)
+            transient_disk_usage = {
+                "working_directories": [str(path) for path in working_roots],
+                "baseline": baseline_working_usage,
+                "peak": peak_working_usage,
+                "final": final_working_usage,
+                "peak_transient": peak_transient_disk_usage_bytes(
+                    baseline_working_usage, peak_working_usage, final_working_usage
+                ),
+                "sample_interval_ns": int(RESOURCE_DISK_SAMPLE_INTERVAL_SECONDS * 1_000_000_000),
+                "samples_while_running": samples_while_running,
+                # A file may be created and removed between polls. This is intentionally an
+                # observed lower bound from the separate resource batch, never a wall-time datum.
+                "complete": samples_while_running > 0,
+                "observed_lower_bound": True,
+            }
         resource_report = (
             log_path.read_text(errors="replace")
             if measure_resources and sys.platform == "darwin"
@@ -666,7 +717,6 @@ def replay_incremental_link(
             raise RuntimeError(
                 f"Wild stable-layout cache missed during incremental replay; see {log_path}"
             )
-        cache_path = incremental_cache_path(replay)
         samples.append(
             {
                 "elapsed_ns": elapsed,
@@ -682,6 +732,7 @@ def replay_incremental_link(
                         path_disk_usage_bytes(cache_path) if cache_path is not None else None
                     ),
                 },
+                "transient_disk_usage": transient_disk_usage,
                 "stable_layout_cache_hits": cache_hits,
                 "stable_layout_cache_misses": cache_misses,
                 "wild_timing_phases": timing_phases,
@@ -771,15 +822,75 @@ def path_disk_usage_bytes(path: Path) -> dict[str, int]:
         return {"apparent_bytes": 0, "allocated_bytes": 0}
     paths = [path]
     if path.is_dir():
-        paths.extend(entry for entry in path.rglob("*") if not entry.is_symlink())
+        try:
+            paths.extend(entry for entry in path.rglob("*") if not entry.is_symlink())
+        except OSError:
+            # A direct replay may atomically rename a sampled temporary file between directory
+            # iteration and metadata collection. Skip that vanished entry; a later sample sees
+            # the published file and this sampler must never affect linker correctness.
+            pass
     apparent_bytes = 0
     allocated_bytes = 0
     for entry in paths:
-        metadata = entry.lstat()
-        if entry.is_file():
+        try:
+            metadata = entry.lstat()
+        except OSError:
+            continue
+        if stat.S_ISREG(metadata.st_mode):
             apparent_bytes += metadata.st_size
         allocated_bytes += getattr(metadata, "st_blocks", 0) * 512
     return {"apparent_bytes": apparent_bytes, "allocated_bytes": allocated_bytes}
+
+
+def direct_replay_working_roots(
+    output: Path, cache_path: Path | None, temporary_directory: Path | None = None
+) -> tuple[Path, ...]:
+    """Returns non-overlapping mutable directories for one direct-link resource replay.
+
+    The output's parent contains atomic output replacements. A stable-layout cache has its own
+    sidecar directory. Removing nested roots avoids double-counting when a caller places a cache
+    under the output directory.
+    """
+    candidates = [output.parent]
+    if cache_path is not None:
+        candidates.append(cache_path)
+    if temporary_directory is not None:
+        candidates.append(temporary_directory)
+    roots: list[Path] = []
+    for candidate in candidates:
+        if candidate in roots:
+            continue
+        if any(candidate.is_relative_to(root) for root in roots):
+            continue
+        roots = [root for root in roots if not root.is_relative_to(candidate)]
+        roots.append(candidate)
+    return tuple(roots)
+
+
+def combined_disk_usage_bytes(paths: tuple[Path, ...]) -> dict[str, int]:
+    """Sums non-overlapping mutable-directory usage for one sampling instant."""
+    total = {"apparent_bytes": 0, "allocated_bytes": 0}
+    for path in paths:
+        usage = path_disk_usage_bytes(path)
+        for kind in total:
+            total[kind] += usage[kind]
+    return total
+
+
+def maximum_disk_usage_bytes(
+    current: dict[str, int], candidate: dict[str, int]
+) -> dict[str, int]:
+    return {kind: max(current[kind], candidate[kind]) for kind in current}
+
+
+def peak_transient_disk_usage_bytes(
+    baseline: dict[str, int], peak: dict[str, int], final: dict[str, int]
+) -> dict[str, int]:
+    """Returns bytes briefly above both the prepared and published direct-link states."""
+    return {
+        kind: max(0, peak[kind] - max(baseline[kind], final[kind]))
+        for kind in baseline
+    }
 
 
 def incremental_cache_path(command: list[str]) -> Path | None:
@@ -899,6 +1010,24 @@ def median_disk_usage_bytes(
             disk_usage = sample.get("disk_usage")
             location_usage = disk_usage.get(location) if isinstance(disk_usage, dict) else None
             value = location_usage.get(kind) if isinstance(location_usage, dict) else None
+            values.append(value if isinstance(value, int) else None)
+        medians[kind] = median_optional_bytes(values)
+    return medians
+
+
+def median_transient_disk_usage_bytes(samples: list[dict[str, Any]]) -> dict[str, int | None]:
+    """Medians for temporary bytes sampled only in the separate resource replay."""
+    medians: dict[str, int | None] = {}
+    for kind in ("apparent_bytes", "allocated_bytes"):
+        values: list[int | None] = []
+        for sample in samples:
+            transient = sample.get("transient_disk_usage")
+            peak = (
+                transient.get("peak_transient")
+                if isinstance(transient, dict) and transient.get("complete")
+                else None
+            )
+            value = peak.get(kind) if isinstance(peak, dict) else None
             values.append(value if isinstance(value, int) else None)
         medians[kind] = median_optional_bytes(values)
     return medians
@@ -1416,6 +1545,21 @@ def comparison(runs: list[dict[str, Any]], workload: Workload) -> dict[str, Any]
         }
         for location in ("output", "incremental_cache")
     }
+    incremental_link_peak_transient_working_directory_bytes = {
+        kind: {
+            linker: median_transient_disk_usage_bytes(
+                [
+                    sample
+                    for run in samples
+                    for sample in run["incremental_link"].get(
+                        "resource_samples", run["incremental_link"]["samples"]
+                    )
+                ]
+            )[kind]
+            for linker, samples in by_linker.items()
+        }
+        for kind in ("apparent_bytes", "allocated_bytes")
+    }
     wild_cache_bytes_per_output_byte = {
         kind: (
             incremental_link_disk_usage_bytes["incremental_cache"][kind]["wild"]
@@ -1459,6 +1603,9 @@ def comparison(runs: list[dict[str, Any]], workload: Workload) -> dict[str, Any]
         "incremental_link_peak_rss_wild_over_apple": incremental_link_peak_rss_ratio,
         "incremental_link_cpu_ns": incremental_link_cpu_ns,
         "incremental_link_disk_usage_bytes": incremental_link_disk_usage_bytes,
+        "incremental_link_peak_transient_working_directory_bytes": (
+            incremental_link_peak_transient_working_directory_bytes
+        ),
         "incremental_link_wild_cache_bytes_per_output_byte": wild_cache_bytes_per_output_byte,
         "thresholds": {
             "cold_max": workload.cold_max,
@@ -1660,6 +1807,11 @@ def main(argv: list[str]) -> int:
                     else None
                 ),
                 "disk_usage": "lstat apparent bytes and allocated 512-byte blocks after each direct replay",
+                "transient_disk_usage": (
+                    "separate resource replay polls mutable output/cache directories every "
+                    f"{RESOURCE_DISK_SAMPLE_INTERVAL_SECONDS * 1000:g} ms; peak transient bytes "
+                    "exclude both prepared and published steady-state bytes"
+                ),
                 "result_artifacts": str(result_root),
             },
             "runs": runs,
