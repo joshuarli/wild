@@ -142,12 +142,14 @@ use object::slice_from_bytes_mut;
 use object::write::macho::CodeDirectory;
 use object::write::macho::CodeSignatureEncoder;
 use rayon::iter::IntoParallelIterator;
+use rayon::iter::IntoParallelRefIterator;
 use rayon::iter::ParallelIterator;
 use rayon::slice::ParallelSlice;
 use sha2::Digest;
 use sha2::Sha256;
 use std::collections::BTreeMap;
 use std::ops::BitAnd;
+use std::ops::Range;
 use tracing::debug_span;
 use zerocopy::FromZeros;
 
@@ -327,6 +329,121 @@ struct FinalEhFramePlan {
     personality_got_rebases: BTreeMap<u64, u64>,
 }
 
+/// Immutable per-section unwind analysis. We retain only the selected ranges and resolved input
+/// targets so parsing and liveness checks can run in parallel; serialization remains in input
+/// order because CIE pointers and FDE offsets are part of the final on-disk contract.
+#[derive(Debug)]
+struct EhFrameSectionPlan<'data> {
+    data: &'data [u8],
+    cies: Vec<EhFrameCiePlan>,
+}
+
+#[derive(Debug)]
+struct EhFrameCiePlan {
+    record_range: Range<usize>,
+    personality_relocation_offset: Option<usize>,
+    personality: Option<EhFramePersonalityGot>,
+    fdes: Vec<EhFrameFdePlan>,
+}
+
+#[derive(Debug)]
+struct EhFrameFdePlan {
+    record_range: Range<usize>,
+    function_relocation_offset: usize,
+    lsda_relocation_offset: Option<usize>,
+    function_address: u64,
+    lsda_address: Option<u64>,
+    identity: EhFrameFdeIdentity,
+}
+
+fn eh_frame_section_plan<'data>(
+    layout: &MachOLayout<'data>,
+    object: &ObjectLayout<'data, MachO>,
+    section_index: object::SectionIndex,
+) -> Result<Option<EhFrameSectionPlan<'data>>> {
+    let section = object.object.section(section_index)?;
+    if section.name() != b"__eh_frame" {
+        return Ok(None);
+    }
+    let data = object.object.raw_section_data(section)?;
+    if data.is_empty() {
+        return Ok(None);
+    }
+    let records = parse_eh_frame_records(data)?;
+    if records.fdes.is_empty() {
+        return Ok(None);
+    }
+    let relocations = eh_frame_relocations(object, section_index)?;
+
+    // Select first, then serialize below in CIE order. This mirrors the original writer's
+    // error order while moving only input-derived parsing and liveness checks off the main
+    // thread.
+    let mut live_by_cie =
+        BTreeMap::<usize, Vec<(&EhFrameFde, u64, EhFrameFdeIdentity)>>::new();
+    for fde in &records.fdes {
+        let Some(function_address) = eh_frame_difference_target_address(
+            object,
+            &relocations,
+            fde.function_relocation_offset,
+            "function",
+            false,
+        )? else {
+            continue;
+        };
+        let identity = eh_frame_fde_identity(object, &relocations, fde.function_relocation_offset)?;
+        live_by_cie
+            .entry(fde.cie_record_start)
+            .or_default()
+            .push((fde, function_address, identity));
+    }
+
+    let mut cies = Vec::with_capacity(live_by_cie.len());
+    for (cie_start, fdes) in live_by_cie {
+        let cie = records.cies.get(&cie_start).with_context(|| {
+            format!(
+                "Mach-O __eh_frame FDE references missing CIE at offset 0x{cie_start:x} in {}",
+                object.input
+            )
+        })?;
+        let personality = cie
+            .personality_relocation_offset
+            .map(|offset| eh_frame_personality_got_address(layout, object, &relocations, offset))
+            .transpose()?;
+        let mut fde_plans = Vec::with_capacity(fdes.len());
+        for (fde, function_address, identity) in fdes {
+            let lsda_address = fde
+                .lsda_relocation_offset
+                .map(|offset| {
+                    eh_frame_difference_target_address(
+                        object,
+                        &relocations,
+                        offset,
+                        "LSDA",
+                        true,
+                    )
+                    .map(|address| address.expect("required Mach-O __eh_frame LSDA target"))
+                })
+                .transpose()?;
+            fde_plans.push(EhFrameFdePlan {
+                record_range: fde.record_range.clone(),
+                function_relocation_offset: fde.function_relocation_offset,
+                lsda_relocation_offset: fde.lsda_relocation_offset,
+                function_address,
+                lsda_address,
+                identity,
+            });
+        }
+        cies.push(EhFrameCiePlan {
+            record_range: cie.record_range.clone(),
+            personality_relocation_offset: cie.personality_relocation_offset,
+            personality,
+            fdes: fde_plans,
+        });
+    }
+
+    Ok(Some(EhFrameSectionPlan { data, cies }))
+}
+
 /// Rebuild the final ARM64 `__TEXT,__eh_frame` table from live input CIE/FDE records.
 ///
 /// Unlike ELF's section-relative relocation stream, Mach-O producers encode an FDE's pcrel
@@ -349,68 +466,42 @@ fn write_eh_frame(
     let mut serialized = Vec::new();
     let mut plan = FinalEhFramePlan::default();
 
-    for group in &layout.group_layouts {
-        for file in &group.files {
-            let FileLayout::Object(object) = file else {
-                continue;
-            };
-            for (section_index, section) in object.object.enumerate_sections() {
-                if section.name() != b"__eh_frame" {
-                    continue;
-                }
-                let data = object.object.raw_section_data(section)?;
-                if data.is_empty() {
-                    continue;
-                }
-                let records = parse_eh_frame_records(data)?;
-                if records.fdes.is_empty() {
-                    continue;
-                }
-                let relocations = eh_frame_relocations(object, section_index)?;
+    let section_plans = layout
+        .group_layouts
+        .par_iter()
+        .map(|group| {
+            group
+                .files
+                .iter()
+                .filter_map(|file| match file {
+                    FileLayout::Object(object) => Some(
+                        object
+                            .object
+                            .enumerate_sections()
+                            .map(|(section_index, _)| eh_frame_section_plan(layout, &object, section_index))
+                            .filter_map_ok(|plan| plan)
+                            .collect::<Result<Vec<_>>>(),
+                    ),
+                    _ => None,
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .collect::<Vec<_>>();
 
-                // Keep an FDE only when the target function has an output resolution. This is
-                // the same live/dead distinction compact-unwind uses; a dead atom can leave an
-                // input FDE behind, but must not acquire a final unwind range.
-                let mut live_by_cie =
-                    BTreeMap::<usize, Vec<(&EhFrameFde, u64, EhFrameFdeIdentity)>>::new();
-                for fde in &records.fdes {
-                    let Some(function_address) = eh_frame_difference_target_address(
-                        object,
-                        &relocations,
-                        fde.function_relocation_offset,
-                        "function",
-                        false,
-                    )? else {
-                        continue;
-                    };
-                    let identity = eh_frame_fde_identity(
-                        object,
-                        &relocations,
-                        fde.function_relocation_offset,
-                    )?;
-                    live_by_cie
-                        .entry(fde.cie_record_start)
-                        .or_default()
-                        .push((fde, function_address, identity));
-                }
-
-                for (cie_start, fdes) in live_by_cie {
-                    let cie = records.cies.get(&cie_start).with_context(|| {
-                        format!(
-                            "Mach-O __eh_frame FDE references missing CIE at offset 0x{cie_start:x} in {}",
-                            object.input
-                        )
-                    })?;
+    // The parallel collection above retains only immutable analysis. Apply all plans in their
+    // prior group/file/section order so CIE pointers, FDE offsets, duplicate diagnostics, and
+    // output bytes remain stable.
+    for group_plans in section_plans {
+        for object_plans in group_plans? {
+            for section_plan in object_plans {
+                for cie in section_plan.cies {
                     let output_cie_start = serialized.len();
-                    serialized.extend_from_slice(&data[cie.record_range.clone()]);
+                    serialized.extend_from_slice(&section_plan.data[cie.record_range.clone()]);
 
                     if let Some(personality_offset) = cie.personality_relocation_offset {
-                        let personality = eh_frame_personality_got_address(
-                            layout,
-                            object,
-                            &relocations,
-                            personality_offset,
-                        )?;
+                        let personality = cie
+                            .personality
+                            .expect("Mach-O __eh_frame CIE personality was planned");
                         if let Some(rebase) = personality.local_got_rebase {
                             insert_local_got_rebase(
                                 &mut plan.personality_got_rebases,
@@ -430,7 +521,7 @@ fn write_eh_frame(
                         )?;
                     }
 
-                    for (fde, function_address, identity) in fdes {
+                    for fde in cie.fdes {
                         let output_fde_start = serialized.len();
                         let output_fde_offset = u32::try_from(output_fde_start)
                             .context("Mach-O __eh_frame FDE offset exceeds u32")?;
@@ -440,14 +531,14 @@ fn write_eh_frame(
                         );
                         ensure!(
                             plan.fde_offsets
-                                .insert(identity, output_fde_offset)
+                                .insert(fde.identity, output_fde_offset)
                                 .is_none(),
                             "ambiguous Mach-O __eh_frame FDEs for input function section {} offset 0x{:x} in file {:?}",
-                            identity.function_section_index,
-                            identity.function_input_offset,
-                            identity.file_id
+                            fde.identity.function_section_index,
+                            fde.identity.function_input_offset,
+                            fde.identity.file_id
                         );
-                        serialized.extend_from_slice(&data[fde.record_range.clone()]);
+                        serialized.extend_from_slice(&section_plan.data[fde.record_range.clone()]);
                         let cie_pointer = output_fde_start
                             .checked_add(size_of::<u32>())
                             .and_then(|address_after_pointer| {
@@ -472,19 +563,14 @@ fn write_eh_frame(
                             &mut serialized,
                             function_field_offset,
                             section_address,
-                            function_address,
+                            fde.function_address,
                             "function",
                         )?;
 
                         if let Some(lsda_relocation_offset) = fde.lsda_relocation_offset {
-                            let lsda_address = eh_frame_difference_target_address(
-                                object,
-                                &relocations,
-                                lsda_relocation_offset,
-                                "LSDA",
-                                true,
-                            )?
-                            .expect("required __eh_frame LSDA target");
+                            let lsda_address = fde
+                                .lsda_address
+                                .expect("required Mach-O __eh_frame LSDA target was planned");
                             let output_field_offset = output_fde_start
                                 .checked_add(lsda_relocation_offset - fde.record_range.start)
                                 .context("Mach-O __eh_frame LSDA output offset overflows")?;
@@ -871,23 +957,26 @@ fn write_compact_unwind_info(
     }
 
     timing_phase!("Write compact unwind info");
+    let entries_by_group = layout
+        .group_layouts
+        .par_iter()
+        .map(|group| {
+            group
+                .files
+                .iter()
+                .filter_map(|file| match file {
+                    FileLayout::Object(object) => {
+                        Some(compact_unwind_entries_for_object(layout, &object))
+                    }
+                    _ => None,
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .collect::<Vec<_>>();
     let mut entries = Vec::new();
-    for group in &layout.group_layouts {
-        for file in &group.files {
-            let FileLayout::Object(object) = file else {
-                continue;
-            };
-            for (section_index, slot) in object.sections.iter().enumerate() {
-                let SectionSlot::FrameData(compact_unwind_section_index) = slot else {
-                    continue;
-                };
-                debug_assert_eq!(section_index, compact_unwind_section_index.0);
-                entries.extend(read_compact_unwind_entries(
-                    layout,
-                    object,
-                    *compact_unwind_section_index,
-                )?);
-            }
+    for group_entries in entries_by_group {
+        for object_entries in group_entries? {
+            entries.extend(object_entries);
         }
     }
 
@@ -930,6 +1019,25 @@ fn write_compact_unwind_info(
     output.fill(0);
     output[..serialized.len()].copy_from_slice(&serialized);
     Ok(())
+}
+
+fn compact_unwind_entries_for_object(
+    layout: &MachOLayout<'_>,
+    object: &ObjectLayout<'_, MachO>,
+) -> Result<Vec<CompactUnwindEntry>> {
+    let mut entries = Vec::new();
+    for (section_index, slot) in object.sections.iter().enumerate() {
+        let SectionSlot::FrameData(compact_unwind_section_index) = slot else {
+            continue;
+        };
+        debug_assert_eq!(section_index, compact_unwind_section_index.0);
+        entries.extend(read_compact_unwind_entries(
+            layout,
+            object,
+            *compact_unwind_section_index,
+        )?);
+    }
+    Ok(entries)
 }
 
 fn read_compact_unwind_entries(
