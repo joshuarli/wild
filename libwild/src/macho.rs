@@ -1224,6 +1224,9 @@ pub(crate) enum MachOGcUnit {
     Atom {
         section_index: object::SectionIndex,
         start: u64,
+        /// `gc_unit_for_symbol` has already resolved the complete atom range. Keeping its end
+        /// avoids a second `atom_range` binary lookup for every graph work item.
+        end: u64,
     },
 }
 
@@ -2551,6 +2554,7 @@ impl platform::Platform for MachO {
             return Ok(Some(MachOGcUnit::Atom {
                 section_index,
                 start: range.start,
+                end: range.end,
             }));
         }
         Ok(object
@@ -2657,6 +2661,7 @@ impl platform::Platform for MachO {
             MachOGcUnit::Atom {
                 section_index,
                 start,
+                end,
             } => {
                 // `gc_sections == false` queues complete sections during activation. An early
                 // symbol request can race ahead of that queue, so it must also select the
@@ -2671,10 +2676,7 @@ impl platform::Platform for MachO {
                         scope,
                     );
                 }
-                let range = {
-                    timing_phase!("Find Mach-O atom range");
-                    object.object.atom_range(section_index, start)?
-                };
+                let range = start..end;
                 let loaded = {
                     timing_phase!("Record Mach-O live atom");
                     object.load_subsection::<A>(
