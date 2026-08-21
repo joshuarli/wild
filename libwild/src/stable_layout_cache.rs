@@ -318,18 +318,6 @@ enum ExistingOutputBaseline {
     Mismatch,
 }
 
-/// An owned, fully authenticated previous output ready for a cache patch.
-///
-/// The APFS path keeps the baseline in a writable copy-on-write clone. If cloning or mapping is
-/// unavailable, it deliberately falls back to the in-memory proof retained by
-/// [`read_existing_output_baseline`]. The two representations have the same complete identity
-/// requirement; neither is a metadata-only shortcut.
-enum PreparedExistingOutput {
-    Absent,
-    Matched(MutableOutput),
-    Mismatch,
-}
-
 struct Candidate {
     bytes: Vec<u8>,
     patches: Vec<PatchRange>,
@@ -511,7 +499,7 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
     // cache candidate and the cache-owned image is verified below.
     let existing_output = {
         timing_phase!("Mach-O stable-layout cache: verify current output lineage");
-        prepare_existing_output_baseline(
+        read_existing_output_baseline(
             args.output(),
             state.output_len,
             &state.output_identity,
@@ -622,11 +610,11 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
     // an identical cache image a second time. The cache image remains the safe fallback only for
     // Cargo's documented case where it retired the previous `-o` before invoking the linker.
     let mut output = match existing_output {
-        PreparedExistingOutput::Matched(output) => output,
-        PreparedExistingOutput::Mismatch => {
+        ExistingOutputBaseline::Matched(bytes) => MutableOutput::InMemory(bytes),
+        ExistingOutputBaseline::Mismatch => {
             return cache_miss("current output does not match the cached baseline lineage");
         }
-        PreparedExistingOutput::Absent => {
+        ExistingOutputBaseline::Absent => {
             timing_phase!("Mach-O stable-layout cache: read and verify baseline image");
             #[cfg(target_os = "macos")]
             let output = clone_baseline_image(cache_dir, args).or_else(|| {
@@ -791,31 +779,6 @@ fn read_existing_output_baseline(
     output_matches_identity(&bytes, signature, output_identity)
         .then_some(ExistingOutputBaseline::Matched(bytes))
         .unwrap_or(ExistingOutputBaseline::Mismatch)
-}
-
-fn prepare_existing_output_baseline(
-    path: &Path,
-    output_len: u64,
-    output_identity: &OutputIdentity,
-    signature: &SignatureInfo,
-) -> PreparedExistingOutput {
-    // APFS cloning keeps all unchanged pages shared while the cache hit updates just its mapped
-    // patch ranges. The clone itself, rather than only its source pathname or metadata, must
-    // pass the same complete identity proof before it may become a patch source. An unsupported
-    // filesystem, a clone race, or a mapping failure uses the established Vec path below.
-    #[cfg(target_os = "macos")]
-    if let Some(output) = clone_existing_output_baseline(path, output_len, output_identity, signature)
-    {
-        return PreparedExistingOutput::Matched(output);
-    }
-
-    match read_existing_output_baseline(path, output_len, output_identity, signature) {
-        ExistingOutputBaseline::Absent => PreparedExistingOutput::Absent,
-        ExistingOutputBaseline::Matched(bytes) => {
-            PreparedExistingOutput::Matched(MutableOutput::InMemory(bytes))
-        }
-        ExistingOutputBaseline::Mismatch => PreparedExistingOutput::Mismatch,
-    }
 }
 
 fn discard_cache_sidecars(args: &MachOArgs) {
@@ -2872,53 +2835,6 @@ fn clone_baseline_image(cache_dir: &Path, args: &MachOArgs) -> Option<MutableOut
     })
 }
 
-/// Clones a previous Cargo output into the output directory, then authenticates the clone before
-/// exposing it as a writable patch image. Verifying the clone closes the source-path race between
-/// `clonefile` and the patch: the bytes we mutate are exactly the bytes that prove this output
-/// lineage, not merely a file that once occupied `-o`.
-#[cfg(target_os = "macos")]
-fn clone_existing_output_baseline(
-    path: &Path,
-    output_len: u64,
-    output_identity: &OutputIdentity,
-    signature: &SignatureInfo,
-) -> Option<MutableOutput> {
-    let staged_path = clone_temporary_path(path);
-    if clone_file(path, &staged_path).is_err() {
-        let _ = fs::remove_file(&staged_path);
-        return None;
-    }
-    let file = match fs::OpenOptions::new().read(true).write(true).open(&staged_path) {
-        Ok(file) => file,
-        Err(_) => {
-            let _ = fs::remove_file(&staged_path);
-            return None;
-        }
-    };
-    if crate::make_executable(&file).is_err() {
-        let _ = fs::remove_file(&staged_path);
-        return None;
-    }
-    let mapping = match unsafe { memmap2::MmapOptions::new().map_mut(&file) } {
-        Ok(mapping) => mapping,
-        Err(_) => {
-            let _ = fs::remove_file(&staged_path);
-            return None;
-        }
-    };
-    if mapping.len() as u64 != output_len
-        || !output_matches_identity(&mapping, signature, output_identity)
-    {
-        drop(mapping);
-        let _ = fs::remove_file(&staged_path);
-        return None;
-    }
-    Some(MutableOutput::Cloned {
-        staged_path,
-        mapping,
-    })
-}
-
 #[cfg(target_os = "macos")]
 fn clone_cache_image_atomic(cache_dir: &Path, args: &MachOArgs) -> std::io::Result<()> {
     fs::create_dir_all(cache_dir)?;
@@ -3729,8 +3645,6 @@ mod tests {
     use super::cache_is_eligible;
     use super::cache_approved_rustc_temporary_archives;
     use super::cache_hit_input_path;
-    #[cfg(target_os = "macos")]
-    use super::clone_existing_output_baseline;
     use super::read_existing_output_baseline;
     #[cfg(target_os = "macos")]
     use super::clone_file;
@@ -4166,55 +4080,6 @@ mod tests {
         assert_eq!(std::fs::read(&destination).unwrap(), b"baseline");
         std::fs::remove_file(source).unwrap();
         std::fs::remove_file(destination).unwrap();
-        std::fs::remove_dir(directory).unwrap();
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn cloned_existing_output_requires_complete_identity_and_keeps_verified_bytes() {
-        let unique = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let directory = std::env::temp_dir().join(format!(
-            "wild-stable-layout-cache-existing-clone-{unique}-{}",
-            std::process::id()
-        ));
-        std::fs::create_dir(&directory).unwrap();
-        let path = directory.join("output");
-        let signature = SignatureInfo {
-            code_limit: 64,
-            hashes_offset: 128,
-            hash_count: 1,
-            uuid_offset: 32,
-            identifier_offset: 96,
-            identifier_capacity: 32,
-        };
-        let mut baseline = (0..160).map(|byte| byte as u8).collect::<Vec<_>>();
-        let normalized = normalized_output_digest(&baseline, &signature).unwrap();
-        baseline[32..48].copy_from_slice(&uuid_from_normalized_digest(&normalized));
-        let identity = output_identity(&baseline, &signature).unwrap();
-        std::fs::write(&path, &baseline).unwrap();
-
-        let cloned = clone_existing_output_baseline(
-            &path,
-            baseline.len() as u64,
-            &identity,
-            &signature,
-        )
-        .unwrap();
-        std::fs::write(&path, b"different source output").unwrap();
-        assert_eq!(cloned.bytes(), baseline);
-        cloned.discard();
-
-        assert!(clone_existing_output_baseline(
-            &path,
-            baseline.len() as u64,
-            &identity,
-            &signature,
-        )
-        .is_none());
-        std::fs::remove_file(path).unwrap();
         std::fs::remove_dir(directory).unwrap();
     }
 
