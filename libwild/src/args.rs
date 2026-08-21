@@ -61,6 +61,13 @@ pub const EXPERIMENTAL_PLATFORMS: &str = "WILD_EXPERIMENTAL_PLATFORMS";
 /// inconsistency.
 pub(crate) const WRITE_VERIFY_ALLOCATIONS_ENV: &str = "WILD_VERIFY_ALLOCATIONS";
 
+/// Unconstrained links on Apple Silicon have enough available CPUs to make the automatic Rayon
+/// pool expensive relative to short links. Four workers is the measured crossover for the
+/// representative Rust and C++ direct-link replays. Explicit `--threads` and jobserver limits
+/// retain their callers' requested parallelism.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const MACOS_AARCH64_AUTOMATIC_THREAD_LIMIT: NonZeroUsize = NonZeroUsize::new(4).unwrap();
+
 #[derive(derive_more::Debug)]
 pub struct CommonArgs {
     pub(crate) unrecognized_options: Vec<String>,
@@ -419,7 +426,9 @@ impl CommonArgs {
                 // Our parent "holds" one jobserver token, add it.
                 NonZeroUsize::new(tokens.len() + 1).unwrap()
             } else {
-                std::thread::available_parallelism().unwrap_or(NonZeroUsize::new(1).unwrap())
+                automatic_thread_count(
+                    std::thread::available_parallelism().unwrap_or(NonZeroUsize::new(1).unwrap()),
+                )
             }
         });
 
@@ -520,6 +529,18 @@ impl CommonArgs {
         }
 
         Ok(common)
+    }
+}
+
+fn automatic_thread_count(available_threads: NonZeroUsize) -> NonZeroUsize {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        available_threads.min(MACOS_AARCH64_AUTOMATIC_THREAD_LIMIT)
+    }
+
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    {
+        available_threads
     }
 }
 
@@ -1683,5 +1704,18 @@ mod tests {
     #[test]
     fn rejects_duplicate_json_timing_option() {
         assert!(parse_time_phase_options("json,json").is_err());
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn caps_unconstrained_macos_arm64_links_at_four_threads() {
+        assert_eq!(
+            automatic_thread_count(NonZeroUsize::new(10).unwrap()),
+            MACOS_AARCH64_AUTOMATIC_THREAD_LIMIT
+        );
+        assert_eq!(
+            automatic_thread_count(NonZeroUsize::new(2).unwrap()).get(),
+            2
+        );
     }
 }
