@@ -43,7 +43,7 @@ use std::time::SystemTime;
 
 const MAGIC: &[u8; 16] = b"WILD-MACHO-INC\0\0";
 const STATE_MAGIC: &[u8; 16] = b"WILD-MACHO-STATE";
-const VERSION: u32 = 9;
+const VERSION: u32 = 10;
 const STATE_VERSION: u32 = 4;
 const HASH_SIZE: usize = 32;
 const MAX_RECORDS: usize = 100_000;
@@ -52,7 +52,7 @@ const DIAGNOSTICS_ENV: &str = "WILD_MACHO_INCREMENTAL_CACHE_DIAGNOSTICS";
 const STRUCTURE_DIGEST_DOMAIN: &[u8] = b"wild-macho-stable-layout-structure-v5\0";
 /// The sidecar is not an authenticated input, but random or torn sidecar corruption must become
 /// a conservative cache miss before any persisted patch mapping is used.
-const MANIFEST_CHECKSUM_DOMAIN: &[u8] = b"wild-macho-stable-layout-manifest-v9\0";
+const MANIFEST_CHECKSUM_DOMAIN: &[u8] = b"wild-macho-stable-layout-manifest-v10\0";
 const STATE_CHECKSUM_DOMAIN: &[u8] = b"wild-macho-stable-layout-state-v4\0";
 
 #[derive(Clone, Debug)]
@@ -230,6 +230,10 @@ struct Manifest {
     /// index appears here only when the baseline image contains none of that input's exact path
     /// bytes, proving the pathname is not an observable part of this cached executable.
     cache_approved_rustc_temporary_archives: Vec<u32>,
+    /// Direct objects may receive a new Cargo/rustc pathname even when their bytes did not
+    /// change. An index appears here only when the raw argument spelling is canonical and the
+    /// entire baseline image proves that spelling is not output-visible.
+    cache_approved_moved_direct_objects: Vec<u32>,
     objects: Vec<ObjectRecord>,
 }
 
@@ -249,6 +253,7 @@ struct ManifestView<'a> {
     signature: SignatureInfo,
     input_count: usize,
     cache_approved_rustc_temporary_archives: Vec<u32>,
+    cache_approved_moved_direct_objects: Vec<u32>,
     object_records: &'a [u8],
     object_count: usize,
 }
@@ -500,6 +505,7 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
             args,
             &state.inputs,
             &manifest.cache_approved_rustc_temporary_archives,
+            &manifest.cache_approved_moved_direct_objects,
         ) else {
             return cache_miss("unable to read every link-visible input");
         };
@@ -521,6 +527,12 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
                     u32::try_from(index).is_ok_and(|input_index| {
                         manifest
                             .cache_approved_rustc_temporary_archives
+                            .binary_search(&input_index)
+                            .is_ok()
+                    }),
+                    u32::try_from(index).is_ok_and(|input_index| {
+                        manifest
+                            .cache_approved_moved_direct_objects
                             .binary_search(&input_index)
                             .is_ok()
                     }),
@@ -612,6 +624,16 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
         {
             output.discard();
             return cache_miss("owned baseline image identity differs");
+        }
+        if !moved_direct_object_paths_are_unobservable(
+            output.bytes(),
+            args,
+            &current_inputs,
+            &state.inputs,
+            &manifest.cache_approved_moved_direct_objects,
+        ) {
+            output.discard();
+            return cache_miss("a moved direct-object pathname is visible in the baseline image");
         }
         output
     };
@@ -778,6 +800,8 @@ pub(crate) fn stage_after_link(layout: &Layout<'_, MachO>, output: &[u8]) {
     };
     let cache_approved_rustc_temporary_archives =
         cache_approved_rustc_temporary_archives(args, &inputs, output);
+    let cache_approved_moved_direct_objects =
+        cache_approved_moved_direct_objects(args, &inputs, output);
     let Some(signature) = signature_info(layout, output) else {
         let _ = cache_miss("normal-link code signature is not usable as a cache baseline");
         return;
@@ -807,6 +831,7 @@ pub(crate) fn stage_after_link(layout: &Layout<'_, MachO>, output: &[u8]) {
         signature,
         inputs,
         cache_approved_rustc_temporary_archives,
+        cache_approved_moved_direct_objects,
         objects,
     };
     let manifest_bytes = manifest.encode();
@@ -1086,15 +1111,16 @@ fn input_digests(args: &MachOArgs) -> Option<Vec<InputDigest>> {
         .collect()
 }
 
-/// Fingerprints only the changed direct object. Every path-identical input with unchanged stored
-/// metadata reuses its baseline BLAKE3 digest. A baseline image can additionally approve an
-/// equal-content rlib from rustc's per-link temporary directory when it proves the old path is
-/// absent from the image; that exceptional path is fully hashed before acceptance. All other
-/// non-direct changes remain normal-link fallbacks.
+/// Fingerprints only a potentially changed direct object. Every path-identical input with
+/// unchanged stored metadata reuses its baseline BLAKE3 digest. A baseline image can additionally
+/// approve equal-content Rust temporary archives and moved direct objects only after it proves
+/// their old path is not link-visible; those exceptional inputs are fully hashed before
+/// acceptance. All other non-direct changes remain normal-link fallbacks.
 fn input_digests_for_cache_hit(
     args: &MachOArgs,
     cached_inputs: &[InputDigest],
     cache_approved_rustc_temporary_archives: &[u32],
+    cache_approved_moved_direct_objects: &[u32],
 ) -> Option<Vec<InputDigest>> {
     (args.common().inputs.len() == cached_inputs.len()).then_some(())?;
     let input_digests = args
@@ -1115,6 +1141,17 @@ fn input_digests_for_cache_hit(
                 });
             }
             if is_mach_object_path(&path) && is_mach_object_path(&cached.path) {
+                let cache_approved = u32::try_from(index).is_ok_and(|input_index| {
+                    cache_approved_moved_direct_objects
+                        .binary_search(&input_index)
+                        .is_ok()
+                });
+                if cache_approved {
+                    let current = read_hashed_input(path.clone())?;
+                    if current.digest == cached.digest {
+                        return Some(current);
+                    }
+                }
                 return read_changed_direct_object(path, cached);
             }
             let cache_approved = u32::try_from(index).is_ok_and(|input_index| {
@@ -1157,6 +1194,33 @@ fn cache_approved_rustc_temporary_archives(
             (argument_path.to_str().is_some_and(|path| path == input.path)
                 && is_rustc_temporary_archive_path(Path::new(&input.path))
                 && n_oso_archive_path_patches(output, &input.path, &input.path).is_some())
+            .then(|| u32::try_from(index).ok())
+            .flatten()
+        })
+        .collect()
+}
+
+/// Direct Cargo/rustc objects can have a fresh hash-bearing path on a rebuild even if their bytes
+/// are identical. Permit that movement only when the original link argument was already the
+/// canonical file identity and no occurrence of it is present in the output image. This proves
+/// that changing the spelling cannot leave an old debug-map or other pathname observable.
+fn cache_approved_moved_direct_objects(
+    args: &MachOArgs,
+    inputs: &[InputDigest],
+    output: &[u8],
+) -> Vec<u32> {
+    args.common()
+        .inputs
+        .iter()
+        .zip(inputs)
+        .enumerate()
+        .filter_map(|(index, (argument, input))| {
+            let InputSpec::File(argument_path) = &argument.spec else {
+                return None;
+            };
+            (is_mach_object_path(&input.path)
+                && argument_path.to_str().is_some_and(|path| path == input.path)
+                && memchr::memmem::find(output, input.path.as_bytes()).is_none())
             .then(|| u32::try_from(index).ok())
             .flatten()
         })
@@ -1432,10 +1496,71 @@ fn reusable_rustc_temporary_archive(current: &str, cached: &str, cache_approved:
         && Path::new(current).file_name() == Path::new(cached).file_name()
 }
 
-fn input_identity_changed(current: &InputDigest, cached: &InputDigest, cache_approved: bool) -> bool {
+fn reusable_moved_direct_object(
+    current: &InputDigest,
+    cached: &InputDigest,
+    cache_approved: bool,
+) -> bool {
+    cache_approved
+        && current.digest == cached.digest
+        && current.direct_object_bytes.is_none()
+        && is_mach_object_path(&current.path)
+        && is_mach_object_path(&cached.path)
+}
+
+fn input_identity_changed(
+    current: &InputDigest,
+    cached: &InputDigest,
+    cache_approved_rustc_temporary_archive: bool,
+    cache_approved_moved_direct_object: bool,
+) -> bool {
     current.digest != cached.digest
         || (current.path != cached.path || current.metadata != cached.metadata)
-            && !reusable_rustc_temporary_archive(&current.path, &cached.path, cache_approved)
+            && !reusable_rustc_temporary_archive(
+                &current.path,
+                &cached.path,
+                cache_approved_rustc_temporary_archive,
+            )
+            && !reusable_moved_direct_object(
+                current,
+                cached,
+                cache_approved_moved_direct_object,
+            )
+}
+
+/// Before a cache hit accepts a new direct-object pathname, reapply the baseline proof retained
+/// in the manifest. The old spelling must remain absent from the image and the current command
+/// must spell its canonical path exactly; otherwise an N_OSO/debug or caller-visible pathname may
+/// need a normal relink rather than a byte patch.
+fn moved_direct_object_paths_are_unobservable(
+    output: &[u8],
+    args: &MachOArgs,
+    current_inputs: &[InputDigest],
+    cached_inputs: &[InputDigest],
+    cache_approved_moved_direct_objects: &[u32],
+) -> bool {
+    cache_approved_moved_direct_objects.iter().all(|input_index| {
+        let Ok(index) = usize::try_from(*input_index) else {
+            return false;
+        };
+        let (Some(current), Some(cached), Some(input)) = (
+            current_inputs.get(index),
+            cached_inputs.get(index),
+            args.common().inputs.get(index),
+        ) else {
+            return false;
+        };
+        if current.path == cached.path {
+            return true;
+        }
+        let InputSpec::File(argument_path) = &input.spec else {
+            return false;
+        };
+        is_mach_object_path(&current.path)
+            && is_mach_object_path(&cached.path)
+            && argument_path.to_str().is_some_and(|path| path == current.path)
+            && memchr::memmem::find(output, cached.path.as_bytes()).is_none()
+    })
 }
 
 /// Return a canonical path only when the command's spelling cannot already identify the cached
@@ -2858,6 +2983,13 @@ impl Manifest {
         for index in &self.cache_approved_rustc_temporary_archives {
             put_u32(&mut out, *index);
         }
+        put_u32(
+            &mut out,
+            self.cache_approved_moved_direct_objects.len() as u32,
+        );
+        for index in &self.cache_approved_moved_direct_objects {
+            put_u32(&mut out, *index);
+        }
         put_u32(&mut out, self.objects.len() as u32);
         for object in &self.objects {
             put_u32(&mut out, object.input_index);
@@ -2934,6 +3066,8 @@ impl Manifest {
         }
         let cache_approved_rustc_temporary_archives =
             read_cache_approved_rustc_temporary_archives(&mut reader, input_count)?;
+        let cache_approved_moved_direct_objects =
+            read_cache_approved_rustc_temporary_archives(&mut reader, input_count)?;
         let object_count = reader.count()?;
         let mut objects = Vec::with_capacity(object_count);
         for _ in 0..object_count {
@@ -2998,6 +3132,7 @@ impl Manifest {
             signature,
             inputs,
             cache_approved_rustc_temporary_archives,
+            cache_approved_moved_direct_objects,
             objects,
         })
     }
@@ -3039,6 +3174,8 @@ impl<'a> ManifestView<'a> {
         }
         let cache_approved_rustc_temporary_archives =
             read_cache_approved_rustc_temporary_archives(&mut reader, input_count)?;
+        let cache_approved_moved_direct_objects =
+            read_cache_approved_rustc_temporary_archives(&mut reader, input_count)?;
         let object_count = reader.count()?;
         let object_records_start = reader.offset;
         // The checksum above covers every record. On a hit, only the object selected from
@@ -3050,6 +3187,7 @@ impl<'a> ManifestView<'a> {
             signature,
             input_count,
             cache_approved_rustc_temporary_archives,
+            cache_approved_moved_direct_objects,
             object_records: &body[object_records_start..],
             object_count,
         })
@@ -3494,6 +3632,7 @@ mod tests {
     use super::replace_output_after_detaching_previous;
     use super::input_digests;
     use super::input_digests_for_cache_hit;
+    use super::input_identity_changed;
     use super::input_metadata_snapshots_match;
     use super::masked_digest;
     use super::masked_digest_for_input_ranges;
@@ -3540,6 +3679,7 @@ mod tests {
                 metadata: test_input_metadata(),
             }],
             cache_approved_rustc_temporary_archives: vec![0],
+            cache_approved_moved_direct_objects: vec![0],
             objects: vec![ObjectRecord {
                 input_index: 0,
                 structure_digest: [3; 32],
@@ -3578,6 +3718,10 @@ mod tests {
         assert_eq!(
             view.cache_approved_rustc_temporary_archives,
             manifest.cache_approved_rustc_temporary_archives
+        );
+        assert_eq!(
+            view.cache_approved_moved_direct_objects,
+            manifest.cache_approved_moved_direct_objects
         );
         let object = view.object_for_input(0).unwrap().unwrap();
         assert_eq!(object.structure_digest, [3; 32]);
@@ -3663,6 +3807,28 @@ mod tests {
         assert_eq!(records[0].input_index, 3);
         assert_eq!(records[0].patches.len(), 1);
         assert_eq!(records[0].structure_masks, vec![InputRange { input_offset: 1, len: 2 }]);
+    }
+
+    #[test]
+    fn cache_approved_moved_direct_object_with_equal_bytes_is_unchanged() {
+        let cached = InputDigest {
+            path: "/tmp/old-codegen.o".to_owned(),
+            digest: [7; HASH_SIZE],
+            direct_object_bytes: None,
+            metadata: test_input_metadata(),
+        };
+        let current = InputDigest {
+            path: "/tmp/new-codegen.o".to_owned(),
+            digest: cached.digest,
+            direct_object_bytes: None,
+            metadata: InputFileMetadata {
+                inode: cached.metadata.inode + 1,
+                ..cached.metadata
+            },
+        };
+
+        assert!(!input_identity_changed(&current, &cached, false, true));
+        assert!(input_identity_changed(&current, &cached, false, false));
     }
 
     #[test]
@@ -3961,13 +4127,13 @@ mod tests {
             cache_hit_input_path(&args, &args.common.inputs[0], &inputs[0]),
             Some(inputs[0].path.clone())
         );
-        let unchanged = input_digests_for_cache_hit(&args, &inputs, &[]).unwrap();
+        let unchanged = input_digests_for_cache_hit(&args, &inputs, &[], &[]).unwrap();
         assert_eq!(unchanged, inputs);
         assert!(unchanged[0].direct_object_bytes.is_none());
 
         std::fs::write(&path, b"after-with-a-different-length").unwrap();
         assert!(!input_metadata_snapshots_match(&args, &inputs));
-        let changed = input_digests_for_cache_hit(&args, &inputs, &[]).unwrap();
+        let changed = input_digests_for_cache_hit(&args, &inputs, &[], &[]).unwrap();
         assert_ne!(changed[0].metadata, inputs[0].metadata);
         // A direct cache candidate detects this by metadata rather than a second full digest.
         assert_eq!(changed[0].digest, inputs[0].digest);
@@ -4028,13 +4194,13 @@ mod tests {
             cached[0].path.as_bytes()
         )
         .is_empty());
-        let current = input_digests_for_cache_hit(&current_args, &cached, &[0]).unwrap();
+        let current = input_digests_for_cache_hit(&current_args, &cached, &[0], &[]).unwrap();
         assert_eq!(current[0].digest, cached[0].digest);
         assert_ne!(current[0].path, cached[0].path);
         assert!(input_metadata_snapshots_match(&current_args, &current));
 
         std::fs::write(&current_archive, b"a different archive payload").unwrap();
-        assert!(input_digests_for_cache_hit(&current_args, &cached, &[0]).is_none());
+        assert!(input_digests_for_cache_hit(&current_args, &cached, &[0], &[]).is_none());
         std::fs::remove_dir_all(directory).unwrap();
     }
 
