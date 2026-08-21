@@ -1455,9 +1455,10 @@ fn collect_macho_stable_layout_cache_qualification(
 fn run_macho_stable_layout_cache_qualification() -> Result {
     let fixture_dir = base_dir().join("tests").join("macho_stable_layout_cache");
     let main_source = fixture_dir.join("main.s");
+    let changed_main_source = fixture_dir.join("main-changed.s");
     let local_source = fixture_dir.join("local.s");
     let moved_local_source = fixture_dir.join("local-moved.s");
-    for source in [&main_source, &local_source, &moved_local_source] {
+    for source in [&main_source, &changed_main_source, &local_source, &moved_local_source] {
         ensure!(source.is_file(), "missing stable-layout-cache fixture {}", source.display());
     }
     let output_dir_guard = tempfile::Builder::new()
@@ -1469,6 +1470,8 @@ fn run_macho_stable_layout_cache_qualification() -> Result {
     let local_object = output_dir.join("local.o");
     let binary = output_dir.join("stable-layout-cache");
     let cache_dir = output_dir.join("cache");
+    let normal_output_dir = output_dir.join("normal-output");
+    let normal_cache_dir = output_dir.join("normal-cache");
 
     compile_macho_stable_layout_cache_fixture(&main_source, &main_object)?;
     compile_macho_stable_layout_cache_fixture(&local_source, &local_object)?;
@@ -1516,6 +1519,42 @@ fn run_macho_stable_layout_cache_qualification() -> Result {
         "cached executable retained a stale private-symbol n_value"
     );
     verify_code_signature(&binary)?;
+
+    // Rebuild the other direct object. The second hit must verify the image identity that the
+    // first hit persisted, rather than merely using the normal-link baseline identity.
+    compile_macho_stable_layout_cache_fixture(&changed_main_source, &main_object)?;
+    let second_transcript = link_macho_stable_layout_cache_fixture(
+        &binary,
+        &cache_dir,
+        &sdk,
+        &main_object,
+        &local_object,
+        true,
+    )?;
+    ensure!(
+        second_transcript.contains("wild: Mach-O stable-layout cache hit:"),
+        "second direct-object rebuild did not verify and reuse the updated cache image:\n{second_transcript}"
+    );
+    ensure!(
+        macho_symbol_address(&binary, b"_stable_layout_local_target")? == baseline_target + 4,
+        "second cache hit changed the prior local-symbol offset"
+    );
+    verify_code_signature(&binary)?;
+
+    std::fs::create_dir(&normal_output_dir)?;
+    let normal_binary = normal_output_dir.join("stable-layout-cache");
+    link_macho_stable_layout_cache_fixture(
+        &normal_binary,
+        &normal_cache_dir,
+        &sdk,
+        &main_object,
+        &local_object,
+        false,
+    )?;
+    ensure!(
+        std::fs::read(&binary)? == std::fs::read(&normal_binary)?,
+        "cached stable-layout output differs from a normal link with the same basename"
+    );
     let run = Command::new(&binary)
         .output()
         .with_context(|| format!("failed to run cached stable-layout executable {}", binary.display()))?;

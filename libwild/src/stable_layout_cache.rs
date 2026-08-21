@@ -42,8 +42,8 @@ use std::time::SystemTime;
 
 const MAGIC: &[u8; 16] = b"WILD-MACHO-INC\0\0";
 const STATE_MAGIC: &[u8; 16] = b"WILD-MACHO-STATE";
-const VERSION: u32 = 8;
-const STATE_VERSION: u32 = 3;
+const VERSION: u32 = 9;
+const STATE_VERSION: u32 = 4;
 const HASH_SIZE: usize = 32;
 const MAX_RECORDS: usize = 100_000;
 const DIAGNOSTICS_ENV: &str = "WILD_MACHO_INCREMENTAL_CACHE_DIAGNOSTICS";
@@ -51,8 +51,8 @@ const DIAGNOSTICS_ENV: &str = "WILD_MACHO_INCREMENTAL_CACHE_DIAGNOSTICS";
 const STRUCTURE_DIGEST_DOMAIN: &[u8] = b"wild-macho-stable-layout-structure-v5\0";
 /// The sidecar is not an authenticated input, but random or torn sidecar corruption must become
 /// a conservative cache miss before any persisted patch mapping is used.
-const MANIFEST_CHECKSUM_DOMAIN: &[u8] = b"wild-macho-stable-layout-manifest-v8\0";
-const STATE_CHECKSUM_DOMAIN: &[u8] = b"wild-macho-stable-layout-state-v3\0";
+const MANIFEST_CHECKSUM_DOMAIN: &[u8] = b"wild-macho-stable-layout-manifest-v9\0";
+const STATE_CHECKSUM_DOMAIN: &[u8] = b"wild-macho-stable-layout-state-v4\0";
 
 #[derive(Clone, Debug)]
 struct InputDigest {
@@ -204,6 +204,16 @@ struct SignatureInfo {
     identifier_capacity: u64,
 }
 
+/// Identity for a cache-owned output after excluding the self-derived UUID and CodeDirectory
+/// hash slots. The UUID must match the normalized digest and the slots have a separate digest,
+/// so together these values still bind every byte in the output without an extra full-file pass
+/// after `refresh_uuid_and_signature` has already calculated the normalized digest.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct OutputIdentity {
+    normalized_digest: [u8; HASH_SIZE],
+    signature_hashes_digest: [u8; HASH_SIZE],
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Manifest {
     arguments_digest: [u8; HASH_SIZE],
@@ -211,7 +221,7 @@ struct Manifest {
     /// separate baseline image because Cargo can retire this hash-bearing artifact before the
     /// next linker invocation.
     baseline_output_path: String,
-    output_digest: [u8; HASH_SIZE],
+    output_identity: OutputIdentity,
     output_len: u64,
     signature: SignatureInfo,
     inputs: Vec<InputDigest>,
@@ -284,7 +294,7 @@ struct ImageState {
     /// Binds this mutable state to exactly one immutable patch topology. Publishing a new image
     /// and state before its structural manifest can therefore only cause a safe cache miss.
     manifest_checksum: [u8; HASH_SIZE],
-    output_digest: [u8; HASH_SIZE],
+    output_identity: OutputIdentity,
     output_len: u64,
     inputs: Vec<InputDigest>,
 }
@@ -470,7 +480,12 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
     // cache candidate and the cache-owned image is verified below.
     let existing_output_matches = {
         timing_phase!("Mach-O stable-layout cache: verify current output lineage");
-        existing_output_matches_baseline(args.output(), state.output_len, &state.output_digest)
+        existing_output_matches_baseline(
+            args.output(),
+            state.output_len,
+            &state.output_identity,
+            &manifest.signature,
+        )
     };
     if let Some(matches) = existing_output_matches {
         if !matches {
@@ -588,10 +603,14 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
             return cache_miss("owned baseline image is absent");
         };
         if output.bytes().len() as u64 != state.output_len
-            || blake3::hash(output.bytes()).as_bytes() != &state.output_digest
+            || !output_matches_identity(
+                output.bytes(),
+                &manifest.signature,
+                &state.output_identity,
+            )
         {
             output.discard();
-            return cache_miss("owned baseline image digest differs");
+            return cache_miss("owned baseline image identity differs");
         }
         output
     };
@@ -609,7 +628,7 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
         };
         patches
     };
-    {
+    let output_identity = {
         timing_phase!("Mach-O stable-layout cache: patch and sign");
         if !apply_output_path_patches(output.bytes_mut(), &archive_path_patches)
             || !apply_patches_from_iter(output.bytes_mut(), current_object, object.patches())
@@ -618,7 +637,11 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
                 current_object,
                 object.symbol_values(),
             )
-            || !refresh_uuid_and_signature(
+        {
+            output.discard();
+            return cache_miss("patch mapping or signature refresh is not valid");
+        }
+        let Some(output_identity) = refresh_uuid_and_signature(
                 output.bytes_mut(),
                 &manifest.signature,
                 args,
@@ -626,13 +649,13 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
                     .patches()
                     .chain(object.symbol_values().map(SymbolValuePatch::signature_range))
                     .chain(archive_path_patches.iter().map(OutputPathPatch::signature_range)),
-            )
-        {
+            ) else {
             output.discard();
             return cache_miss("patch mapping or signature refresh is not valid");
-        }
+        };
         output.invalidate_code_signature_cache();
-    }
+        output_identity
+    };
 
     // Recheck the filesystem identity captured around the initial full input hash immediately
     // before publishing. This is the normal linker's mtime race guard, strengthened on Unix with
@@ -645,13 +668,7 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
         }
     }
 
-    let (output_len, output_digest) = {
-        timing_phase!("Mach-O stable-layout cache: fingerprint patched output");
-        (
-            output.bytes().len() as u64,
-            *blake3::hash(output.bytes()).as_bytes(),
-        )
-    };
+    let output_len = output.bytes().len() as u64;
     let output = output.finish();
 
     // Mach-O code-signature verification is cached by vnode on macOS. Never mutate the previous
@@ -672,7 +689,7 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
         }
     }
 
-    state.output_digest = output_digest;
+    state.output_identity = output_identity;
     state.output_len = output_len;
     // The direct object is the one patched input, but equal-content rlibs can move between
     // rustc's per-link temporary directories. Retain every current physical identity so the
@@ -705,7 +722,8 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
 fn existing_output_matches_baseline(
     path: &Path,
     output_len: u64,
-    output_digest: &[u8; HASH_SIZE],
+    output_identity: &OutputIdentity,
+    signature: &SignatureInfo,
 ) -> Option<bool> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
@@ -718,7 +736,7 @@ fn existing_output_matches_baseline(
     if bytes.len() as u64 != output_len {
         return Some(false);
     }
-    Some(blake3::hash(&bytes).as_bytes() == output_digest)
+    Some(output_matches_identity(&bytes, signature, output_identity))
 }
 
 fn discard_cache_sidecars(args: &MachOArgs) {
@@ -756,6 +774,9 @@ pub(crate) fn stage_after_link(layout: &Layout<'_, MachO>, output: &[u8]) {
     let Some(signature) = signature_info(layout, output) else {
         return;
     };
+    let Some(output_identity) = output_identity(output, &signature) else {
+        return;
+    };
     let Some(objects) = object_records(layout, &inputs, output) else {
         return;
     };
@@ -769,7 +790,7 @@ pub(crate) fn stage_after_link(layout: &Layout<'_, MachO>, output: &[u8]) {
     let manifest = Manifest {
         arguments_digest: arguments_digest(args),
         baseline_output_path,
-        output_digest: *blake3::hash(output).as_bytes(),
+        output_identity,
         output_len: output.len() as u64,
         signature,
         inputs,
@@ -783,7 +804,7 @@ pub(crate) fn stage_after_link(layout: &Layout<'_, MachO>, output: &[u8]) {
     let state = ImageState {
         arguments_digest: manifest.arguments_digest,
         manifest_checksum,
-        output_digest: manifest.output_digest,
+        output_identity: manifest.output_identity,
         output_len: manifest.output_len,
         inputs: manifest.inputs.clone(),
     };
@@ -833,7 +854,7 @@ pub(crate) fn publish_staged(args: &MachOArgs) {
         || state.arguments_digest != manifest.arguments_digest
         || state.manifest_checksum != manifest_checksum
         || state.inputs != manifest.inputs
-        || state.output_digest != manifest.output_digest
+        || state.output_identity != manifest.output_identity
         || state.output_len != manifest.output_len
         || input_digests(args).as_ref() != Some(&manifest.inputs)
     {
@@ -2300,38 +2321,110 @@ fn find_uuid_offset(output: &[u8]) -> Option<u64> {
     None
 }
 
+fn output_identity(output: &[u8], signature: &SignatureInfo) -> Option<OutputIdentity> {
+    let (_, _, hashes_offset, hashes_end) = signature_identity_ranges(output, signature)?;
+    Some(OutputIdentity {
+        normalized_digest: normalized_output_digest(output, signature)?,
+        signature_hashes_digest: *blake3::hash(&output[hashes_offset..hashes_end]).as_bytes(),
+    })
+}
+
+fn output_matches_identity(
+    output: &[u8],
+    signature: &SignatureInfo,
+    expected: &OutputIdentity,
+) -> bool {
+    let Some((uuid_offset, uuid_end, _, _)) = signature_identity_ranges(output, signature) else {
+        return false;
+    };
+    output.get(uuid_offset..uuid_end) == Some(uuid_from_normalized_digest(&expected.normalized_digest).as_slice())
+        && output_identity(output, signature).as_ref() == Some(expected)
+}
+
+/// BLAKE3 of the output with the bytes derived by Mach-O's ad-hoc signing scheme replaced by
+/// zeroes. This is exactly the digest from which `refresh_uuid_and_signature` derives `LC_UUID`.
+fn normalized_output_digest(output: &[u8], signature: &SignatureInfo) -> Option<[u8; HASH_SIZE]> {
+    let (uuid_offset, uuid_end, hashes_offset, hashes_end) =
+        signature_identity_ranges(output, signature)?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&output[..uuid_offset]);
+    update_blake3_with_zeroes(&mut hasher, uuid_end - uuid_offset);
+    hasher.update(&output[uuid_end..hashes_offset]);
+    update_blake3_with_zeroes(&mut hasher, hashes_end - hashes_offset);
+    hasher.update(&output[hashes_end..]);
+    Some(*hasher.finalize().as_bytes())
+}
+
+fn uuid_from_normalized_digest(digest: &[u8; HASH_SIZE]) -> [u8; 16] {
+    let mut uuid: [u8; 16] = digest[..16]
+        .try_into()
+        .expect("BLAKE3 output starts with a UUID-width prefix");
+    uuid[6] = (uuid[6] & 0x0f) | 0x30;
+    uuid[8] = (uuid[8] & 0x3f) | 0x80;
+    uuid
+}
+
+fn signature_identity_ranges(
+    output: &[u8],
+    signature: &SignatureInfo,
+) -> Option<(usize, usize, usize, usize)> {
+    let code_limit = usize::try_from(signature.code_limit).ok()?;
+    let hashes_offset = usize::try_from(signature.hashes_offset).ok()?;
+    let hash_count = usize::try_from(signature.hash_count).ok()?;
+    let hashes_len = usize::try_from(u64::from(signature.hash_count) * u64::from(macho::CS_HASH_SIZE)).ok()?;
+    let hashes_end = hashes_offset.checked_add(hashes_len)?;
+    let uuid_offset = usize::try_from(signature.uuid_offset).ok()?;
+    let uuid_end = uuid_offset.checked_add(16)?;
+    (hash_count == code_limit.div_ceil(macho::CS_BLOCK_SIZE)
+        && uuid_end <= code_limit
+        && code_limit <= hashes_offset
+        && hashes_end <= output.len()
+        && uuid_end <= hashes_offset)
+        .then_some((uuid_offset, uuid_end, hashes_offset, hashes_end))
+}
+
+fn update_blake3_with_zeroes(hasher: &mut blake3::Hasher, len: usize) {
+    const ZEROES: [u8; 4096] = [0; 4096];
+    let mut remaining = len;
+    while remaining != 0 {
+        let chunk_len = remaining.min(ZEROES.len());
+        hasher.update(&ZEROES[..chunk_len]);
+        remaining -= chunk_len;
+    }
+}
+
 fn refresh_uuid_and_signature(
     output: &mut [u8],
     signature: &SignatureInfo,
     args: &MachOArgs,
     changed_patches: impl Iterator<Item = PatchRange>,
-) -> bool {
+) -> Option<OutputIdentity> {
     let Some(code_limit) = usize::try_from(signature.code_limit).ok() else {
-        return false;
+        return None;
     };
     let Some(hashes_offset) = usize::try_from(signature.hashes_offset).ok() else {
-        return false;
+        return None;
     };
     let Some(uuid_offset) = usize::try_from(signature.uuid_offset).ok() else {
-        return false;
+        return None;
     };
     let Some(identifier_offset) = usize::try_from(signature.identifier_offset).ok() else {
-        return false;
+        return None;
     };
     let Some(identifier_capacity) = usize::try_from(signature.identifier_capacity).ok() else {
-        return false;
+        return None;
     };
     let Some(hashes_len) = usize::try_from(u64::from(signature.hash_count) * u64::from(macho::CS_HASH_SIZE)).ok() else {
-        return false;
+        return None;
     };
     let Some(hashes_end) = hashes_offset.checked_add(hashes_len) else {
-        return false;
+        return None;
     };
     let Some(uuid_end) = uuid_offset.checked_add(16) else {
-        return false;
+        return None;
     };
     let Some(identifier_end) = identifier_offset.checked_add(identifier_capacity) else {
-        return false;
+        return None;
     };
     if code_limit > output.len()
         || hashes_end > output.len()
@@ -2339,7 +2432,7 @@ fn refresh_uuid_and_signature(
         || uuid_end > code_limit
         || identifier_end != hashes_offset
     {
-        return false;
+        return None;
     }
 
     // `code_signature_identifier` is the output basename. A Rustc rebuild may change its
@@ -2347,10 +2440,10 @@ fn refresh_uuid_and_signature(
     // (including its terminator) still fits the original padded allocation.
     let identifier = macho::code_signature_identifier(args);
     let Some(identifier_len) = identifier.len().checked_add(1) else {
-        return false;
+        return None;
     };
     if identifier_len > identifier_capacity {
-        return false;
+        return None;
     }
     output[identifier_offset..identifier_end].fill(0);
     output[identifier_offset..identifier_offset + identifier.len()].copy_from_slice(identifier);
@@ -2358,7 +2451,7 @@ fn refresh_uuid_and_signature(
     // The normal writer hashes an LC_UUID command that still contains its initial zero bytes;
     // clear the previous UUID as well as the code hashes so the replacement is byte-identical
     // to a normal link of the same changed inputs.
-    // Every cache-owned baseline image is content-addressed before use, so these are the valid
+    // Every cache-owned baseline image is identity-verified before use, so these are the valid
     // hash slots for all code pages before this one-object patch. Keep them while zeroing the
     // slots for the UUID's whole-output hash, then recompute only pages changed by the patch and
     // the UUID itself. This preserves byte-for-byte normal-link signing without rehashing static
@@ -2366,20 +2459,24 @@ fn refresh_uuid_and_signature(
     let previous_hashes = output[hashes_offset..hashes_end].to_vec();
     output[hashes_offset..hashes_end].fill(0);
     output[uuid_offset..uuid_end].fill(0);
-    let hash = blake3::hash(output);
-    output[uuid_offset..uuid_end].copy_from_slice(&hash.as_bytes()[..16]);
-    output[uuid_offset + 6] = (output[uuid_offset + 6] & 0x0f) | 0x30;
-    output[uuid_offset + 8] = (output[uuid_offset + 8] & 0x3f) | 0x80;
+    let normalized_digest = *blake3::hash(output).as_bytes();
+    output[uuid_offset..uuid_end].copy_from_slice(&uuid_from_normalized_digest(&normalized_digest));
     output[hashes_offset..hashes_end].copy_from_slice(&previous_hashes);
 
-    refresh_changed_code_signature_hashes(
+    if !refresh_changed_code_signature_hashes(
         output,
         code_limit,
         hashes_offset,
         usize::try_from(signature.hash_count).unwrap_or(usize::MAX),
         uuid_offset,
         changed_patches,
-    )
+    ) {
+        return None;
+    }
+    Some(OutputIdentity {
+        normalized_digest,
+        signature_hashes_digest: *blake3::hash(&output[hashes_offset..hashes_end]).as_bytes(),
+    })
 }
 
 /// Rehashes the CodeDirectory pages changed by a cache patch and the page containing its fresh
@@ -2687,7 +2784,8 @@ impl Manifest {
         put_u32(&mut out, VERSION);
         out.extend_from_slice(&self.arguments_digest);
         put_bytes(&mut out, self.baseline_output_path.as_bytes());
-        out.extend_from_slice(&self.output_digest);
+        out.extend_from_slice(&self.output_identity.normalized_digest);
+        out.extend_from_slice(&self.output_identity.signature_hashes_digest);
         put_u64(&mut out, self.output_len);
         put_u64(&mut out, self.signature.code_limit);
         put_u64(&mut out, self.signature.hashes_offset);
@@ -2759,7 +2857,10 @@ impl Manifest {
         anyhow::ensure!(reader.u32()? == VERSION, "unsupported cache version");
         let arguments_digest = reader.hash()?;
         let baseline_output_path = reader.string()?;
-        let output_digest = reader.hash()?;
+        let output_identity = OutputIdentity {
+            normalized_digest: reader.hash()?,
+            signature_hashes_digest: reader.hash()?,
+        };
         let output_len = reader.u64()?;
         let signature = SignatureInfo {
             code_limit: reader.u64()?,
@@ -2840,7 +2941,7 @@ impl Manifest {
         Ok(Self {
             arguments_digest,
             baseline_output_path,
-            output_digest,
+            output_identity,
             output_len,
             signature,
             inputs,
@@ -2864,9 +2965,10 @@ impl<'a> ManifestView<'a> {
         anyhow::ensure!(reader.take(MAGIC.len())? == MAGIC, "wrong cache magic");
         anyhow::ensure!(reader.u32()? == VERSION, "unsupported cache version");
         let arguments_digest = reader.hash()?;
-        // Baseline output provenance and its content digest are needed when publishing a normal
+        // Baseline output provenance and its content identity are needed when publishing a normal
         // link, but the hit path owns and validates the current image through `ImageState`.
         reader.skip_bytes()?;
+        let _ = reader.hash()?;
         let _ = reader.hash()?;
         let _ = reader.u64()?;
         let signature = SignatureInfo {
@@ -3140,7 +3242,8 @@ impl ImageState {
         put_u32(&mut out, STATE_VERSION);
         out.extend_from_slice(&self.arguments_digest);
         out.extend_from_slice(&self.manifest_checksum);
-        out.extend_from_slice(&self.output_digest);
+        out.extend_from_slice(&self.output_identity.normalized_digest);
+        out.extend_from_slice(&self.output_identity.signature_hashes_digest);
         put_u64(&mut out, self.output_len);
         put_u32(&mut out, self.inputs.len() as u32);
         for input in &self.inputs {
@@ -3166,7 +3269,10 @@ impl ImageState {
         anyhow::ensure!(reader.u32()? == STATE_VERSION, "unsupported image-state version");
         let arguments_digest = reader.hash()?;
         let manifest_checksum = reader.hash()?;
-        let output_digest = reader.hash()?;
+        let output_identity = OutputIdentity {
+            normalized_digest: reader.hash()?,
+            signature_hashes_digest: reader.hash()?,
+        };
         let output_len = reader.u64()?;
         let input_count = reader.count()?;
         let mut inputs = Vec::with_capacity(input_count);
@@ -3182,7 +3288,7 @@ impl ImageState {
         Ok(Self {
             arguments_digest,
             manifest_checksum,
-            output_digest,
+            output_identity,
             output_len,
             inputs,
         })
@@ -3317,6 +3423,7 @@ mod tests {
     use super::InputRange;
     use super::ImageState;
     use super::ObjectRecord;
+    use super::OutputIdentity;
     use super::PatchRange;
     use super::ProtectedRange;
     use super::SignatureInfo;
@@ -3340,7 +3447,11 @@ mod tests {
     use super::protected_ranges_match;
     use super::refresh_changed_code_signature_hashes;
     use super::n_oso_archive_path_patches;
+    use super::normalized_output_digest;
+    use super::output_identity;
+    use super::output_matches_identity;
     use super::stable_output_basename;
+    use super::uuid_from_normalized_digest;
     use super::arguments_digest;
     use crate::args::Input;
     use crate::args::InputSpec;
@@ -3356,7 +3467,10 @@ mod tests {
         let manifest = Manifest {
             arguments_digest: [1; 32],
             baseline_output_path: "/tmp/e-old-hash".to_owned(),
-            output_digest: [2; 32],
+            output_identity: OutputIdentity {
+                normalized_digest: [2; 32],
+                signature_hashes_digest: [3; 32],
+            },
             output_len: 123,
             signature: SignatureInfo {
                 code_limit: 64,
@@ -3455,7 +3569,7 @@ mod tests {
         let state = ImageState {
             arguments_digest: manifest.arguments_digest,
             manifest_checksum: view.checksum,
-            output_digest: manifest.output_digest,
+            output_identity: manifest.output_identity,
             output_len: manifest.output_len,
             inputs: manifest.inputs.clone(),
         };
@@ -3574,26 +3688,45 @@ mod tests {
             "wild-stable-layout-cache-output-{unique}-{}",
             std::process::id()
         ));
-        let baseline = b"baseline";
-        std::fs::write(&path, baseline).unwrap();
-        let digest = *blake3::hash(baseline).as_bytes();
+        let signature = SignatureInfo {
+            code_limit: 64,
+            hashes_offset: 128,
+            hash_count: 1,
+            uuid_offset: 32,
+            identifier_offset: 96,
+            identifier_capacity: 32,
+        };
+        let mut baseline = (0..160).map(|byte| byte as u8).collect::<Vec<_>>();
+        let normalized = normalized_output_digest(&baseline, &signature).unwrap();
+        baseline[32..48].copy_from_slice(&uuid_from_normalized_digest(&normalized));
+        let identity = output_identity(&baseline, &signature).unwrap();
+        std::fs::write(&path, &baseline).unwrap();
+        let wrong_identity = OutputIdentity {
+            normalized_digest: [0; HASH_SIZE],
+            signature_hashes_digest: identity.signature_hashes_digest,
+        };
 
         assert_eq!(
-            existing_output_matches_baseline(&path, baseline.len() as u64, &digest),
+            existing_output_matches_baseline(&path, baseline.len() as u64, &identity, &signature),
             Some(true),
         );
         assert_eq!(
-            existing_output_matches_baseline(&path, baseline.len() as u64 - 1, &digest),
+            existing_output_matches_baseline(
+                &path,
+                baseline.len() as u64 - 1,
+                &identity,
+                &signature,
+            ),
             Some(false),
         );
         assert_eq!(
-            existing_output_matches_baseline(&path, baseline.len() as u64, &[0; 32]),
+            existing_output_matches_baseline(&path, baseline.len() as u64, &wrong_identity, &signature),
             Some(false),
         );
 
         std::fs::remove_file(&path).unwrap();
         assert_eq!(
-            existing_output_matches_baseline(&path, baseline.len() as u64, &digest),
+            existing_output_matches_baseline(&path, baseline.len() as u64, &identity, &signature),
             None,
         );
 
@@ -3601,10 +3734,56 @@ mod tests {
         // read is not equivalent to that allowed absence: it cannot prove this cache lineage.
         std::fs::create_dir(&path).unwrap();
         assert_eq!(
-            existing_output_matches_baseline(&path, baseline.len() as u64, &digest),
+            existing_output_matches_baseline(&path, baseline.len() as u64, &identity, &signature),
             Some(false),
         );
         std::fs::remove_dir(&path).unwrap();
+    }
+
+    #[test]
+    fn output_identity_binds_code_bytes_uuid_and_signature_hashes() {
+        let signature = SignatureInfo {
+            code_limit: 128,
+            hashes_offset: 192,
+            hash_count: 1,
+            uuid_offset: 32,
+            identifier_offset: 160,
+            identifier_capacity: 32,
+        };
+        let mut output = (0..300).map(|byte| byte as u8).collect::<Vec<_>>();
+        let normalized = normalized_output_digest(&output, &signature).unwrap();
+        let mut writer_preimage = output.clone();
+        writer_preimage[32..48].fill(0);
+        writer_preimage[192..224].fill(0);
+        assert_eq!(normalized, *blake3::hash(&writer_preimage).as_bytes());
+        output[32..48].copy_from_slice(&uuid_from_normalized_digest(&normalized));
+        let identity = output_identity(&output, &signature).unwrap();
+        assert!(output_matches_identity(&output, &signature, &identity));
+
+        output[80] ^= 1;
+        assert!(!output_matches_identity(&output, &signature, &identity));
+        output[80] ^= 1;
+
+        output[160] ^= 1;
+        assert!(!output_matches_identity(&output, &signature, &identity));
+        output[160] ^= 1;
+
+        output[32] ^= 1;
+        assert!(!output_matches_identity(&output, &signature, &identity));
+        output[32] ^= 1;
+
+        output[192] ^= 1;
+        assert!(!output_matches_identity(&output, &signature, &identity));
+        output[192] ^= 1;
+
+        output[250] ^= 1;
+        assert!(!output_matches_identity(&output, &signature, &identity));
+
+        let invalid_signature = SignatureInfo {
+            hash_count: 2,
+            ..signature
+        };
+        assert!(output_identity(&output, &invalid_signature).is_none());
     }
 
     #[cfg(target_os = "macos")]

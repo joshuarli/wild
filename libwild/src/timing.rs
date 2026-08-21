@@ -284,7 +284,6 @@ fn should_emit_json_phase(name: &str) -> bool {
             | "Mach-O stable-layout cache: prepare rustc archive debug paths"
             | "Mach-O stable-layout cache: patch and sign"
             | "Mach-O stable-layout cache: recheck input metadata"
-            | "Mach-O stable-layout cache: fingerprint patched output"
             | "Mach-O stable-layout cache: atomically replace output"
             | "Mach-O stable-layout cache: atomically update sidecars"
     )
