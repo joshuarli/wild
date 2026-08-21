@@ -72,8 +72,6 @@ perfetto = ["libwild/perfetto"]
 
 wasm = ["libwild/wasm"]
 
-macho = ["libwild/macho"]
-
 # external tests
 external_tests = ["mold_tests", "lld_tests"]
 mold_tests = []

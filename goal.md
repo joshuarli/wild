@@ -27,6 +27,53 @@ Primary targets:
 - Never accept a cache “hit” unless it is proven to use the fast path and the resulting Mach-O
   passes codesign verification and runtime/integration checks.
 
+Current baseline (macOS AArch64, captured 2026-08-19):
+
+The current full direct-link and resource batches use the saved seven-workload matrix and five
+samples per linker. The runner's summaries below are means, rather than the alternating,
+interleaved paired medians required for signoff. They are the working baseline and show the
+remaining delta; rerun them as paired medians before claiming a target has passed.
+
+| workload | Apple wall (ms) | Wild wall (ms) | Wild/Apple | Apple peak RSS (MiB) | Wild peak RSS (MiB) | Wild/Apple |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| large Rust application | 246.53 | 316.80 | 1.285× | 298.33 | 268.11 | 0.899× |
+| `librustc_driver` | 295.62 | 493.24 | 1.668× | 455.79 | 421.38 | 0.925× |
+| medium Rust project | 82.39 | 68.21 | 0.828× | 53.08 | 32.93 | 0.620× |
+| native dependency workspace | 85.05 | 62.13 | 0.730× | 48.11 | 26.22 | 0.545× |
+| proc-macro-heavy workspace | 85.03 | 76.07 | 0.895× | 62.03 | 41.42 | 0.668× |
+| tiny Rust binary | 77.20 | 57.67 | 0.747× | 45.87 | 25.64 | 0.559× |
+| Wild self-link | 255.81 | 386.03 | 1.509× | 315.53 | 332.79 | 1.055× |
+
+The median of the seven mean-derived direct-link ratios is 0.895×, 0.045× above the 0.85×
+target; three workloads are slower than Apple. The median of the corresponding peak-RSS ratios
+is 0.668×, already below the 0.75× aggregate target. The per-workload RSS guard still fails for
+`librustc_driver` (0.925× versus 0.90×) and Wild self-link (1.055× versus 0.90×). The large Rust
+application is within that guard only narrowly at 0.899×.
+
+Current status:
+
+- Direct final-link output validation, strict codesign, and the targeted integration tests pass.
+  The tested candidate Wild self-link and `librustc_driver` outputs were byte-for-byte and
+  allocation-block identical to their preceding Wild baselines.
+- The current baseline does not qualify the cold-Cargo, incremental-cache, persistent-cache-disk,
+  or peak-transient-disk targets. Do not infer those results from direct-link replays.
+- Export-trie construction and key handling have reduced the current RSS baseline substantially;
+  retain those gains while pursuing the remaining wall-time work.
+
+Remaining performance problems, in order:
+
+1. Cold direct-link time for `librustc_driver` (1.668×), Wild self-link (1.509×), and the large
+   Rust application (1.285×). These are the blocking workloads for both the 0.85× target and the
+   requirement that none be slower than Apple.
+2. Peak RSS for Wild self-link, then `librustc_driver`. The former needs to fall below 284 MiB to
+   satisfy the 0.90× per-workload guard; the latter needs to fall below 411 MiB. Keep the large
+   Rust application below its narrow 0.90× margin as time work proceeds.
+3. The proc-macro-heavy workspace is close but still misses the 0.85× direct-link target at
+   0.895×. It becomes a priority after the three blocking direct-link workloads.
+4. Establish cache-eligible incremental workload traces and measure cold Cargo, cache-hit rate,
+   persistent cache bytes, and transient disk in the required separate batches. Disk growth is
+   acceptable only under the trade-off rules above.
+
 Benchmark at least:
 
 1. `~/d/e` — fast iteration workload.

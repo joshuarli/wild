@@ -437,15 +437,15 @@ fn main() -> Result<std::process::ExitCode> {
     let mut tests = Vec::new();
     collect_tests(&mut tests, &filter)?;
     external_tests::collect_tests(&mut tests, &filter)?;
-    #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     collect_cargo_macho_qualification(&mut tests, &filter)?;
-    #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     collect_cargo_macho_staticlib_qualification(&mut tests, &filter)?;
-    #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     collect_real_cargo_macho_corpus(&mut tests, &filter)?;
-    #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     collect_macho_dylib_dependency_qualification(&mut tests, &filter)?;
-    #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     collect_macho_stable_layout_cache_qualification(&mut tests, &filter)?;
     Ok(libtest_mimic::run(&args, tests).exit_code())
 }
@@ -453,7 +453,7 @@ fn main() -> Result<std::process::ExitCode> {
 /// The pinned Cargo corpus deliberately stays out of the per-PR runtime budget. The manually
 /// dispatched macOS qualification workflow opts in with this environment variable, where the
 /// test proves clean/build/test for both the supported stable compiler and the dated nightly.
-#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn collect_real_cargo_macho_corpus(tests: &mut Vec<Trial>, filter: &Filter) -> Result {
     const NAME: &str = "macho/aarch64/real-cargo-corpus/default";
     if filter.excludes(NAME) || env::var_os("WILD_RUN_MACHO_REAL_CARGO_CORPUS").is_none() {
@@ -466,7 +466,7 @@ fn collect_real_cargo_macho_corpus(tests: &mut Vec<Trial>, filter: &Filter) -> R
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn run_real_cargo_macho_corpus() -> Result {
     let manifest = base_dir()
         .join("tests")
@@ -512,7 +512,7 @@ fn run_real_cargo_macho_corpus() -> Result {
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn run_cargo_corpus_command(
     toolchain: &str,
     operation: &str,
@@ -553,17 +553,17 @@ fn run_cargo_corpus_command(
 /// binary ahead of rustup; that binary accepts ordinary Cargo commands but reports `+nightly...`
 /// as an unknown subcommand. Probe the requested selector before running a qualification command,
 /// and prefer the documented Homebrew rustup proxy used by the macOS benchmark protocol.
-#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn cargo_with_toolchain(toolchain: &str) -> Result<Command> {
     rustup_tool_with_toolchain("cargo", toolchain)
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn rustc_with_toolchain(toolchain: &str) -> Result<Command> {
     rustup_tool_with_toolchain("rustc", toolchain)
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn rustup_tool_with_toolchain(tool: &str, toolchain: &str) -> Result<Command> {
     const HOMEBREW_RUSTUP_BIN: &str = "/opt/homebrew/opt/rustup/bin";
 
@@ -603,7 +603,7 @@ fn rustup_tool_with_toolchain(tool: &str, toolchain: &str) -> Result<Command> {
     )
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn verify_real_cargo_corpus_transcript(
     transcript: &str,
     wild: &Path,
@@ -652,7 +652,7 @@ fn verify_real_cargo_corpus_transcript(
 /// its binary targets. Run every retained corpus executable after checking its thin ARM64 header,
 /// signature, and file type so this qualification catches a link that merely wrote a plausible
 /// artifact while failing dyld/runtime initialization.
-#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn verify_real_cargo_macho_corpus_binaries(target_dir: &Path) -> Result {
     let debug_dir = target_dir.join("debug");
     for (name, expected_stdout) in [
@@ -713,7 +713,7 @@ fn verify_real_cargo_macho_corpus_binaries(target_dir: &Path) -> Result {
 /// and makes Clang print the selected linker. It exercises both kinds of Rust dylib that Cargo
 /// produces on ARM64: a proc macro that must be loaded during compilation, and a Rust `dylib`
 /// that must be found through the final executable's Mach-O rpath at runtime.
-#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn collect_cargo_macho_qualification(tests: &mut Vec<Trial>, filter: &Filter) -> Result {
     const NAME: &str = "macho/aarch64/cargo-workspace-qualification/default";
     if filter.excludes(NAME) {
@@ -726,7 +726,7 @@ fn collect_cargo_macho_qualification(tests: &mut Vec<Trial>, filter: &Filter) ->
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn run_cargo_macho_qualification() -> Result {
     let fixture_dir = base_dir().join("tests").join("cargo_macho_qualification");
     let manifest = fixture_dir.join("Cargo.toml");
@@ -915,7 +915,7 @@ fn run_cargo_macho_qualification() -> Result {
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn replace_copied_cargo_qualification_file(path: &Path, from: &str, to: &str) -> Result {
     let contents = std::fs::read_to_string(path)
         .with_context(|| format!("failed to read copied Cargo qualification file {}", path.display()))?;
@@ -929,7 +929,7 @@ fn replace_copied_cargo_qualification_file(path: &Path, from: &str, to: &str) ->
         .with_context(|| format!("failed to update copied Cargo qualification file {}", path.display()))
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn copy_cargo_macho_qualification_workspace(source: &Path, destination: &Path) -> Result {
     std::fs::create_dir_all(destination).with_context(|| {
         format!(
@@ -965,7 +965,7 @@ fn copy_cargo_macho_qualification_workspace(source: &Path, destination: &Path) -
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn cargo_macho_qualification_rust_sources(
     root: &Path,
 ) -> Result<Vec<(PathBuf, Vec<u8>)>> {
@@ -974,7 +974,7 @@ fn cargo_macho_qualification_rust_sources(
     Ok(sources)
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn collect_cargo_macho_qualification_rust_sources(
     root: &Path,
     directory: &Path,
@@ -1001,7 +1001,7 @@ fn collect_cargo_macho_qualification_rust_sources(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn ensure_cargo_macho_qualification_sources_unchanged(
     fixture_dir: &Path,
     sources: &[(PathBuf, Vec<u8>)],
@@ -1023,7 +1023,7 @@ fn ensure_cargo_macho_qualification_sources_unchanged(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn ensure_cargo_macho_qualification_build_marker_unchanged(fixture_dir: &Path) -> Result {
     let marker = fixture_dir.join("dylib-producer").join("build-marker.txt");
     let marker_contents = std::fs::read_to_string(&marker)
@@ -1036,7 +1036,7 @@ fn ensure_cargo_macho_qualification_build_marker_unchanged(fixture_dir: &Path) -
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn cargo_build_with_wild(
     manifest: &Path,
     target_dir: &Path,
@@ -1078,7 +1078,7 @@ fn cargo_build_with_wild(
     verify_cargo_wild_transcript(&transcript, wild, package, expected_final_outputs)
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn cargo_test_with_wild(
     manifest: &Path,
     target_dir: &Path,
@@ -1112,7 +1112,7 @@ fn cargo_test_with_wild(
     verify_cargo_wild_transcript(&transcript, wild, package, expected_final_outputs)
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn verify_cargo_wild_transcript(
     transcript: &str,
     wild: &Path,
@@ -1160,7 +1160,7 @@ fn verify_cargo_wild_transcript(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn run_cargo_macho_binary(binary: &Path, expected_stdout: &str) -> Result {
     let output = Command::new(binary)
         // Cargo sets this for its own subprocesses. Removing both search-path overrides ensures
@@ -1185,7 +1185,7 @@ fn run_cargo_macho_binary(binary: &Path, expected_stdout: &str) -> Result {
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn verify_cargo_dylib_rpath(binary: &Path) -> Result {
     let load_commands = Command::new("otool")
         .arg("-l")
@@ -1216,7 +1216,7 @@ fn verify_cargo_dylib_rpath(binary: &Path) -> Result {
 /// native controls keep its ordinary C exports and the C++ exception path distinct: the latter
 /// throws in C++, crosses an `extern "C-unwind"` Rust export, and is caught by its original C++
 /// frame.
-#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn collect_cargo_macho_staticlib_qualification(
     tests: &mut Vec<Trial>,
     filter: &Filter,
@@ -1233,7 +1233,7 @@ fn collect_cargo_macho_staticlib_qualification(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn run_cargo_macho_staticlib_qualification() -> Result {
     let fixture_dir = base_dir().join("tests").join("cargo_macho_staticlib");
     let manifest = fixture_dir.join("Cargo.toml");
@@ -1359,7 +1359,7 @@ fn run_cargo_macho_staticlib_qualification() -> Result {
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn link_native_staticlib_consumer(
     source: &Path,
     archive: &Path,
@@ -1413,7 +1413,7 @@ fn link_native_staticlib_consumer(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn run_native_staticlib_consumer(binary: &Path, expected_exit: i32) -> Result {
     let output = Command::new(binary)
         .env_remove("DYLD_LIBRARY_PATH")
@@ -1436,7 +1436,7 @@ fn run_native_staticlib_consumer(binary: &Path, expected_exit: i32) -> Result {
 /// within an otherwise equal-sized, relocation-free section. The cache must compose both updates,
 /// update the final `n_value`, retain the other layout, re-sign the executable, and run it
 /// without invoking a normal link.
-#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn collect_macho_stable_layout_cache_qualification(
     tests: &mut Vec<Trial>,
     filter: &Filter,
@@ -1452,7 +1452,7 @@ fn collect_macho_stable_layout_cache_qualification(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn run_macho_stable_layout_cache_qualification() -> Result {
     let fixture_dir = base_dir().join("tests").join("macho_stable_layout_cache");
     let main_source = fixture_dir.join("main.s");
@@ -1598,7 +1598,7 @@ fn run_macho_stable_layout_cache_qualification() -> Result {
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn compile_macho_stable_layout_cache_fixture(source: &Path, output: &Path) -> Result {
     let result = Command::new("clang")
         .args(["-arch", "arm64", "-c"])
@@ -1617,7 +1617,7 @@ fn compile_macho_stable_layout_cache_fixture(source: &Path, output: &Path) -> Re
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn macos_sdk_path() -> Result<PathBuf> {
     let output = Command::new("xcrun")
         .arg("--show-sdk-path")
@@ -1635,7 +1635,7 @@ fn macos_sdk_path() -> Result<PathBuf> {
     Ok(PathBuf::from(path))
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn link_macho_stable_layout_cache_fixture(
     binary: &Path,
     cache_dir: &Path,
@@ -1683,7 +1683,7 @@ fn link_macho_stable_layout_cache_fixture(
     Ok(transcript)
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn macho_symbol_address(binary: &Path, expected_name: &[u8]) -> Result<u64> {
     let bytes = std::fs::read(binary)
         .with_context(|| format!("failed to read cached Mach-O executable {}", binary.display()))?;
@@ -1705,7 +1705,7 @@ fn macho_symbol_address(binary: &Path, expected_name: &[u8]) -> Result<u64> {
 /// A dylib's own dependency list is a separate dyld contract from an executable loading one
 /// dylib. Build all three images with the selected linker: the executable finds the middle image
 /// through its rpath, then the middle image finds the leaf through its own rpath.
-#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn collect_macho_dylib_dependency_qualification(
     tests: &mut Vec<Trial>,
     filter: &Filter,
@@ -1722,7 +1722,7 @@ fn collect_macho_dylib_dependency_qualification(
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn run_macho_dylib_dependency_qualification() -> Result {
     let fixture_dir = base_dir().join("tests").join("macho_dylib_dependency");
     let leaf_source = fixture_dir.join("leaf.c");
@@ -1831,7 +1831,7 @@ fn run_macho_dylib_dependency_qualification() -> Result {
     Ok(())
 }
 
-#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn link_arm64_dylib_dependency_artifact(
     linker_name: &str,
     wild: Option<&Path>,
@@ -1885,7 +1885,7 @@ fn collect_tests(tests: &mut Vec<Trial>, filter: &Filter) -> Result {
             continue;
         }
 
-        if platform == PlatformKind::MachO && !cfg!(feature = "macho") {
+        if platform == PlatformKind::MachO && !cfg!(target_os = "macos") {
             continue;
         }
 
