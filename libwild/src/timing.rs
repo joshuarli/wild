@@ -262,6 +262,7 @@ fn should_emit_json_phase(name: &str) -> bool {
             | "Traverse reference graph"
             | "Write output file"
             | "Write data to file"
+            | "Build Mach-O exports trie"
             | "Copy Mach-O object data"
             | "Write Mach-O dynamic tables"
             | "Write Mach-O unwind tables"
@@ -441,6 +442,7 @@ mod tests {
     fn json_timing_is_bounded_to_link_critical_phases() {
         assert!(should_emit_json_phase("Link"));
         assert!(should_emit_json_phase("Traverse reference graph"));
+        assert!(should_emit_json_phase("Build Mach-O exports trie"));
         assert!(should_emit_json_phase("Try Mach-O stable-layout cache"));
         assert!(should_emit_json_phase(
             "Mach-O stable-layout cache: verify current output lineage"

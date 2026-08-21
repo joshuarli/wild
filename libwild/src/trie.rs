@@ -2,6 +2,7 @@
 
 use leb128::write::unsigned_len as uleb128_size;
 use object::macho;
+use smallvec::SmallVec;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Symbol<'data> {
@@ -32,7 +33,10 @@ struct UncompressedNode {
     symbol: Option<usize>,
     representative: usize,
     depth: usize,
-    children: Vec<usize>,
+    /// Export names are commonly long mangled paths with just one continuation at each byte.
+    /// Keeping that edge inline avoids a separate heap allocation for every such byte while the
+    /// temporary character trie is being compressed into Mach-O's radix representation.
+    children: SmallVec<[usize; 1]>,
 }
 
 /// Build a Mach-O exports trie for `symbols`. `symbols` is sorted in place.
