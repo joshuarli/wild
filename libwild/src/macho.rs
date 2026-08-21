@@ -317,19 +317,130 @@ pub(crate) fn compact_unwind_info_capacity(entry_count: usize) -> usize {
     28 + 3 * 4 + (page_count + 1) * 12 + entry_count * 8 + page_count * 8 + entry_count * 8
 }
 
-/// Allocate enough room for every input record plus the sole output terminator. The final writer
-/// only retains CIEs that have a live FDE, so the actual serialization can be smaller, but it
-/// never needs more bytes than the complete input sections and one four-byte terminator. The
-/// synthetic section has 8-byte pointer alignment, so its reserved part must end on that boundary
-/// even though the terminator itself is four bytes.
-pub(crate) fn eh_frame_capacity(input_size: usize) -> Result<usize> {
-    let size = input_size
+/// Add the one final terminator and required alignment to the selected `__eh_frame` records.
+/// The synthetic section has 8-byte pointer alignment, so its reserved part must end on that
+/// boundary even though the terminator itself is four bytes.
+pub(crate) fn eh_frame_capacity(record_size: usize) -> Result<usize> {
+    let size = record_size
         .checked_add(size_of::<u32>())
         .context("Mach-O __eh_frame input is too large")?;
     Ok(size
         .checked_add(7)
         .context("Mach-O __eh_frame alignment overflows")?
         & !7)
+}
+
+/// Return the number of CIE/FDE bytes the final `__eh_frame` writer will retain for one object.
+///
+/// Graph traversal is complete before `create_finalise_sizes_ext`, but atom ranges have not yet
+/// been sorted or assigned output offsets. That is still enough to prove an FDE's function is
+/// dead: its target section either was not loaded, or its symbol does not belong to a recorded
+/// live atom. Keeping this pre-layout test conservative matters. A producer form the final
+/// writer will reject, or one whose target cannot be resolved here, remains allocated so the
+/// writer retains ownership of its established diagnostic.
+fn selected_eh_frame_record_size(
+    object: &layout::ObjectLayoutState<'_, MachO>,
+) -> Result<(bool, usize)> {
+    let mut has_input = false;
+    let mut selected_size = 0usize;
+
+    for (section_index, section) in object.object.enumerate_sections() {
+        if section.name() != b"__eh_frame" {
+            continue;
+        }
+        let data = object.object.raw_section_data(section)?;
+        if data.is_empty() {
+            continue;
+        }
+        has_input = true;
+        let records = parse_eh_frame_records(data)?;
+        if records.fdes.is_empty() {
+            continue;
+        }
+
+        let mut relocations = BTreeMap::<usize, Vec<object::macho::RelocationInfo>>::new();
+        for relocation in object.relocations(section_index)?.relocations {
+            let info = relocation.info(LE);
+            let offset = usize::try_from(info.r_address)
+                .context("Mach-O __eh_frame relocation offset overflowed usize")?;
+            relocations.entry(offset).or_default().push(info);
+        }
+
+        let mut selected_cies = BTreeSet::new();
+        for fde in &records.fdes {
+            if eh_frame_fde_is_definitely_dead(object, &relocations, fde.function_relocation_offset)
+            {
+                continue;
+            }
+
+            if selected_cies.insert(fde.cie_record_start) {
+                let cie = records.cies.get(&fde.cie_record_start).with_context(|| {
+                    format!(
+                        "Mach-O __eh_frame FDE references missing CIE at offset 0x{:x} in {}",
+                        fde.cie_record_start, object.input
+                    )
+                })?;
+                selected_size = selected_size
+                    .checked_add(cie.record_range.len())
+                    .context("selected Mach-O __eh_frame CIE data is too large")?;
+            }
+            selected_size = selected_size
+                .checked_add(fde.record_range.len())
+                .context("selected Mach-O __eh_frame FDE data is too large")?;
+        }
+    }
+
+    Ok((has_input, selected_size))
+}
+
+/// Return true only for an FDE whose unsigned target is conclusively absent from the final
+/// object. This duplicates the liveness half of `macho_writer::eh_frame_input_symbol_address` at
+/// the earlier pre-layout boundary; it intentionally leaves malformed or unfamiliar relocation
+/// sequences to the writer.
+fn eh_frame_fde_is_definitely_dead(
+    object: &layout::ObjectLayoutState<'_, MachO>,
+    relocations: &BTreeMap<usize, Vec<object::macho::RelocationInfo>>,
+    function_relocation_offset: usize,
+) -> bool {
+    let Some(fields) = relocations.get(&function_relocation_offset) else {
+        return false;
+    };
+    let Some(unsigned) = fields
+        .iter()
+        .find(|info| info.r_type == macho::ARM64_RELOC_UNSIGNED)
+    else {
+        return false;
+    };
+    if !unsigned.r_extern {
+        return false;
+    }
+
+    let symbol_index = SymbolIndex(unsigned.r_symbolnum as usize);
+    let Ok(symbol) = object.object.symbol(symbol_index) else {
+        return false;
+    };
+    let Ok(Some(section_index)) = object.object.symbol_section(symbol, symbol_index) else {
+        return false;
+    };
+
+    if !matches!(
+        object.sections.get(section_index.0),
+        Some(
+            resolution::SectionSlot::Loaded(_)
+                | resolution::SectionSlot::Sorted(_)
+                | resolution::SectionSlot::LoadedDebugInfo(_)
+                | resolution::SectionSlot::FrameData(_)
+        )
+    ) {
+        return true;
+    }
+
+    object
+        .object
+        .symbol_offset_in_section(symbol, section_index)
+        .is_ok_and(|input_offset| {
+            !object.input_offset_has_output_address(section_index, input_offset)
+        })
 }
 
 type SectionHeader = Section64<crate::macho::Endianness>;
@@ -3036,7 +3147,8 @@ impl platform::Platform for MachO {
         let mut imported_libraries = Vec::new();
         let mut imported_symbols = Vec::new();
         let mut compact_unwind_entry_count = 0usize;
-        let mut eh_frame_input_size = 0usize;
+        let mut has_eh_frame_input = false;
+        let mut selected_eh_frame_record_total_size = 0usize;
         let mut objc_message_stubs_by_selector = BTreeMap::new();
         let mut objc_message_selectors = BTreeMap::new();
 
@@ -3086,15 +3198,12 @@ impl platform::Platform for MachO {
                                 .checked_add(data.len() / COMPACT_UNWIND_ENTRY_SIZE)
                                 .context("too many Mach-O compact unwind entries")?;
                         }
-                        for (_, section) in object.object.enumerate_sections() {
-                            if section.name() != b"__eh_frame" {
-                                continue;
-                            }
-                            let data = object.object.raw_section_data(section)?;
-                            eh_frame_input_size = eh_frame_input_size
-                                .checked_add(data.len())
-                                .context("too much Mach-O __eh_frame input")?;
-                        }
+                        let (object_has_eh_frame_input, object_eh_frame_record_size) =
+                            selected_eh_frame_record_size(object)?;
+                        has_eh_frame_input |= object_has_eh_frame_input;
+                        selected_eh_frame_record_total_size = selected_eh_frame_record_total_size
+                            .checked_add(object_eh_frame_record_size)
+                            .context("selected Mach-O __eh_frame data is too large")?;
                     }
                     layout::FileLayoutState::StubLibrary(state) => {
                         if state.format_specific.loaded {
@@ -3126,8 +3235,8 @@ impl platform::Platform for MachO {
                 .common
                 .allocate(part_id::UNWIND_INFO, unwind_info_capacity as u64);
         }
-        let eh_frame_size = eh_frame_capacity(eh_frame_input_size)?;
-        if eh_frame_input_size > 0 {
+        let eh_frame_size = eh_frame_capacity(selected_eh_frame_record_total_size)?;
+        if has_eh_frame_input {
             let epilogue_group = groups
                 .last_mut()
                 .context("missing Mach-O epilogue group for __eh_frame")?;
@@ -3172,7 +3281,7 @@ impl platform::Platform for MachO {
             imported_libraries,
             imported_symbols,
             unwind_info_size: unwind_info_capacity as u64,
-            eh_frame_size: (eh_frame_input_size > 0)
+            eh_frame_size: has_eh_frame_input
                 .then_some(eh_frame_size as u64)
                 .unwrap_or(0),
             objc_message_stubs,

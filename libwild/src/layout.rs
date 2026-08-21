@@ -4471,6 +4471,36 @@ impl<'data, P: Platform> ObjectLayoutState<'data, P> {
         }
     }
 
+    /// Returns whether an input offset has, or will receive, an output address. This includes a
+    /// label exactly at the end of the final retained atom: it owns no bytes, but it is still a
+    /// valid address. Before atom ranges are sorted, identify that boundary by its greatest end;
+    /// `output_offset_for_input` applies the equivalent sorted rule after size finalisation.
+    pub(crate) fn input_offset_has_output_address(
+        &self,
+        section_index: SectionIndex,
+        input_offset: u64,
+    ) -> bool {
+        let subsections = self
+            .live_subsections
+            .get(section_index.0)
+            .and_then(Option::as_deref);
+        if self.live_subsections_finalised {
+            return output_offset_for_input(subsections, input_offset).is_some();
+        }
+        let Some(subsections) = subsections else {
+            return true;
+        };
+        subsections.iter().any(|subsection| {
+            let range = &subsection.range;
+            (range.start == range.end && input_offset == range.start)
+                || (input_offset >= range.start && input_offset < range.end)
+                || (input_offset == range.end
+                    && subsections
+                        .iter()
+                        .all(|candidate| candidate.range.end <= input_offset))
+        })
+    }
+
     fn load_section<'scope, A: Arch<Platform = P>>(
         &mut self,
         common: &mut CommonGroupState<'data, P>,
