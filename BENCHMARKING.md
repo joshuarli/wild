@@ -83,7 +83,7 @@ For the current fast-iteration workload, build the optimized linker and run `e` 
 
 ```sh
 /opt/homebrew/opt/rustup/bin/cargo +nightly-2026-07-24 \
-  build --release -p wild-linker --features macho --bin wild
+  build --release -p wild-linker --bin wild
 python3 benchmarks/cargo_link_benchmark.py \
   --config benchmarks/e.benchmark.json \
   --workspace ~/d/e \

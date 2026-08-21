@@ -20,7 +20,8 @@ iced-x86.workspace = true
 itertools.workspace = true
 memchr.workspace = true
 memmap2.workspace = true
-object.workspace = true
+# Debug-info decompression is only needed by this diagnostic tool, not by the linker binary.
+object = { workspace = true, features = ["compression"] }
 symbolic-demangle.workspace = true
 tabled.workspace = true
 tempfile.workspace = true

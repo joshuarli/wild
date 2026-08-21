@@ -27,19 +27,19 @@ The matrix is a correctness-qualified performance baseline, not a speed claim: W
 loses substantially on the large Rust links, which identifies the next optimization work without
 weakening the completed format contract.
 The repository's ARM64 macOS CI job installs `nightly-2026-07-24` with `rust-src` and
-`llvm-tools`, then explicitly runs `cargo +nightly-2026-07-24 build/test --profile ci --workspace
---features macho`. Stable coverage remains in the Linux jobs. The separate manual/scheduled
+`llvm-tools`, then explicitly runs `cargo +nightly-2026-07-24 build/test --profile ci --workspace`.
+Stable coverage remains in the Linux jobs. The separate manual/scheduled
 qualification workflow runs the larger corpus and self-host path without making ordinary pull
 requests wait for them.
 
 Baseline checks completed on this host:
 
 * `cargo build --profile ci --workspace --no-default-features` — pass.
-* `WILD_TEST_IGNORE_FORMAT=1 cargo +1.97.1-aarch64-apple-darwin test --profile ci --workspace
-  --features macho` — pass (all workspace unit tests and doctests, including 224 `libwild` tests
+* `WILD_TEST_IGNORE_FORMAT=1 cargo +1.97.1-aarch64-apple-darwin test --profile ci --workspace` —
+  pass (all workspace unit tests and doctests, including 224 `libwild` tests
   and 97 ARM64 Mach-O integrations).
-* `WILD_TEST_IGNORE_FORMAT=1 cargo +nightly-2026-07-24 test --profile ci --workspace --features
-  macho` — pass (all workspace unit tests and doctests, including 224 `libwild` tests and 97
+* `WILD_TEST_IGNORE_FORMAT=1 cargo +nightly-2026-07-24 test --profile ci --workspace` — pass
+  (all workspace unit tests and doctests, including 224 `libwild` tests and 97
   ARM64 Mach-O integrations). This is the reproducible dated-nightly gate; it is run with the
   installed `rust-src` and `llvm-tools` components, not by falling back to stable Rust.
 * Without `WILD_TEST_IGNORE_FORMAT=1`, only tidy tests fail because this host lacks `taplo` and
@@ -150,49 +150,49 @@ passed wherever Wild is listed as failing.
 
 ## Reproducers and qualification commands
 
-* Fast existing Mach-O suite: `cargo test --profile ci --workspace --features macho`.
+* Fast existing Mach-O suite: `cargo test --profile ci --workspace`.
 * Existing CI build: `cargo build --profile ci --workspace --no-default-features`.
 * Focused permanent Rust TLS fixture: `WILD_TEST_IGNORE_FORMAT=1 cargo test -p wild-linker
-  --features macho --test integration_tests -- 'macho/aarch64/rust-thread-local/default'`.
+  --test integration_tests -- 'macho/aarch64/rust-thread-local/default'`.
 * Focused Apple-framework fixture: `WILD_TEST_IGNORE_FORMAT=1 cargo test --profile ci -p
-  wild-linker --features macho --test integration_tests --
+  wild-linker --test integration_tests --
   'macho/aarch64/framework-security/default'`. It links the same ARM64 C consumer with Apple and
   Wild, checks `LC_LOAD_DYLIB` for the current SDK Security framework identity/version, and runs
   the imported call.
 * Focused external-SDK-reexport fixture: `WILD_TEST_IGNORE_FORMAT=1 cargo test --profile ci -p
-  wild-linker --features macho --test integration_tests --
+  wild-linker --test integration_tests --
   'macho/aarch64/sdk-libiconv-external-reexport/default'`. It resolves the separate
   `libcharset.1.tbd` child of the SDK's `libiconv.tbd`, then checks that only libiconv's install
   name is emitted into the ARM64 consumer.
 * Cargo proc-macro and Rust-dylib qualification: `WILD_TEST_IGNORE_FORMAT=1 cargo test -p
-  wild-linker --features macho --test integration_tests --
+  wild-linker --test integration_tests --
   'macho/aarch64/cargo-workspace-qualification/default'`. This retains the multi-package Cargo
   workspace, executes its initial `build` and `test`, then mutates a proc-macro consumer, a
   `build.rs` input, and the dylib producer in a temporary copy. It audits every final ARM64 Clang
   invocation printed by `cargo -vv` for Wild's `--ld-path`, rejects x86_64 links, runs the
   rebuilt binaries without `DYLD_*` overrides, and confirms the retained fixture did not change.
 * Focused C debug-map fixture: `WILD_TEST_IGNORE_FORMAT=1 cargo test --profile ci -p wild-linker
-  --test integration_tests --features macho -- 'macho/aarch64/debug-dwarf/default'`. Its output
+  --test integration_tests -- 'macho/aarch64/debug-dwarf/default'`. Its output
   can be checked with `dsymutil --dump-debug-map <binary>`, `dsymutil <binary>`, and
   `dwarfdump --verify <binary>.dSYM/Contents/Resources/DWARF/<binary-name>`.
 * Focused Rust debug-map fixture: `WILD_TEST_IGNORE_FORMAT=1 cargo +nightly-2026-07-24 test
-  --profile ci -p wild-linker --features macho --test integration_tests --
+  --profile ci -p wild-linker --test integration_tests --
   'macho/aarch64/rust-debug-dwarf/default'`. It uses the exact dated toolchain independently of
   the harness default, checks that `-dead_strip` omits the private Rust atom, verifies its dSYM,
   and has LLDB stop in `wild_rust_debug_dwarf_add` at `rust-debug-dwarf.rs:14`.
 * Focused C++14 and Objective-C debug-map fixtures: `WILD_TEST_IGNORE_FORMAT=1 cargo
-  +nightly-2026-07-24 test --profile ci -p wild-linker --features macho --test integration_tests
+  +nightly-2026-07-24 test --profile ci -p wild-linker --test integration_tests
   -- 'macho/aarch64/cxx-debug-dwarf/default'` and the same command with
   `macho/aarch64/objc-debug-dwarf/default`. Each proves Apple ld, ld64.lld, and Wild produce a
   valid dSYM and that LLDB stops at the named source-level helper; the former deliberately emits
   only `DW_LANG_C_plus_plus_14`, while the latter emits only `DW_LANG_ObjC`.
 * Focused C++ archive EH/debug-map fixture: `WILD_TEST_IGNORE_FORMAT=1 cargo
-  +nightly-2026-07-24 test --profile ci -p wild-linker --features macho --test integration_tests
+  +nightly-2026-07-24 test --profile ci -p wild-linker --test integration_tests
   -- 'macho/aarch64/cxx-exception-archive/default'`. Its throwing frame is extracted from a
   `-g` archive member, reaches a C++ catch through its LSDA, and appears in Wild's debug map as
   `archive.a(member.o)`; the dead helper is absent and LLDB resolves the member's source line.
 * Focused ARM64 subtractor fixture: `WILD_TEST_IGNORE_FORMAT=1 cargo test --profile ci -p
-  wild-linker --features macho --test integration_tests -- 'macho/aarch64/subtractor-reloc/default'`.
+  wild-linker --test integration_tests -- 'macho/aarch64/subtractor-reloc/default'`.
   Apple clang emits an adjacent, same-offset `ARM64_RELOC_SUBTRACTOR` then
   `ARM64_RELOC_UNSIGNED` pair, both external-symbol, non-PC-relative, width-matched 32-bit or
   64-bit records. The unsigned half names the minuend, the subtractor names the subtrahend, and
@@ -229,7 +229,7 @@ chained-fixup plan records the first page start as `0x68`, so dyld begins the ch
 actual bind rather than decoding a local slot as a pointer.
 
 ```sh
-cargo build -p wild-linker --features macho --bin wild
+cargo build -p wild-linker --bin wild
 scratch="$(mktemp -d)"
 cargo init --bin --name wild_macho_smoke "$scratch"
 RUSTFLAGS="-C linker=clang -C link-arg=--ld-path=$PWD/target/debug/wild" \
@@ -309,7 +309,7 @@ Rust ABI/exception qualification.
 
 ```sh
 WILD_TEST_IGNORE_FORMAT=1 cargo +nightly-2026-07-24 test --profile ci -p wild-linker \
-  --features macho --test integration_tests -- 'macho/aarch64/cargo-staticlib-native/default'
+  --test integration_tests -- 'macho/aarch64/cargo-staticlib-native/default'
 ```
 
 ### Objective-C selector dispatch
