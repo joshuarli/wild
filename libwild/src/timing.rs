@@ -283,6 +283,7 @@ fn should_emit_json_phase(name: &str) -> bool {
             | "Mach-O stable-layout cache: read and verify baseline image"
             | "Mach-O stable-layout cache: prepare rustc archive debug paths"
             | "Mach-O stable-layout cache: patch and sign"
+            | "Mach-O stable-layout cache: hash patched normalized output"
             | "Mach-O stable-layout cache: recheck input metadata"
             | "Mach-O stable-layout cache: atomically replace output"
             | "Mach-O stable-layout cache: atomically update sidecars"
@@ -443,6 +444,9 @@ mod tests {
         assert!(should_emit_json_phase("Try Mach-O stable-layout cache"));
         assert!(should_emit_json_phase(
             "Mach-O stable-layout cache: verify current output lineage"
+        ));
+        assert!(should_emit_json_phase(
+            "Mach-O stable-layout cache: hash patched normalized output"
         ));
         assert!(!should_emit_json_phase("Record Mach-O live atom"));
         assert!(!should_emit_json_phase("Write object"));

@@ -2655,7 +2655,10 @@ fn refresh_uuid_and_signature(
     let previous_hashes = output[hashes_offset..hashes_end].to_vec();
     output[hashes_offset..hashes_end].fill(0);
     output[uuid_offset..uuid_end].fill(0);
-    let normalized_digest = *blake3::hash(output).as_bytes();
+    let normalized_digest = {
+        timing_phase!("Mach-O stable-layout cache: hash patched normalized output");
+        *blake3::hash(output).as_bytes()
+    };
     output[uuid_offset..uuid_end].copy_from_slice(&uuid_from_normalized_digest(&normalized_digest));
     output[hashes_offset..hashes_end].copy_from_slice(&previous_hashes);
 
