@@ -36,7 +36,7 @@
     "append": "\n// wild benchmark workspace incremental-rebuild marker\n"
   },
   "goals": {
-    "cold_wild_over_apple_max": 1.05,
-    "incremental_wild_over_apple_max": 0.75
+    "cold_wild_over_apple_max": 0.95,
+    "incremental_wild_over_apple_max": 0.70
   }
 }

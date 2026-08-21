@@ -117,10 +117,11 @@ change must fall back to a normal link, and the benchmark treats that fallback a
 measurement rather than a fast sample.
 
 Use `--enforce-goals` only in a gating job: it requires Wild's fresh-Cargo wall time to be at most
-1.05× Apple ld64 and Wild's direct changed-source final link to be at most 0.75× Apple ld64. The
-cold no-cache direct-link ratio is reported as the authoritative cold linker comparison, while the
-Cargo-incremental ratio remains context and does not conflate compiler/LTO work with the linker's
-own target.
+0.95× Apple ld64 and, for cache-eligible workloads, its direct changed-source final link to be at
+most 0.70× Apple ld64. These are the per-workload hard limits. The matrix signoff separately
+requires the 0.85× cold-direct, 0.60× incremental-direct, and 0.75× peak-RSS medians documented in
+[`goal.md`](goal.md); the runner reports each of those direct and resource ratios without
+conflating compiler/LTO work with the linker's own target.
 
 ### Preparing the "run-with" files
 
