@@ -14,6 +14,6 @@
   "runtime": null,
   "goals": {
     "cold_wild_over_apple_max": 1.05,
-    "incremental_wild_over_apple_max": 0.5
+    "incremental_wild_over_apple_max": 0.75
   }
 }

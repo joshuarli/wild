@@ -83,13 +83,42 @@ class PiAgentBenchmarkTests(unittest.TestCase):
                 "linker": "apple-ld64",
                 "cold": {"elapsed_ns": 100},
                 "incremental": {"elapsed_ns": 50},
-                "incremental_link": {"samples": [{"elapsed_ns": 20}]},
+                "incremental_link": {
+                    "samples": [
+                        {
+                            "elapsed_ns": 20,
+                            "peak_rss_bytes": 100,
+                            "user_cpu_ns": 15,
+                            "system_cpu_ns": 5,
+                            "disk_usage": {
+                                "output": {"apparent_bytes": 80, "allocated_bytes": 96},
+                                "incremental_cache": None,
+                            },
+                        }
+                    ]
+                },
             },
             {
                 "linker": "wild",
                 "cold": {"elapsed_ns": 105},
                 "incremental": {"elapsed_ns": 25},
-                "incremental_link": {"samples": [{"elapsed_ns": 10}]},
+                "incremental_link": {
+                    "samples": [
+                        {
+                            "elapsed_ns": 10,
+                            "peak_rss_bytes": 50,
+                            "user_cpu_ns": 7,
+                            "system_cpu_ns": 3,
+                            "disk_usage": {
+                                "output": {"apparent_bytes": 100, "allocated_bytes": 128},
+                                "incremental_cache": {
+                                    "apparent_bytes": 150,
+                                    "allocated_bytes": 160,
+                                },
+                            },
+                        }
+                    ]
+                },
             },
         ]
         workload = BENCHMARK.Workload(
@@ -110,6 +139,32 @@ class PiAgentBenchmarkTests(unittest.TestCase):
         self.assertEqual(result["cold_wild_over_apple"], 1.05)
         self.assertEqual(result["incremental_cargo_wild_over_apple"], 0.5)
         self.assertEqual(result["incremental_link_wild_over_apple"], 0.5)
+        self.assertEqual(result["incremental_link_peak_rss_bytes"], {"apple-ld64": 100, "wild": 50})
+        self.assertEqual(result["incremental_link_peak_rss_wild_over_apple"], 0.5)
+        self.assertEqual(
+            result["incremental_link_cpu_ns"],
+            {
+                "user_cpu_ns": {"apple-ld64": 15, "wild": 7},
+                "system_cpu_ns": {"apple-ld64": 5, "wild": 3},
+            },
+        )
+        self.assertEqual(
+            result["incremental_link_disk_usage_bytes"],
+            {
+                "output": {
+                    "apparent_bytes": {"apple-ld64": 80, "wild": 100},
+                    "allocated_bytes": {"apple-ld64": 96, "wild": 128},
+                },
+                "incremental_cache": {
+                    "apparent_bytes": {"apple-ld64": None, "wild": 150},
+                    "allocated_bytes": {"apple-ld64": None, "wild": 160},
+                },
+            },
+        )
+        self.assertEqual(
+            result["incremental_link_wild_cache_bytes_per_output_byte"],
+            {"apparent_bytes": 1.5, "allocated_bytes": 1.25},
+        )
 
     def test_comparison_aggregates_cache_hit_rate_and_miss_reasons(self) -> None:
         runs = [
@@ -205,6 +260,42 @@ class PiAgentBenchmarkTests(unittest.TestCase):
                 BENCHMARK.stable_layout_cache_miss_evidence(log),
                 ["wild: Mach-O stable-layout cache miss: image state is absent"],
             )
+
+    def test_macos_time_peak_rss_parser_requires_the_resource_record(self) -> None:
+        report = (
+            "        42  voluntary context switches\n"
+            "  73400320  maximum resident set size\n"
+        )
+        self.assertEqual(BENCHMARK.macos_time_peak_rss_bytes(report), 73_400_320)
+        self.assertIsNone(BENCHMARK.macos_time_peak_rss_bytes("no resource report\n"))
+
+    def test_macos_time_cpu_parser_reads_child_user_and_system_time(self) -> None:
+        report = "        2.34 real         1.25 user         0.50 sys\n"
+        self.assertEqual(
+            BENCHMARK.macos_time_cpu_ns(report),
+            {"user_cpu_ns": 1_250_000_000, "system_cpu_ns": 500_000_000},
+        )
+        self.assertIsNone(BENCHMARK.macos_time_cpu_ns("no resource report\n"))
+
+    def test_resource_replay_disables_wild_forking_only(self) -> None:
+        command = ["/tmp/linker", "-o", "/tmp/e", "/tmp/e.o"]
+        self.assertEqual(
+            BENCHMARK.resource_replay_command(command, BENCHMARK.Linker("apple-ld64", None)),
+            command,
+        )
+        self.assertEqual(
+            BENCHMARK.resource_replay_command(command, BENCHMARK.Linker("wild", Path("/tmp/wild"))),
+            [*command, "--no-fork"],
+        )
+
+    def test_path_disk_usage_reports_apparent_and_allocated_bytes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = Path(temporary) / "cache"
+            cache.mkdir()
+            (cache / "manifest").write_bytes(b"cache bytes")
+            usage = BENCHMARK.path_disk_usage_bytes(cache)
+            self.assertEqual(usage["apparent_bytes"], len(b"cache bytes"))
+            self.assertGreaterEqual(usage["allocated_bytes"], usage["apparent_bytes"])
 
     def test_cache_baseline_replays_the_raw_linker_output_after_cargo_postprocessing(self) -> None:
         """The direct cache image must match Wild's raw output, not Cargo's stripped artifact."""

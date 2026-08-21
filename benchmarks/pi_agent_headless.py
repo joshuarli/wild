@@ -18,6 +18,7 @@ sample share it. This is a cold-Cargo-target benchmark, not an attempt to flush 
 from __future__ import annotations
 
 import argparse
+from decimal import Decimal
 import glob
 import hashlib
 import json
@@ -38,13 +39,17 @@ from typing import Any
 from typing import Callable
 
 
-SCHEMA_VERSION = "cargo-link-build-benchmark/v1"
+SCHEMA_VERSION = "cargo-link-build-benchmark/v2"
 MACHO_64_MAGIC = 0xFEEDFACF
 CPU_TYPE_ARM64 = 0x0100000C
 MH_EXECUTE = 2
 MH_DYLIB = 6
 STABLE_LAYOUT_CACHE_HIT_PREFIX = "wild: Mach-O stable-layout cache hit:"
 STABLE_LAYOUT_CACHE_MISS_PREFIX = "wild: Mach-O stable-layout cache miss:"
+MACOS_TIME_MAX_RSS = re.compile(r"^\s*(\d+)\s+maximum resident set size\s*$")
+MACOS_TIME_CPU = re.compile(
+    r"^\s*\d+(?:\.\d+)?\s+real\s+(\d+(?:\.\d+)?)\s+user\s+(\d+(?:\.\d+)?)\s+sys\s*$"
+)
 
 
 @dataclass(frozen=True)
@@ -590,6 +595,7 @@ def replay_incremental_link(
     fixed_output: Path | None = None,
     prepare_replay: Callable[[], None] | None = None,
     require_stable_layout_cache_hit: bool = False,
+    measure_resources: bool = False,
 ) -> list[dict[str, Any]]:
     """Reruns the final changed-source linker argv without invoking Cargo or rustc."""
     output_index = command.index("-o") + 1
@@ -600,15 +606,22 @@ def replay_incremental_link(
             prepare_replay()
         output = fixed_output if fixed_output is not None else output_dir / f"{linker.name}-{repetition}"
         replay = list(command)
+        if measure_resources:
+            replay = resource_replay_command(replay, linker)
         if fixed_output is None:
             replay[output_index] = str(output)
         elif Path(replay[output_index]) != fixed_output:
             raise RuntimeError("Cache replay command did not retain its cached output path")
         log_path = output_dir / f"{linker.name}-{repetition}.log"
+        metered_replay = (
+            ["/usr/bin/time", "-l", *replay]
+            if measure_resources and sys.platform == "darwin"
+            else replay
+        )
         start = time.perf_counter_ns()
         with log_path.open("w", encoding="utf-8") as log:
             completed = subprocess.run(
-                replay,
+                metered_replay,
                 env=environment,
                 stdout=log,
                 stderr=subprocess.STDOUT,
@@ -617,6 +630,17 @@ def replay_incremental_link(
         elapsed = time.perf_counter_ns() - start
         if completed.returncode:
             raise RuntimeError(f"{linker.name} incremental replay failed; see {log_path}")
+        resource_report = (
+            log_path.read_text(errors="replace")
+            if measure_resources and sys.platform == "darwin"
+            else None
+        )
+        peak_rss_bytes = (
+            macos_time_peak_rss_bytes(resource_report) if resource_report is not None else None
+        )
+        cpu_ns = macos_time_cpu_ns(resource_report) if resource_report is not None else None
+        if resource_report is not None and (peak_rss_bytes is None or cpu_ns is None):
+            raise RuntimeError(f"macOS child resource record is absent from {log_path}")
         artifact = validate_artifact(
             output,
             expected_file_type,
@@ -635,12 +659,22 @@ def replay_incremental_link(
             raise RuntimeError(
                 f"Wild stable-layout cache missed during incremental replay; see {log_path}"
             )
+        cache_path = incremental_cache_path(replay)
         samples.append(
             {
                 "elapsed_ns": elapsed,
+                "peak_rss_bytes": peak_rss_bytes,
+                "user_cpu_ns": None if cpu_ns is None else cpu_ns["user_cpu_ns"],
+                "system_cpu_ns": None if cpu_ns is None else cpu_ns["system_cpu_ns"],
                 "log": str(log_path),
                 "command": replay,
                 "artifact": artifact,
+                "disk_usage": {
+                    "output": path_disk_usage_bytes(output),
+                    "incremental_cache": (
+                        path_disk_usage_bytes(cache_path) if cache_path is not None else None
+                    ),
+                },
                 "stable_layout_cache_hits": cache_hits,
                 "stable_layout_cache_misses": cache_misses,
                 "wild_timing_phases": timing_phases,
@@ -701,6 +735,58 @@ def stable_layout_cache_miss_evidence(log_path: Path) -> list[str]:
         for line in log_path.read_text(errors="replace").splitlines()
         if line.strip().startswith(STABLE_LAYOUT_CACHE_MISS_PREFIX)
     ]
+
+
+def macos_time_peak_rss_bytes(report: str) -> int | None:
+    """Extracts the child peak RSS emitted by macOS `/usr/bin/time -l` in bytes."""
+    for line in report.splitlines():
+        match = MACOS_TIME_MAX_RSS.fullmatch(line)
+        if match is not None:
+            return int(match.group(1))
+    return None
+
+
+def macos_time_cpu_ns(report: str) -> dict[str, int] | None:
+    """Extracts child user and system CPU from macOS `/usr/bin/time -l` in nanoseconds."""
+    for line in report.splitlines():
+        match = MACOS_TIME_CPU.fullmatch(line)
+        if match is not None:
+            return {
+                "user_cpu_ns": int(Decimal(match.group(1)) * 1_000_000_000),
+                "system_cpu_ns": int(Decimal(match.group(2)) * 1_000_000_000),
+            }
+    return None
+
+
+def path_disk_usage_bytes(path: Path) -> dict[str, int]:
+    """Reports apparent and allocated bytes without following cache-directory symlinks."""
+    if not path.exists():
+        return {"apparent_bytes": 0, "allocated_bytes": 0}
+    paths = [path]
+    if path.is_dir():
+        paths.extend(entry for entry in path.rglob("*") if not entry.is_symlink())
+    apparent_bytes = 0
+    allocated_bytes = 0
+    for entry in paths:
+        metadata = entry.lstat()
+        if entry.is_file():
+            apparent_bytes += metadata.st_size
+        allocated_bytes += getattr(metadata, "st_blocks", 0) * 512
+    return {"apparent_bytes": apparent_bytes, "allocated_bytes": allocated_bytes}
+
+
+def incremental_cache_path(command: list[str]) -> Path | None:
+    """Returns the cache root from Wild's direct linker argv, if this replay uses one."""
+    try:
+        index = command.index("-incremental_cache")
+    except ValueError:
+        return None
+    return Path(command[index + 1]) if index + 1 < len(command) else None
+
+
+def resource_replay_command(command: list[str], linker: Linker) -> list[str]:
+    """Uses Wild's foreground linker process for comparable child-RSS measurements."""
+    return [*command, "--no-fork"] if linker.name == "wild" else list(command)
 
 
 def wild_timing_phases(log_path: Path, output: Path) -> list[dict[str, Any]]:
@@ -788,6 +874,27 @@ def restore_source(path: Path, before: bytes, before_hash: str) -> str:
 
 def median_ns(samples: list[int]) -> int:
     return int(statistics.median(samples))
+
+
+def median_optional_bytes(samples: list[int | None]) -> int | None:
+    """Returns a median only when every directly comparable replay has a resource sample."""
+    return None if any(sample is None for sample in samples) else median_ns([int(sample) for sample in samples])
+
+
+def median_disk_usage_bytes(
+    samples: list[dict[str, Any]], location: str
+) -> dict[str, int | None]:
+    """Medians for one direct-replay disk location, preserving an absent cache as `None`."""
+    medians: dict[str, int | None] = {}
+    for kind in ("apparent_bytes", "allocated_bytes"):
+        values: list[int | None] = []
+        for sample in samples:
+            disk_usage = sample.get("disk_usage")
+            location_usage = disk_usage.get(location) if isinstance(disk_usage, dict) else None
+            value = location_usage.get(kind) if isinstance(location_usage, dict) else None
+            values.append(value if isinstance(value, int) else None)
+        medians[kind] = median_optional_bytes(values)
+    return medians
 
 
 def resolve_artifact(
@@ -895,6 +1002,7 @@ def run_sample(
     linker: Linker,
     sample_index: int,
     link_repetitions: int,
+    resource_link_repetitions: int,
     keep_workspaces: bool,
     wild_incremental_cache_root: Path | None,
 ) -> dict[str, Any]:
@@ -1007,12 +1115,13 @@ def run_sample(
                 target_dir=capture_target,
                 log_path=capture_log,
             )
+            capture_command = final_link_command(
+                capture_log,
+                linker,
+                output=primary_artifact_path(capture_target, workload, capture_log, linker),
+            )
             incremental_link = replay_incremental_link(
-                command=final_link_command(
-                    capture_log,
-                    linker,
-                    output=primary_artifact_path(capture_target, workload, capture_log, linker),
-                ),
+                command=capture_command,
                 environment=capture_environment,
                 output_dir=logs_dir / f"{linker.name}-{sample_index}-incremental-link",
                 linker=linker,
@@ -1020,6 +1129,17 @@ def run_sample(
                 expected_file_type=workload.macho_file_type,
                 runtime=workload.runtime,
                 runtime_cwd=workspace,
+            )
+            incremental_link_resources = replay_incremental_link(
+                command=capture_command,
+                environment=capture_environment,
+                output_dir=logs_dir / f"{linker.name}-{sample_index}-incremental-link-resources",
+                linker=linker,
+                repetitions=resource_link_repetitions,
+                expected_file_type=workload.macho_file_type,
+                runtime=workload.runtime,
+                runtime_cwd=workspace,
+                measure_resources=True,
             )
             incremental_link_capture: dict[str, Any] = {
                 "capture_log": str(capture_log),
@@ -1029,6 +1149,7 @@ def run_sample(
                     "uses_rustc_save_temps": True,
                 },
                 "samples": incremental_link,
+                "resource_samples": incremental_link_resources,
             }
         else:
             # Cargo gives the changed object/output fresh hashes. Build a separate baseline with
@@ -1115,6 +1236,26 @@ def run_sample(
                 ),
                 require_stable_layout_cache_hit=True,
             )
+            incremental_link_resources = replay_incremental_link(
+                command=changed_command,
+                environment=capture_environment,
+                output_dir=logs_dir / f"{linker.name}-{sample_index}-incremental-link-resources",
+                linker=linker,
+                repetitions=resource_link_repetitions,
+                expected_file_type=workload.macho_file_type,
+                runtime=workload.runtime,
+                runtime_cwd=workspace,
+                fixed_output=changed_output,
+                prepare_replay=lambda: restore_cached_direct_baseline(
+                    baseline_output=baseline_output,
+                    baseline_output_snapshot=baseline_output_snapshot,
+                    cache_dir=direct_cache_dir,
+                    cache_snapshot=cache_snapshot,
+                    stale_published_output=changed_output,
+                ),
+                require_stable_layout_cache_hit=True,
+                measure_resources=True,
+            )
             incremental_link_capture = {
                 "baseline_log": str(baseline_log),
                 "capture_log": str(capture_log),
@@ -1136,6 +1277,7 @@ def run_sample(
                     "direct_samples_require_hits": True,
                 },
                 "samples": incremental_link,
+                "resource_samples": incremental_link_resources,
             }
         restored_hash = restore_source(mutation_path, before, before_hash)
         return {
@@ -1210,6 +1352,69 @@ def comparison(runs: list[dict[str, Any]], workload: Workload) -> dict[str, Any]
     incremental_link_ratio = (
         medians["wild"]["incremental_link"] / medians["apple-ld64"]["incremental_link"]
     )
+    incremental_link_peak_rss = {
+        linker: median_optional_bytes(
+            [
+                sample.get("peak_rss_bytes")
+                for run in samples
+                for sample in run["incremental_link"].get(
+                    "resource_samples", run["incremental_link"]["samples"]
+                )
+            ]
+        )
+        for linker, samples in by_linker.items()
+    }
+    apple_peak_rss = incremental_link_peak_rss["apple-ld64"]
+    wild_peak_rss = incremental_link_peak_rss["wild"]
+    incremental_link_peak_rss_ratio = (
+        wild_peak_rss / apple_peak_rss
+        if apple_peak_rss is not None and wild_peak_rss is not None and apple_peak_rss != 0
+        else None
+    )
+    incremental_link_cpu_ns = {
+        kind: {
+            linker: median_optional_bytes(
+                [
+                    sample.get(kind)
+                    for run in samples
+                    for sample in run["incremental_link"].get(
+                        "resource_samples", run["incremental_link"]["samples"]
+                    )
+                ]
+            )
+            for linker, samples in by_linker.items()
+        }
+        for kind in ("user_cpu_ns", "system_cpu_ns")
+    }
+    incremental_link_disk_usage_bytes = {
+        location: {
+            kind: {
+                linker: median_disk_usage_bytes(
+                    [
+                        sample
+                        for run in samples
+                        for sample in run["incremental_link"].get(
+                            "resource_samples", run["incremental_link"]["samples"]
+                        )
+                    ],
+                    location,
+                )[kind]
+                for linker, samples in by_linker.items()
+            }
+            for kind in ("apparent_bytes", "allocated_bytes")
+        }
+        for location in ("output", "incremental_cache")
+    }
+    wild_cache_bytes_per_output_byte = {
+        kind: (
+            incremental_link_disk_usage_bytes["incremental_cache"][kind]["wild"]
+            / incremental_link_disk_usage_bytes["output"][kind]["wild"]
+            if incremental_link_disk_usage_bytes["incremental_cache"][kind]["wild"] is not None
+            and incremental_link_disk_usage_bytes["output"][kind]["wild"] not in (None, 0)
+            else None
+        )
+        for kind in ("apparent_bytes", "allocated_bytes")
+    }
     cache_hits: list[str] = []
     cache_misses: list[str] = []
     for run in runs:
@@ -1239,6 +1444,11 @@ def comparison(runs: list[dict[str, Any]], workload: Workload) -> dict[str, Any]
         "cold_wild_over_apple": cold_ratio,
         "incremental_cargo_wild_over_apple": cargo_incremental_ratio,
         "incremental_link_wild_over_apple": incremental_link_ratio,
+        "incremental_link_peak_rss_bytes": incremental_link_peak_rss,
+        "incremental_link_peak_rss_wild_over_apple": incremental_link_peak_rss_ratio,
+        "incremental_link_cpu_ns": incremental_link_cpu_ns,
+        "incremental_link_disk_usage_bytes": incremental_link_disk_usage_bytes,
+        "incremental_link_wild_cache_bytes_per_output_byte": wild_cache_bytes_per_output_byte,
         "thresholds": {"cold_max": workload.cold_max, "incremental_max": workload.incremental_max},
         "cache": {
             "hit_count": len(cache_hits),
@@ -1275,6 +1485,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=5,
         help="Direct final-link replays after each changed-source Cargo build",
     )
+    parser.add_argument(
+        "--resource-link-repetitions",
+        type=int,
+        default=1,
+        help="Separate direct-link resource replays after each changed-source Cargo build",
+    )
     parser.add_argument("--allow-network", action="store_true", help="Do not pass Cargo --offline")
     parser.add_argument("--keep-workspaces", action="store_true")
     parser.add_argument(
@@ -1296,8 +1512,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
-    if args.repetitions < 1 or args.link_repetitions < 1:
-        raise ValueError("--repetitions and --link-repetitions must be positive")
+    if args.repetitions < 1 or args.link_repetitions < 1 or args.resource_link_repetitions < 1:
+        raise ValueError("--repetitions, --link-repetitions, and --resource-link-repetitions must be positive")
     workspace = args.workspace.resolve()
     workload = load_workload(args.config.resolve())
     wild = args.wild.resolve()
@@ -1360,6 +1576,7 @@ def main(argv: list[str]) -> int:
                         linker=linker,
                         sample_index=sample_index,
                         link_repetitions=args.link_repetitions,
+                        resource_link_repetitions=args.resource_link_repetitions,
                         keep_workspaces=args.keep_workspaces,
                         wild_incremental_cache_root=(
                             wild_incremental_cache_root if linker.path is not None else None
@@ -1402,6 +1619,7 @@ def main(argv: list[str]) -> int:
                 "deployment_target": workload.deployment_target,
                 "cargo_incremental": "1",
                 "link_repetitions": args.link_repetitions,
+                "resource_link_repetitions": args.resource_link_repetitions,
                 "offline": not args.allow_network,
                 "wild_timing_json": args.wild_timing_json,
                 "wild_incremental_cache_root": (
@@ -1410,6 +1628,17 @@ def main(argv: list[str]) -> int:
                     else None
                 ),
                 "wild_incremental_cache_diagnostics": wild_incremental_cache_root is not None,
+                "direct_link_peak_rss": (
+                    "macOS /usr/bin/time -l child maximum resident set size (bytes)"
+                    if sys.platform == "darwin"
+                    else None
+                ),
+                "direct_link_cpu": (
+                    "macOS /usr/bin/time -l child user/system CPU (nanoseconds)"
+                    if sys.platform == "darwin"
+                    else None
+                ),
+                "disk_usage": "lstat apparent bytes and allocated 512-byte blocks after each direct replay",
                 "result_artifacts": str(result_root),
             },
             "runs": runs,

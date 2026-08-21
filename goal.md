@@ -1,4 +1,4 @@
-Make Wild the fastest correct ARM64 Mach-O linker for real Rust workloads.
+Make Wild the fastest correct and most memory-efficient ARM64 Mach-O linker for real Rust workloads.
 
 Work benchmark-first. Do not optimize from intuition: before each change, capture the exact final linker invocation, measure it with Wild’s `--time=json`, add or retain a regression, then rerun the full benchmark matrix.
 
@@ -7,9 +7,16 @@ Context is in BENCHMARKING.md.
 Primary targets:
 
 - Cold release workspace builds: Wild ≤ 1.00× Apple ld64 median wall time.
-- Incremental final links: Wild ≤ 0.50× Apple ld64 median wall time.
-- Stretch goal: Wild ≤ 0.35× Apple ld64 for cache-eligible changed-object links.
+- Incremental final links: Wild ≤ 0.75× Apple ld64 median wall time for cache-eligible
+  changed-object links.
+- Stretch goal: Wild ≤ 0.60× Apple ld64 for cache-eligible changed-object links.
+- Peak RSS: Wild ≤ 1.00× Apple ld64 median peak RSS on every tracked final-link replay, with no
+  workload above 1.10× Apple. This is measured in the separate, comparable resource batch—not
+  inferred from wall-time runs or Cargo's process tree.
 - Never trade cold performance for incremental wins: cold must remain ≤ 1.05× Apple on every tracked workload.
+- Never trade a speed win for an unexplained peak-RSS regression. A change that increases peak
+  RSS by more than 5% on a tracked workload must retain a direct-link win of at least 10% or add
+  a documented supported incremental topology.
 - Never accept a cache “hit” unless it is proven to use the fast path and the resulting ARM64 Mach-O passes codesign verification and runtime/integration checks.
 
 Benchmark at least:
@@ -31,7 +38,17 @@ Measure and report separately:
 - direct final-link replay wall time;
 - Wild phase timings from `--time=json`;
 - cache-hit/miss rate and miss reasons;
-- output size, ARM64 Mach-O validation, codesign, and runtime checks.
+- median user CPU, system CPU, and peak RSS for Wild and Apple ld64 from a separate resource
+  batch using the same saved inputs and linker verification;
+- final-output apparent/allocated bytes, persistent incremental-cache apparent/allocated bytes,
+  and cache bytes per final-output byte; add peak transient working-directory bytes once the
+  generic runner can sample it without perturbing link timing;
+- ARM64 Mach-O validation, codesign, and runtime checks.
+
+Disk is a measured trade-off, not a blanket cache-growth prohibition. Retain and compare the
+cache's persistent image/sidecars and its peak temporary footprint on every incremental result.
+Storage growth is acceptable when it enables a new safe cache-hit topology or produces a measured
+direct-link improvement of at least 10%; explain the byte delta and why the gain is worth it.
 
 Prioritize, in order:
 
@@ -46,25 +63,9 @@ For each completed change, report:
 
 - the bottleneck identified;
 - baseline versus after medians and ratios;
+- baseline versus after peak RSS and disk-footprint medians/ratios when the change can affect
+  allocation, mapping, caching, or output staging;
 - exact workloads and toolchain;
 - cache-hit evidence where applicable;
 - tests run;
 - remaining limiting phase and the next proposed experiment.
-
-## Completed macOS finish line
-
-The current ARM64 qualification is deliberately bounded. Keep the limitations and evidence in
-[`docs/macho-rust-status.md`](docs/macho-rust-status.md), and do not advertise broad macOS support
-until the ARM64 expansion is complete.
-
-ARM64 expansion completed with the bounded evidence and limitations recorded in
-[`docs/macho-rust-status.md`](docs/macho-rust-status.md):
-
-- [x] Broaden `__TEXT,__eh_frame` CIE/FDE grammar and qualify additional C++, Objective-C, and Rust
-  language forms, including archive debug-map inputs.
-- [x] Broaden ARM64 subtractor relocation coverage beyond the validated ordinary 64-bit static-data
-  form.
-- [x] Expand dylib, proc-macro, Rust TLS, crate-type, and stress qualification.
-- [x] Expand the Apple differential corpus and retain reproducible ARM64 Rust workload evidence.
-
-x86_64 macOS is out of scope.

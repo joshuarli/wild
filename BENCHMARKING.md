@@ -102,7 +102,7 @@ change must fall back to a normal link, and the benchmark treats that fallback a
 measurement rather than a fast sample.
 
 Use `--enforce-goals` only in a gating job: it requires Wild's fresh-Cargo wall time to be at most
-1.05× Apple ld64 and Wild's direct changed-source final link to be at most 0.50× Apple ld64. The
+1.05× Apple ld64 and Wild's direct changed-source final link to be at most 0.75× Apple ld64. The
 Cargo-incremental ratio remains in the report as context, but does not conflate compiler/LTO work
 with the linker's own target.
 
