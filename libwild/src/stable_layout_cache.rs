@@ -43,7 +43,7 @@ use std::time::SystemTime;
 const MAGIC: &[u8; 16] = b"WILD-MACHO-INC\0\0";
 const STATE_MAGIC: &[u8; 16] = b"WILD-MACHO-STATE";
 const VERSION: u32 = 8;
-const STATE_VERSION: u32 = 2;
+const STATE_VERSION: u32 = 3;
 const HASH_SIZE: usize = 32;
 const MAX_RECORDS: usize = 100_000;
 const DIAGNOSTICS_ENV: &str = "WILD_MACHO_INCREMENTAL_CACHE_DIAGNOSTICS";
@@ -52,7 +52,7 @@ const STRUCTURE_DIGEST_DOMAIN: &[u8] = b"wild-macho-stable-layout-structure-v5\0
 /// The sidecar is not an authenticated input, but random or torn sidecar corruption must become
 /// a conservative cache miss before any persisted patch mapping is used.
 const MANIFEST_CHECKSUM_DOMAIN: &[u8] = b"wild-macho-stable-layout-manifest-v8\0";
-const STATE_CHECKSUM_DOMAIN: &[u8] = b"wild-macho-stable-layout-state-v2\0";
+const STATE_CHECKSUM_DOMAIN: &[u8] = b"wild-macho-stable-layout-state-v3\0";
 
 #[derive(Clone, Debug)]
 struct InputDigest {
@@ -232,6 +232,9 @@ struct Manifest {
 /// without allocating patch records; it owns only the small path-approval index list.
 struct ManifestView<'a> {
     arguments_digest: [u8; HASH_SIZE],
+    /// The verified checksum also binds [`ImageState`] to this exact immutable topology, so a
+    /// cache hit does not need a second full manifest hash after decoding it.
+    checksum: [u8; HASH_SIZE],
     signature: SignatureInfo,
     input_count: usize,
     cache_approved_rustc_temporary_archives: Vec<u32>,
@@ -280,7 +283,7 @@ struct ImageState {
     arguments_digest: [u8; HASH_SIZE],
     /// Binds this mutable state to exactly one immutable patch topology. Publishing a new image
     /// and state before its structural manifest can therefore only cause a safe cache miss.
-    manifest_digest: [u8; HASH_SIZE],
+    manifest_checksum: [u8; HASH_SIZE],
     output_digest: [u8; HASH_SIZE],
     output_len: u64,
     inputs: Vec<InputDigest>,
@@ -429,7 +432,11 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
         };
         manifest
     };
-    if manifest.arguments_digest != arguments_digest(args) {
+    let arguments_match = {
+        timing_phase!("Mach-O stable-layout cache: verify arguments");
+        manifest.arguments_digest == arguments_digest(args)
+    };
+    if !arguments_match {
         return cache_miss("normalized argument digest differs");
     }
     let state_bytes = {
@@ -446,10 +453,13 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
         };
         state
     };
-    if state.arguments_digest != manifest.arguments_digest
-        || state.manifest_digest != *blake3::hash(&manifest_bytes).as_bytes()
-        || state.inputs.len() != manifest.input_count
-    {
+    let state_matches_manifest = {
+        timing_phase!("Mach-O stable-layout cache: verify image state");
+        state.arguments_digest == manifest.arguments_digest
+            && state.manifest_checksum == manifest.checksum
+            && state.inputs.len() == manifest.input_count
+    };
+    if !state_matches_manifest {
         return cache_miss("image state does not match the structural manifest");
     }
     // Cargo normally leaves the previous hash-bearing output in place until the linker replaces
@@ -458,11 +468,11 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
     // another output layout (for example, a stale save-temps replay); never patch over such an
     // output. Cargo may retire the path before invoking the linker, so absence remains a valid
     // cache candidate and the cache-owned image is verified below.
-    if let Some(matches) = existing_output_matches_baseline(
-        args.output(),
-        state.output_len,
-        &state.output_digest,
-    ) {
+    let existing_output_matches = {
+        timing_phase!("Mach-O stable-layout cache: verify current output lineage");
+        existing_output_matches_baseline(args.output(), state.output_len, &state.output_digest)
+    };
+    if let Some(matches) = existing_output_matches {
         if !matches {
             return cache_miss("current output does not match the cached baseline lineage");
         }
@@ -482,24 +492,27 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
     if current_inputs.len() != state.inputs.len() {
         return cache_miss("link-visible input count differs");
     }
-    let changed = current_inputs
-        .iter()
-        .zip(&state.inputs)
-        .enumerate()
-        .filter_map(|(index, (current, cached))| {
-            input_identity_changed(
-                current,
-                cached,
-                u32::try_from(index).is_ok_and(|input_index| {
-                    manifest
-                        .cache_approved_rustc_temporary_archives
-                        .binary_search(&input_index)
-                        .is_ok()
-                }),
-            )
-            .then_some(index)
-        })
-        .collect::<Vec<_>>();
+    let changed = {
+        timing_phase!("Mach-O stable-layout cache: select changed input");
+        current_inputs
+            .iter()
+            .zip(&state.inputs)
+            .enumerate()
+            .filter_map(|(index, (current, cached))| {
+                input_identity_changed(
+                    current,
+                    cached,
+                    u32::try_from(index).is_ok_and(|input_index| {
+                        manifest
+                            .cache_approved_rustc_temporary_archives
+                            .binary_search(&input_index)
+                            .is_ok()
+                    }),
+                )
+                .then_some(index)
+            })
+            .collect::<Vec<_>>()
+    };
     let [changed_index] = changed.as_slice() else {
         // Deliberately do not reuse an output for an exact-input invocation. This cache exists to
         // patch one changed object, not to turn normal links into output-copy/cache hits.
@@ -519,7 +532,11 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
     let Ok(changed_input_index) = u32::try_from(*changed_index) else {
         return cache_miss("changed input index is not representable");
     };
-    let Some(object) = manifest.object_for_input(changed_input_index).ok().flatten() else {
+    let object = {
+        timing_phase!("Mach-O stable-layout cache: find cached object record");
+        manifest.object_for_input(changed_input_index).ok().flatten()
+    };
+    let Some(object) = object else {
         return cache_miss("changed object has no cached positional record");
     };
 
@@ -628,8 +645,13 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
         }
     }
 
-    let output_len = output.bytes().len() as u64;
-    let output_digest = *blake3::hash(output.bytes()).as_bytes();
+    let (output_len, output_digest) = {
+        timing_phase!("Mach-O stable-layout cache: fingerprint patched output");
+        (
+            output.bytes().len() as u64,
+            *blake3::hash(output.bytes()).as_bytes(),
+        )
+    };
     let output = output.finish();
 
     // Mach-O code-signature verification is cached by vnode on macOS. Never mutate the previous
@@ -754,9 +776,13 @@ pub(crate) fn stage_after_link(layout: &Layout<'_, MachO>, output: &[u8]) {
         cache_approved_rustc_temporary_archives,
         objects,
     };
+    let manifest_bytes = manifest.encode();
+    let manifest_checksum: [u8; HASH_SIZE] = manifest_bytes[manifest_bytes.len() - HASH_SIZE..]
+        .try_into()
+        .expect("manifest encoding ends with a fixed-width checksum");
     let state = ImageState {
         arguments_digest: manifest.arguments_digest,
-        manifest_digest: *blake3::hash(&manifest.encode()).as_bytes(),
+        manifest_checksum,
         output_digest: manifest.output_digest,
         output_len: manifest.output_len,
         inputs: manifest.inputs.clone(),
@@ -800,9 +826,12 @@ pub(crate) fn publish_staged(args: &MachOArgs) {
         let _ = fs::remove_file(staged_state);
         return;
     };
+    let manifest_checksum: [u8; HASH_SIZE] = bytes[bytes.len() - HASH_SIZE..]
+        .try_into()
+        .expect("decoded manifest ends with a fixed-width checksum");
     if manifest.arguments_digest != arguments_digest(args)
         || state.arguments_digest != manifest.arguments_digest
-        || state.manifest_digest != *blake3::hash(&bytes).as_bytes()
+        || state.manifest_checksum != manifest_checksum
         || state.inputs != manifest.inputs
         || state.output_digest != manifest.output_digest
         || state.output_len != manifest.output_len
@@ -2717,8 +2746,11 @@ impl Manifest {
         let Some(checksum_offset) = bytes.len().checked_sub(HASH_SIZE) else {
             anyhow::bail!("truncated cache checksum");
         };
-        let (body, checksum) = bytes.split_at(checksum_offset);
-        anyhow::ensure!(manifest_checksum(body).as_slice() == checksum, "cache checksum differs");
+        let (body, checksum_bytes) = bytes.split_at(checksum_offset);
+        let checksum: [u8; HASH_SIZE] = checksum_bytes
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("invalid cache checksum length"))?;
+        anyhow::ensure!(manifest_checksum(body) == checksum, "cache checksum differs");
         let mut reader = Reader {
             bytes: body,
             offset: 0,
@@ -2823,8 +2855,11 @@ impl<'a> ManifestView<'a> {
         let Some(checksum_offset) = bytes.len().checked_sub(HASH_SIZE) else {
             anyhow::bail!("truncated cache checksum");
         };
-        let (body, checksum) = bytes.split_at(checksum_offset);
-        anyhow::ensure!(manifest_checksum(body).as_slice() == checksum, "cache checksum differs");
+        let (body, checksum_bytes) = bytes.split_at(checksum_offset);
+        let checksum: [u8; HASH_SIZE] = checksum_bytes
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("invalid cache checksum length"))?;
+        anyhow::ensure!(manifest_checksum(body) == checksum, "cache checksum differs");
         let mut reader = Reader { bytes: body, offset: 0 };
         anyhow::ensure!(reader.take(MAGIC.len())? == MAGIC, "wrong cache magic");
         anyhow::ensure!(reader.u32()? == VERSION, "unsupported cache version");
@@ -2852,16 +2887,16 @@ impl<'a> ManifestView<'a> {
             read_cache_approved_rustc_temporary_archives(&mut reader, input_count)?;
         let object_count = reader.count()?;
         let object_records_start = reader.offset;
-        for _ in 0..object_count {
-            ObjectRecordView::skip(&mut reader)?;
-        }
-        anyhow::ensure!(reader.offset == body.len(), "trailing cache data");
+        // The checksum above covers every record. On a hit, only the object selected from
+        // `ImageState::inputs` can affect the patch, so decode and validate that record on
+        // demand rather than walking every unrelated object first.
         Ok(Self {
             arguments_digest,
+            checksum,
             signature,
             input_count,
             cache_approved_rustc_temporary_archives,
-            object_records: &body[object_records_start..reader.offset],
+            object_records: &body[object_records_start..],
             object_count,
         })
     }
@@ -2900,32 +2935,6 @@ fn read_cache_approved_rustc_temporary_archives(
 }
 
 impl<'a> ObjectRecordView<'a> {
-    fn skip(reader: &mut Reader<'a>) -> anyhow::Result<()> {
-        let _ = reader.u32()?;
-        let _ = reader.hash()?;
-        let patch_count = reader.count()?;
-        let patch_bytes = patch_count
-            .checked_mul(3 * size_of::<u64>())
-            .ok_or_else(|| anyhow::anyhow!("cache patch length overflow"))?;
-        let _ = reader.take(patch_bytes)?;
-        let structure_mask_count = reader.count()?;
-        let structure_mask_bytes = structure_mask_count
-            .checked_mul(2 * size_of::<u64>())
-            .ok_or_else(|| anyhow::anyhow!("cache structure-mask length overflow"))?;
-        let _ = reader.take(structure_mask_bytes)?;
-        let symbol_value_count = reader.count()?;
-        let symbol_value_bytes = symbol_value_count
-            .checked_mul(6 * size_of::<u64>())
-            .ok_or_else(|| anyhow::anyhow!("cache symbol-value length overflow"))?;
-        let _ = reader.take(symbol_value_bytes)?;
-        let protected_count = reader.count()?;
-        for _ in 0..protected_count {
-            let _ = reader.u64()?;
-            reader.skip_bytes()?;
-        }
-        Ok(())
-    }
-
     fn decode(reader: &mut Reader<'a>) -> anyhow::Result<Self> {
         let input_index = reader.u32()?;
         let structure_digest = reader.hash()?;
@@ -3130,7 +3139,7 @@ impl ImageState {
         out.extend_from_slice(STATE_MAGIC);
         put_u32(&mut out, STATE_VERSION);
         out.extend_from_slice(&self.arguments_digest);
-        out.extend_from_slice(&self.manifest_digest);
+        out.extend_from_slice(&self.manifest_checksum);
         out.extend_from_slice(&self.output_digest);
         put_u64(&mut out, self.output_len);
         put_u32(&mut out, self.inputs.len() as u32);
@@ -3156,7 +3165,7 @@ impl ImageState {
         anyhow::ensure!(reader.take(STATE_MAGIC.len())? == STATE_MAGIC, "wrong image-state magic");
         anyhow::ensure!(reader.u32()? == STATE_VERSION, "unsupported image-state version");
         let arguments_digest = reader.hash()?;
-        let manifest_digest = reader.hash()?;
+        let manifest_checksum = reader.hash()?;
         let output_digest = reader.hash()?;
         let output_len = reader.u64()?;
         let input_count = reader.count()?;
@@ -3172,7 +3181,7 @@ impl ImageState {
         anyhow::ensure!(reader.offset == body.len(), "trailing image-state data");
         Ok(Self {
             arguments_digest,
-            manifest_digest,
+            manifest_checksum,
             output_digest,
             output_len,
             inputs,
@@ -3299,6 +3308,7 @@ fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
 mod tests {
     use super::Manifest;
     use super::ManifestView;
+    use super::HASH_SIZE;
     use super::MAGIC;
     use super::STATE_MAGIC;
     use super::DirectObjectSnapshot;
@@ -3393,6 +3403,10 @@ mod tests {
         assert_eq!(Manifest::decode(&encoded).unwrap(), manifest);
         let view = ManifestView::decode(&encoded).unwrap();
         assert_eq!(view.arguments_digest, manifest.arguments_digest);
+        assert_eq!(
+            view.checksum,
+            <[u8; HASH_SIZE]>::try_from(&encoded[encoded.len() - HASH_SIZE..]).unwrap(),
+        );
         assert_eq!(view.input_count, manifest.inputs.len());
         assert_eq!(
             view.cache_approved_rustc_temporary_archives,
@@ -3440,7 +3454,7 @@ mod tests {
         );
         let state = ImageState {
             arguments_digest: manifest.arguments_digest,
-            manifest_digest: *blake3::hash(&manifest.encode()).as_bytes(),
+            manifest_checksum: view.checksum,
             output_digest: manifest.output_digest,
             output_len: manifest.output_len,
             inputs: manifest.inputs.clone(),

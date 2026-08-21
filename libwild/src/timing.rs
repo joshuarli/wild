@@ -269,11 +269,22 @@ fn should_emit_json_phase(name: &str) -> bool {
             | "Hash Mach-O UUID"
             | "Hash Mach-O code signature"
             | "Try Mach-O stable-layout cache"
+            | "Mach-O stable-layout cache: read manifest"
+            | "Mach-O stable-layout cache: decode manifest"
+            | "Mach-O stable-layout cache: verify arguments"
+            | "Mach-O stable-layout cache: read image state"
+            | "Mach-O stable-layout cache: decode image state"
+            | "Mach-O stable-layout cache: verify image state"
+            | "Mach-O stable-layout cache: verify current output lineage"
             | "Mach-O stable-layout cache: fingerprint inputs"
+            | "Mach-O stable-layout cache: select changed input"
+            | "Mach-O stable-layout cache: find cached object record"
             | "Mach-O stable-layout cache: validate changed object snapshot"
             | "Mach-O stable-layout cache: read and verify baseline image"
+            | "Mach-O stable-layout cache: prepare rustc archive debug paths"
             | "Mach-O stable-layout cache: patch and sign"
             | "Mach-O stable-layout cache: recheck input metadata"
+            | "Mach-O stable-layout cache: fingerprint patched output"
             | "Mach-O stable-layout cache: atomically replace output"
             | "Mach-O stable-layout cache: atomically update sidecars"
     )
@@ -431,6 +442,9 @@ mod tests {
         assert!(should_emit_json_phase("Link"));
         assert!(should_emit_json_phase("Traverse reference graph"));
         assert!(should_emit_json_phase("Try Mach-O stable-layout cache"));
+        assert!(should_emit_json_phase(
+            "Mach-O stable-layout cache: verify current output lineage"
+        ));
         assert!(!should_emit_json_phase("Record Mach-O live atom"));
         assert!(!should_emit_json_phase("Write object"));
     }
