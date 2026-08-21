@@ -4077,11 +4077,11 @@ fn write_code_signature_hashes(
     Ok(())
 }
 
-struct MachOSymbolTableWriter<'strings> {
-    strings: &'strings SymtabStringTable,
+struct MachOSymbolTableWriter<'strings, 'data> {
+    strings: &'strings SymtabStringTable<'data>,
 }
 
-impl MachOSymbolTableWriter<'_> {
+impl MachOSymbolTableWriter<'_, '_> {
     #[inline(always)]
     fn define_symbol(
         &mut self,

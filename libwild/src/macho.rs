@@ -1153,7 +1153,7 @@ pub(crate) struct LayoutExt<'data> {
     /// selector stub that owns its spelling.
     pub(crate) objc_message_stub_indexes: BTreeMap<ObjcMessageSymbol, usize>,
     /// Deduplicated `LC_SYMTAB` names, with offsets stable before the parallel writer starts.
-    pub(crate) symtab_strings: SymtabStringTable,
+    pub(crate) symtab_strings: SymtabStringTable<'data>,
 }
 
 #[derive(Debug, Default)]
@@ -1167,7 +1167,7 @@ pub(crate) struct FinaliseSizesExt<'data> {
     eh_frame_size: u64,
     objc_message_stubs: Vec<ObjcMessageStub<'data>>,
     objc_message_stub_indexes: BTreeMap<ObjcMessageSymbol, usize>,
-    symtab_strings: SymtabStringTable,
+    symtab_strings: SymtabStringTable<'data>,
 }
 
 /// One Mach-O string table shared by every output nlist record.
@@ -1177,13 +1177,16 @@ pub(crate) struct FinaliseSizesExt<'data> {
 /// after every object has decided which symbols and dSYM map records survive, then freeze it before
 /// output groups write in parallel.
 #[derive(Debug)]
-pub(crate) struct SymtabStringTable {
+pub(crate) struct SymtabStringTable<'data> {
     bytes: Vec<u8>,
-    offsets: HashMap<Vec<u8>, u32>,
+    /// Most nlist spellings borrow immutable input bytes. Keep those references rather than
+    /// duplicating every Rust symbol name while compacting the shared output string table. The
+    /// few generated dSYM paths remain owned through `Cow`.
+    offsets: HashMap<Cow<'data, [u8]>, u32>,
     uninterned_size: u64,
 }
 
-impl Default for SymtabStringTable {
+impl<'data> Default for SymtabStringTable<'data> {
     fn default() -> Self {
         Self {
             // `n_strx == 0` means an unnamed nlist record, so reserve the leading NUL.
@@ -1194,8 +1197,8 @@ impl Default for SymtabStringTable {
     }
 }
 
-impl SymtabStringTable {
-    fn add(&mut self, name: &[u8]) -> Result {
+impl<'data> SymtabStringTable<'data> {
+    fn add(&mut self, name: Cow<'data, [u8]>) -> Result {
         let name_size = u64::try_from(name.len())
             .context("Mach-O symbol name length exceeds u64")?
             .checked_add(1)
@@ -1205,15 +1208,15 @@ impl SymtabStringTable {
             .checked_add(name_size)
             .context("Mach-O symbol string-table size overflows")?;
 
-        if self.offsets.contains_key(name) {
+        if self.offsets.contains_key(name.as_ref()) {
             return Ok(());
         }
 
         let offset = u32::try_from(self.bytes.len())
             .context("Mach-O symbol string table exceeds 4 GiB")?;
-        self.bytes.extend_from_slice(name);
+        self.bytes.extend_from_slice(&name);
         self.bytes.push(0);
-        self.offsets.insert(name.to_vec(), offset);
+        self.offsets.insert(name, offset);
         Ok(())
     }
 
@@ -3350,7 +3353,7 @@ impl platform::Platform for MachO {
 
         for object in layout::objects_iter(groups) {
             for name in &object.format_specific.symtab_strings {
-                strings.add(name)?;
+                strings.add(name.clone())?;
             }
         }
 
@@ -5984,9 +5987,9 @@ mod tests {
     #[test]
     fn symtab_string_table_interns_duplicate_nlist_names() {
         let mut strings = SymtabStringTable::default();
-        strings.add(b"_alpha").unwrap();
-        strings.add(b"_beta").unwrap();
-        strings.add(b"_alpha").unwrap();
+        strings.add(Cow::Borrowed(b"_alpha")).unwrap();
+        strings.add(Cow::Borrowed(b"_beta")).unwrap();
+        strings.add(Cow::Borrowed(b"_alpha")).unwrap();
 
         assert_eq!(strings.offset_of(b"_alpha").unwrap(), 1);
         assert_eq!(strings.offset_of(b"_beta").unwrap(), 8);
@@ -5996,6 +5999,17 @@ mod tests {
         let mut output = vec![0; strings.size() as usize];
         strings.write_to(&mut output).unwrap();
         assert_eq!(output, b"\0_alpha\0_beta\0");
+    }
+
+    #[test]
+    fn symtab_string_table_retains_borrowed_input_names() {
+        let mut strings = SymtabStringTable::default();
+        strings.add(Cow::Borrowed(b"_input_symbol")).unwrap();
+
+        assert!(matches!(
+            strings.offsets.keys().next(),
+            Some(Cow::Borrowed(b"_input_symbol"))
+        ));
     }
 
     #[test]
