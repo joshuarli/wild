@@ -65,8 +65,9 @@ profiles must produce a verified cache hit when `--wild-incremental-cache` is su
 direct replay is held to the cache-link target. Ineligible profiles still measure their normal
 incremental final link, peak RSS, CPU, output bytes, and validation evidence, but neither request
 cache sidecars nor use the cache-link target as a gate. The proc-macro dylib profile is ineligible
-because the cache only supports executables. The native/C++ profile is ineligible until the
-static-archive topology can publish and validate a safe baseline.
+because the cache only supports executables. The native/C++ profile remains eligible: it changes a
+live fixed-width Rust data value while retaining the native static archive, so it verifies that an
+unchanged static archive does not block a safe cache baseline.
 
 Each workload's `incremental_mutation` is an exact append or exact one-occurrence replacement.
 Prefer a same-size replacement that changes a real emitted byte over a comment-only edit. For a
