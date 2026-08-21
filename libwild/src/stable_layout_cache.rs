@@ -44,7 +44,7 @@ use std::time::SystemTime;
 const MAGIC: &[u8; 16] = b"WILD-MACHO-INC\0\0";
 const STATE_MAGIC: &[u8; 16] = b"WILD-MACHO-STATE";
 const VERSION: u32 = 10;
-const STATE_VERSION: u32 = 5;
+const STATE_VERSION: u32 = 4;
 const HASH_SIZE: usize = 32;
 const MAX_RECORDS: usize = 100_000;
 const DIAGNOSTICS_ENV: &str = "WILD_MACHO_INCREMENTAL_CACHE_DIAGNOSTICS";
@@ -53,7 +53,7 @@ const STRUCTURE_DIGEST_DOMAIN: &[u8] = b"wild-macho-stable-layout-structure-v5\0
 /// The sidecar is not an authenticated input, but random or torn sidecar corruption must become
 /// a conservative cache miss before any persisted patch mapping is used.
 const MANIFEST_CHECKSUM_DOMAIN: &[u8] = b"wild-macho-stable-layout-manifest-v10\0";
-const STATE_CHECKSUM_DOMAIN: &[u8] = b"wild-macho-stable-layout-state-v5\0";
+const STATE_CHECKSUM_DOMAIN: &[u8] = b"wild-macho-stable-layout-state-v4\0";
 
 #[derive(Clone, Debug)]
 struct InputDigest {
@@ -302,10 +302,6 @@ struct ImageState {
     manifest_checksum: [u8; HASH_SIZE],
     output_identity: OutputIdentity,
     output_len: u64,
-    /// Exact metadata for the output published with `output_identity`. A matching device, inode,
-    /// length, mtime, and ctime lets the next cache hit retain the normal filesystem race model
-    /// without rehashing an unchanged multi-megabyte output just to prove its lineage.
-    output_metadata: Option<InputFileMetadata>,
     inputs: Vec<InputDigest>,
 }
 
@@ -495,7 +491,6 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
             state.output_len,
             &state.output_identity,
             &manifest.signature,
-            state.output_metadata.as_ref(),
         )
     };
     if let Some(matches) = existing_output_matches {
@@ -719,7 +714,6 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
 
     state.output_identity = output_identity;
     state.output_len = output_len;
-    state.output_metadata = output_file_metadata(args.output());
     // The direct object is the one patched input, but equal-content rlibs can move between
     // rustc's per-link temporary directories. Retain every current physical identity so the
     // metadata race guard checks the paths that produced this image on the next cache hit.
@@ -753,11 +747,7 @@ fn existing_output_matches_baseline(
     output_len: u64,
     output_identity: &OutputIdentity,
     signature: &SignatureInfo,
-    expected_metadata: Option<&InputFileMetadata>,
 ) -> Option<bool> {
-    if expected_metadata.is_some_and(|expected| output_file_metadata(path).as_ref() == Some(expected)) {
-        return Some(true);
-    }
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         // Cargo can retire the old hash-bearing output before invoking the linker. That is the
@@ -770,10 +760,6 @@ fn existing_output_matches_baseline(
         return Some(false);
     }
     Some(output_matches_identity(&bytes, signature, output_identity))
-}
-
-fn output_file_metadata(path: &Path) -> Option<InputFileMetadata> {
-    input_file_metadata(path.to_str()?)
 }
 
 fn discard_cache_sidecars(args: &MachOArgs) {
@@ -857,7 +843,6 @@ pub(crate) fn stage_after_link(layout: &Layout<'_, MachO>, output: &[u8]) {
         manifest_checksum,
         output_identity: manifest.output_identity,
         output_len: manifest.output_len,
-        output_metadata: None,
         inputs: manifest.inputs.clone(),
     };
     // Stage the image first. `publish_staged` exposes it only after generic linking confirms no
@@ -899,7 +884,7 @@ pub(crate) fn publish_staged(args: &MachOArgs) {
         let _ = fs::remove_file(staged_image);
         return;
     };
-    let Ok(mut state) = ImageState::decode(&state_bytes) else {
+    let Ok(state) = ImageState::decode(&state_bytes) else {
         let _ = cache_miss("staged baseline image state is corrupt or incompatible");
         let _ = fs::remove_file(staged);
         let _ = fs::remove_file(staged_image);
@@ -918,14 +903,6 @@ pub(crate) fn publish_staged(args: &MachOArgs) {
         || input_digests(args).as_ref() != Some(&manifest.inputs)
     {
         let _ = cache_miss("link-visible inputs changed before baseline publication");
-        let _ = fs::remove_file(staged);
-        let _ = fs::remove_file(staged_image);
-        let _ = fs::remove_file(staged_state);
-        return;
-    }
-    state.output_metadata = output_file_metadata(args.output());
-    if write_staged_image_state_atomic(cache_dir, args, &state).is_err() {
-        let _ = cache_miss("unable to record baseline output metadata");
         let _ = fs::remove_file(staged);
         let _ = fs::remove_file(staged_image);
         let _ = fs::remove_file(staged_state);
@@ -3458,13 +3435,6 @@ impl ImageState {
         out.extend_from_slice(&self.output_identity.normalized_digest);
         out.extend_from_slice(&self.output_identity.signature_hashes_digest);
         put_u64(&mut out, self.output_len);
-        match &self.output_metadata {
-            Some(metadata) => {
-                out.push(1);
-                put_input_metadata(&mut out, metadata);
-            }
-            None => out.push(0),
-        }
         put_u32(&mut out, self.inputs.len() as u32);
         for input in &self.inputs {
             put_bytes(&mut out, input.path.as_bytes());
@@ -3494,11 +3464,6 @@ impl ImageState {
             signature_hashes_digest: reader.hash()?,
         };
         let output_len = reader.u64()?;
-        let output_metadata = match reader.take(1)? {
-            [0] => None,
-            [1] => Some(read_input_metadata(&mut reader)?),
-            _ => anyhow::bail!("invalid output-metadata presence flag"),
-        };
         let input_count = reader.count()?;
         let mut inputs = Vec::with_capacity(input_count);
         for _ in 0..input_count {
@@ -3515,7 +3480,6 @@ impl ImageState {
             manifest_checksum,
             output_identity,
             output_len,
-            output_metadata,
             inputs,
         })
     }
@@ -3669,7 +3633,6 @@ mod tests {
     use super::input_digests;
     use super::input_digests_for_cache_hit;
     use super::input_identity_changed;
-    use super::input_file_metadata;
     use super::input_metadata_snapshots_match;
     use super::masked_digest;
     use super::masked_digest_for_input_ranges;
@@ -3805,7 +3768,6 @@ mod tests {
             manifest_checksum: view.checksum,
             output_identity: manifest.output_identity,
             output_len: manifest.output_len,
-            output_metadata: Some(test_input_metadata()),
             inputs: manifest.inputs.clone(),
         };
         let state_encoded = state.encode();
@@ -3988,16 +3950,9 @@ mod tests {
             normalized_digest: [0; HASH_SIZE],
             signature_hashes_digest: identity.signature_hashes_digest,
         };
-        let baseline_metadata = input_file_metadata(path.to_str().unwrap()).unwrap();
 
         assert_eq!(
-            existing_output_matches_baseline(
-                &path,
-                baseline.len() as u64,
-                &identity,
-                &signature,
-                None,
-            ),
+            existing_output_matches_baseline(&path, baseline.len() as u64, &identity, &signature),
             Some(true),
         );
         assert_eq!(
@@ -4006,40 +3961,17 @@ mod tests {
                 baseline.len() as u64 - 1,
                 &identity,
                 &signature,
-                None,
             ),
             Some(false),
         );
         assert_eq!(
-            existing_output_matches_baseline(
-                &path,
-                baseline.len() as u64,
-                &wrong_identity,
-                &signature,
-                None,
-            ),
+            existing_output_matches_baseline(&path, baseline.len() as u64, &wrong_identity, &signature),
             Some(false),
-        );
-        assert_eq!(
-            existing_output_matches_baseline(
-                &path,
-                baseline.len() as u64,
-                &wrong_identity,
-                &signature,
-                Some(&baseline_metadata),
-            ),
-            Some(true),
         );
 
         std::fs::remove_file(&path).unwrap();
         assert_eq!(
-            existing_output_matches_baseline(
-                &path,
-                baseline.len() as u64,
-                &identity,
-                &signature,
-                None,
-            ),
+            existing_output_matches_baseline(&path, baseline.len() as u64, &identity, &signature),
             None,
         );
 
@@ -4047,13 +3979,7 @@ mod tests {
         // read is not equivalent to that allowed absence: it cannot prove this cache lineage.
         std::fs::create_dir(&path).unwrap();
         assert_eq!(
-            existing_output_matches_baseline(
-                &path,
-                baseline.len() as u64,
-                &identity,
-                &signature,
-                None,
-            ),
+            existing_output_matches_baseline(&path, baseline.len() as u64, &identity, &signature),
             Some(false),
         );
         std::fs::remove_dir(&path).unwrap();
