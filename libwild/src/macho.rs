@@ -2283,7 +2283,11 @@ impl platform::Symbol for SymtabEntry {
     }
 
     fn is_default_strippable(&self, name: &[u8]) -> bool {
-        self.is_local() && name.starts_with(b"ltmp")
+        // These are compiler-generated local implementation labels, not source-level symbols.
+        // ld64 omits them from an ordinary final-image nlist, while retaining real local symbols
+        // for post-link tools. Keeping `l_anon.*` in large Rust outputs adds many megabytes to
+        // __LINKEDIT and forces the code-signature writer to hash those extra pages.
+        self.is_local() && (name.starts_with(b"ltmp") || name.starts_with(b"l_anon."))
     }
 
     fn debug_string(&self) -> String {
@@ -6177,6 +6181,19 @@ mod tests {
 
         let undefined = test_undefined_symbol();
         assert_eq!(undefined.debug_string(), "Global Undefined");
+    }
+
+    #[test]
+    fn default_stripping_omits_only_local_compiler_labels() {
+        let mut local = test_symbol(SymbolSectionProperties::default());
+        local.n_type.remove(N_EXT);
+
+        assert!(local.is_default_strippable(b"ltmp0"));
+        assert!(local.is_default_strippable(b"l_anon.7"));
+        assert!(!local.is_default_strippable(b"_source_level_local"));
+
+        let global = test_symbol(SymbolSectionProperties::default());
+        assert!(!global.is_default_strippable(b"l_anon.7"));
     }
 
     #[test]
