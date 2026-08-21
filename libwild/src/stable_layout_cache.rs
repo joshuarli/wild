@@ -25,6 +25,7 @@ use object::Endianness;
 use object::macho::LC_UUID;
 use rayon::prelude::*;
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 #[cfg(target_os = "macos")]
 use std::ffi::CString;
 use std::fs;
@@ -1612,18 +1613,23 @@ fn object_records(
     output: &[u8],
 ) -> Option<Vec<ObjectRecord>> {
     let mut direct_object_indices = BTreeMap::new();
+    let mut repeated_direct_object_paths = BTreeSet::new();
     for (index, input) in inputs
         .iter()
         .enumerate()
         .filter(|(_, input)| is_mach_object_path(&input.path))
     {
         // A repeated direct object has no unambiguous one-object role.
-        if direct_object_indices.insert(input.path.as_str(), index).is_some() {
-            return None;
+        if direct_object_indices.contains_key(input.path.as_str()) {
+            direct_object_indices.remove(input.path.as_str());
+            repeated_direct_object_paths.insert(input.path.as_str());
+        } else if !repeated_direct_object_paths.contains(input.path.as_str()) {
+            direct_object_indices.insert(input.path.as_str(), index);
         }
     }
 
     let mut candidates = BTreeMap::new();
+    let mut ambiguous_input_indices = BTreeSet::new();
     for group in &layout.group_layouts {
         for file in &group.files {
             let FileLayout::Object(object) = file else {
@@ -1634,18 +1640,41 @@ fn object_records(
             let Some(&input_index) = direct_object_indices.get(path.as_str()) else {
                 continue;
             };
-            if candidates
-                .insert(input_index, object_candidate(layout, object, output)?)
-                .is_some()
-            {
-                return None;
+            if ambiguous_input_indices.contains(&input_index) {
+                continue;
+            }
+            // Every direct input is still fingerprinted in `ImageState`. An object that cannot
+            // supply a proven patch mapping is therefore safe to leave unrecorded: changing it
+            // has no `ObjectRecord` and must take the normal-link fallback, while another direct
+            // object with a verified mapping can still use a cache baseline.
+            let Some(candidate) = object_candidate(layout, object, output) else {
+                continue;
+            };
+            if candidates.insert(input_index, candidate).is_some() {
+                candidates.remove(&input_index);
+                ambiguous_input_indices.insert(input_index);
             }
         }
     }
 
+    Some(cacheable_records_from_candidates(
+        candidates
+            .into_iter()
+            .map(|(input_index, candidate)| (input_index, Some(candidate))),
+    ))
+}
+
+/// Converts only individually proven direct-object mappings into manifest records. Inputs without
+/// a record remain part of the baseline fingerprint, so a later change to one cannot become a
+/// cache hit. Keeping that per-input fallback lets an unsupported Rust codegen object coexist with
+/// a separately safe changed object instead of suppressing the whole baseline.
+fn cacheable_records_from_candidates(
+    candidates: impl IntoIterator<Item = (usize, Option<Candidate>)>,
+) -> Vec<ObjectRecord> {
     candidates
         .into_iter()
-        .map(|(input_index, mut candidate)| {
+        .filter_map(|(input_index, candidate)| {
+            let mut candidate = candidate?;
             if candidate.patches.is_empty() {
                 return None;
             }
@@ -3437,6 +3466,7 @@ fn put_bytes(out: &mut Vec<u8>, bytes: &[u8]) {
 mod tests {
     use super::Manifest;
     use super::ManifestView;
+    use super::Candidate;
     use super::HASH_SIZE;
     use super::MAGIC;
     use super::STATE_MAGIC;
@@ -3607,6 +3637,32 @@ mod tests {
         let mut corrupt = manifest.encode();
         corrupt[MAGIC.len() + size_of::<u32>()] ^= 1;
         assert!(Manifest::decode(&corrupt).is_err());
+    }
+
+    #[test]
+    fn unrecordable_direct_object_does_not_suppress_a_cacheable_object_record() {
+        let records = super::cacheable_records_from_candidates([
+            (
+                3,
+                Some(Candidate {
+                    bytes: vec![1, 2, 3, 4],
+                    patches: vec![PatchRange {
+                        input_offset: 1,
+                        output_offset: 9,
+                        len: 2,
+                    }],
+                    structure_masks: Vec::new(),
+                    symbol_values: Vec::new(),
+                    protected: Vec::new(),
+                }),
+            ),
+            (7, None),
+        ]);
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].input_index, 3);
+        assert_eq!(records[0].patches.len(), 1);
+        assert_eq!(records[0].structure_masks, vec![InputRange { input_offset: 1, len: 2 }]);
     }
 
     #[test]
