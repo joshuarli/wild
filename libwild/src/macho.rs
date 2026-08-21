@@ -1242,8 +1242,9 @@ struct RegularObject<'data> {
     pub(crate) sections: SectionTable<'data>,
     /// Atom boundaries are a property of the input file, not a liveness query. Rust's standard
     /// library has enough symbols that rebuilding and then coalescing this list for every graph
-    /// edge turns a valid proc-macro link quadratic.
-    atom_starts: DeferredIndex<Vec<Vec<u64>>>,
+    /// edge turns a valid proc-macro link quadratic. Archive members often use just one section,
+    /// so initialize the selected section rather than every section in the member.
+    atom_starts: DeferredIndex<AtomStarts>,
     /// Public definitions, grouped by input section and sorted by their input offsets.
     ///
     /// `-dead_strip` loads Mach-O input one atom at a time. Exporting an atom used to scan the
@@ -1258,10 +1259,19 @@ struct RegularObject<'data> {
 /// the fallible build. Archive members are parsed before symbol resolution knows which of them
 /// will become live, so computing their dead-strip indexes eagerly adds work for every rejected
 /// member. The mutex is used only by the first builder; the steady state is `OnceLock::get`.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct DeferredIndex<T> {
     value: OnceLock<T>,
     initializing: Mutex<()>,
+}
+
+impl<T> Default for DeferredIndex<T> {
+    fn default() -> Self {
+        Self {
+            value: OnceLock::new(),
+            initializing: Mutex::new(()),
+        }
+    }
 }
 
 impl<T> DeferredIndex<T> {
@@ -1291,6 +1301,55 @@ impl<T> DeferredIndex<T> {
             .value
             .get()
             .expect("dead-strip index was initialized before being returned"))
+    }
+}
+
+/// Per-section atom-boundary indexes for one regular object.
+///
+/// The outer [`DeferredIndex`] defers even allocating these section slots for archive members
+/// that symbol resolution rejects. Once a member is selected, each section retains its own
+/// fallible index so atom-level dead stripping need not scan every debug or data section before
+/// loading the first live text atom.
+#[derive(Debug)]
+struct AtomStarts {
+    sections: Box<[DeferredIndex<Vec<u64>>]>,
+}
+
+impl AtomStarts {
+    fn uninitialized(section_count: usize) -> Self {
+        Self {
+            sections: (0..section_count)
+                .map(|_| DeferredIndex::default())
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        }
+    }
+
+    fn from_all(starts: Vec<Vec<u64>>) -> Self {
+        Self {
+            sections: starts
+                .into_iter()
+                .map(|starts| {
+                    let value = OnceLock::new();
+                    match value.set(starts) {
+                        Ok(()) => {}
+                        Err(_) => unreachable!("fresh atom-start index was initialized twice"),
+                    }
+                    DeferredIndex {
+                        value,
+                        initializing: Mutex::new(()),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        }
+    }
+
+    fn section(&self, section_index: object::SectionIndex) -> Result<&DeferredIndex<Vec<u64>>> {
+        Ok(self
+            .sections
+            .get(section_index.0)
+            .context("Mach-O subsection atom section index out of range")?)
     }
 }
 
@@ -4792,20 +4851,15 @@ impl<'data> File<'data> {
     }
 
     fn atom_starts(&self, section_index: object::SectionIndex) -> Result<&[u64]> {
-        Ok(self
-            .atom_starts_by_section()?
-            .get(section_index.0)
-            .map(Vec::as_slice)
-            .context("Mach-O subsection atom section index out of range")?)
-    }
-
-    fn atom_starts_by_section(&self) -> Result<&[Vec<u64>]> {
         let ObjectKind::Regular(regular) = &self.kind else {
             bail!("dynamic Mach-O input has no subsection atoms");
         };
-        Ok(regular
+        let starts = regular
             .atom_starts
-            .get_or_try_init(|| self.compute_atom_starts())?
+            .get_or_try_init(|| Ok(AtomStarts::uninitialized(self.sections().len())))?;
+        Ok(starts
+            .section(section_index)?
+            .get_or_try_init(|| self.compute_atom_starts_for_section(section_index))?
             .as_slice())
     }
 
@@ -4838,7 +4892,7 @@ impl<'data> File<'data> {
         if self.uses_subsections_via_symbols() {
             regular
                 .atom_starts
-                .get_or_try_init(|| self.compute_atom_starts())?;
+                .get_or_try_init(|| self.compute_atom_starts().map(AtomStarts::from_all))?;
         }
         Ok(())
     }
@@ -4920,6 +4974,50 @@ impl<'data> File<'data> {
             remove_relocation_interior_atom_starts(starts, &mut relocation_ranges);
         }
         Ok(all_starts)
+    }
+
+    /// Builds one section's atom starts for a lazily selected archive member. Directly supplied
+    /// objects use [`Self::compute_atom_starts`] during parsing instead, preserving its full-file
+    /// structural validation before link layout begins.
+    fn compute_atom_starts_for_section(
+        &self,
+        section_index: object::SectionIndex,
+    ) -> Result<Vec<u64>> {
+        let section = self.section(section_index)?;
+        let section_size = self.section_size(section)?;
+        let mut starts = vec![0];
+        for (symbol_index, symbol) in self.enumerate_symbols() {
+            if self.symbol_section(symbol, symbol_index)? != Some(section_index) {
+                continue;
+            }
+            let offset = self.symbol_offset_in_section(symbol, section_index)?;
+            ensure!(
+                offset <= section_size,
+                "Mach-O symbol lies past the end of its section while forming dead-strip atoms"
+            );
+            starts.push(offset);
+        }
+
+        starts.sort_unstable();
+        starts.dedup();
+        let mut relocation_ranges = Vec::new();
+        for relocation in paired_relocations(self.relocations(section_index, &())?.relocations) {
+            let relocation = relocation?;
+            let relocation_start = u64::from(relocation.info.r_address);
+            let width = 1u64
+                .checked_shl(u32::from(relocation.info.r_length))
+                .context("Mach-O relocation width is invalid")?;
+            let relocation_end = relocation_start
+                .checked_add(width)
+                .context("Mach-O relocation range overflows")?;
+            ensure!(
+                relocation_end <= section_size,
+                "Mach-O relocation extends past the end of its section"
+            );
+            relocation_ranges.push(relocation_start..relocation_end);
+        }
+        remove_relocation_interior_atom_starts(&mut starts, &mut relocation_ranges);
+        Ok(starts)
     }
 
     fn sections(&self) -> &'data [SectionHeader] {
@@ -5240,6 +5338,20 @@ mod tests {
         };
         assert!(regular.atom_starts.get().is_some());
         assert!(regular.exported_symbols_by_section.get().is_some());
+    }
+
+    #[test]
+    fn atom_starts_initializes_only_the_requested_section() {
+        let starts = AtomStarts::uninitialized(2);
+        assert!(starts.sections[0].get().is_none());
+        assert!(starts.sections[1].get().is_none());
+
+        starts.sections[1]
+            .get_or_try_init(|| Ok(vec![0, 8]))
+            .unwrap();
+
+        assert!(starts.sections[0].get().is_none());
+        assert_eq!(starts.sections[1].get().unwrap(), &[0, 8]);
     }
 
     #[test]
