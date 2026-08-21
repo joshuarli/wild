@@ -62,11 +62,11 @@ pub const EXPERIMENTAL_PLATFORMS: &str = "WILD_EXPERIMENTAL_PLATFORMS";
 pub(crate) const WRITE_VERIFY_ALLOCATIONS_ENV: &str = "WILD_VERIFY_ALLOCATIONS";
 
 /// Unconstrained links on Apple Silicon have enough available CPUs to make the automatic Rayon
-/// pool expensive relative to short links. Six workers is the measured crossover for the
+/// pool expensive relative to short links. Eight workers is the measured crossover for the
 /// representative Rust and C++ direct-link replays. Explicit `--threads` and jobserver limits
 /// retain their callers' requested parallelism.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-const MACOS_AARCH64_AUTOMATIC_THREAD_LIMIT: NonZeroUsize = NonZeroUsize::new(6).unwrap();
+const MACOS_AARCH64_AUTOMATIC_THREAD_LIMIT: NonZeroUsize = NonZeroUsize::new(8).unwrap();
 
 #[derive(derive_more::Debug)]
 pub struct CommonArgs {
@@ -1708,10 +1708,10 @@ mod tests {
 
     #[test]
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn caps_unconstrained_macos_arm64_links_at_six_threads() {
+    fn caps_unconstrained_macos_arm64_links_at_eight_threads() {
         assert_eq!(
             automatic_thread_count(NonZeroUsize::new(10).unwrap()),
-            NonZeroUsize::new(6).unwrap()
+            NonZeroUsize::new(8).unwrap()
         );
         assert_eq!(
             automatic_thread_count(NonZeroUsize::new(2).unwrap()).get(),
