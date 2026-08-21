@@ -95,6 +95,8 @@ use std::num::NonZeroU64;
 use std::ops::Range;
 use std::slice::Iter;
 use std::sync::atomic::Ordering;
+use std::sync::Mutex;
+use std::sync::OnceLock;
 
 use gimli::Reader as _;
 
@@ -1076,6 +1078,21 @@ pub(crate) struct File<'data> {
     kind: ObjectKind<'data>,
 }
 
+impl<'data> File<'data> {
+    #[cfg(test)]
+    fn parse_bytes_with_dead_strip_indexes(
+        input: &'data [u8],
+        is_dynamic: bool,
+        eagerly_initialize_dead_strip_indexes: bool,
+    ) -> Result<Self> {
+        parse_bytes_with_dead_strip_indexes(
+            input,
+            is_dynamic,
+            eagerly_initialize_dead_strip_indexes,
+        )
+    }
+}
+
 /// The identity and ABI versions that a dynamic input contributes to its consumer.
 ///
 /// Mach-O resolves dynamic libraries by the `LC_ID_DYLIB` path rather than the path by which the
@@ -1223,7 +1240,7 @@ struct RegularObject<'data> {
     /// Atom boundaries are a property of the input file, not a liveness query. Rust's standard
     /// library has enough symbols that rebuilding and then coalescing this list for every graph
     /// edge turns a valid proc-macro link quadratic.
-    atom_starts: Vec<Vec<u64>>,
+    atom_starts: DeferredIndex<Vec<Vec<u64>>>,
     /// Public definitions, grouped by input section and sorted by their input offsets.
     ///
     /// `-dead_strip` loads Mach-O input one atom at a time. Exporting an atom used to scan the
@@ -1231,7 +1248,47 @@ struct RegularObject<'data> {
     /// revisit the same local and undefined symbols. Keep the parse-time index separate from
     /// `atom_starts`: a relocation can coalesce atom boundaries, while this index still selects
     /// all public symbols in the live input range.
-    exported_symbols_by_section: Vec<Vec<ExportedSymbol>>,
+    exported_symbols_by_section: DeferredIndex<Vec<Vec<ExportedSymbol>>>,
+}
+
+/// Builds one immutable parse-time index at most once, while preserving linker diagnostics from
+/// the fallible build. Archive members are parsed before symbol resolution knows which of them
+/// will become live, so computing their dead-strip indexes eagerly adds work for every rejected
+/// member. The mutex is used only by the first builder; the steady state is `OnceLock::get`.
+#[derive(Debug, Default)]
+struct DeferredIndex<T> {
+    value: OnceLock<T>,
+    initializing: Mutex<()>,
+}
+
+impl<T> DeferredIndex<T> {
+    #[cfg(test)]
+    fn get(&self) -> Option<&T> {
+        self.value.get()
+    }
+
+    fn get_or_try_init(&self, initialize: impl FnOnce() -> Result<T>) -> Result<&T> {
+        if let Some(value) = self.value.get() {
+            return Ok(value);
+        }
+
+        let _initializing = self
+            .initializing
+            .lock()
+            .expect("dead-strip index initialization mutex was poisoned");
+        if let Some(value) = self.value.get() {
+            return Ok(value);
+        }
+        let value = initialize()?;
+        match self.value.set(value) {
+            Ok(()) => {}
+            Err(_) => unreachable!("dead-strip index was initialized while its mutex was held"),
+        }
+        Ok(self
+            .value
+            .get()
+            .expect("dead-strip index was initialized before being returned"))
+    }
 }
 
 /// A public, section-defined Mach-O symbol eligible for executable export after dead stripping.
@@ -1255,118 +1312,118 @@ fn exported_symbols_in_range<'symbols>(
     &exported_symbols[start..end]
 }
 
+fn parse_bytes_with_dead_strip_indexes<'data>(
+    input: &'data [u8],
+    is_dynamic: bool,
+    eagerly_initialize_dead_strip_indexes: bool,
+) -> Result<File<'data>> {
+    let header = macho::MachHeader64::<object::Endianness>::parse(input, 0)?;
+    let mut commands = header.load_commands(LE, input, 0)?;
+
+    let mut symbols = None;
+    let mut sections = None;
+    let mut indirect_symbols = None;
+    let mut symbol_section_properties = Vec::new();
+    let mut dylib_metadata = None;
+
+    while let Some(command) = commands.next()? {
+        if let Some(symtab_command) = command.symtab()? {
+            ensure!(symbols.is_none(), "At most one symtab command expected");
+            symbols = Some(symtab_command.symbols::<macho::MachHeader64<_>, _>(LE, input)?);
+        } else if let Some(dysymtab_command) = command.dysymtab()? {
+            ensure!(
+                indirect_symbols.is_none(),
+                "At most one dysymtab command expected"
+            );
+            indirect_symbols = Some(dysymtab_command.indirect_symbols(LE, input)?);
+        } else if is_dynamic && command.cmd() == macho::LC_ID_DYLIB {
+            ensure!(
+                dylib_metadata.is_none(),
+                "At most one LC_ID_DYLIB command expected"
+            );
+            let dylib_command: &DylibCommand = command.data()?;
+            dylib_metadata = Some(DylibMetadata {
+                install_name: command.string(LE, dylib_command.dylib.name)?,
+                versions: DylibVersions {
+                    current: dylib_command.dylib.current_version.get(LE),
+                    compatibility: dylib_command.dylib.compatibility_version.get(LE),
+                },
+            });
+        } else if let Some((segment_command, segment_data)) = command.segment_64()? {
+            let section_list = segment_command.sections(LE, segment_data)?;
+            symbol_section_properties.extend(
+                section_list
+                    .iter()
+                    .map(symbol_section_properties_from_section),
+            );
+            if !is_dynamic {
+                ensure!(sections.is_none(), "At most one segment command expected");
+                sections = Some(section_list);
+            }
+        }
+    }
+
+    let symbols = symbols.ok_or("Missing symbol table")?;
+    if !is_dynamic {
+        validate_indirect_symbol_sections(
+            sections.as_deref().ok_or("Missing segment command")?,
+            symbols.len(),
+            indirect_symbols,
+        )?;
+    }
+    let symbol_entries = symbols
+        .iter()
+        .map(|raw| {
+            let properties = if !raw.n_type.is_stab()
+                && raw.n_type.typ() == N_SECT
+                && raw.n_sect != 0
+            {
+                *symbol_section_properties
+                    .get(usize::from(raw.n_sect - 1))
+                    .context("Mach-O symbol section index is out of range")?
+            } else {
+                SymbolSectionProperties::default()
+            };
+            Ok(SymtabEntry::from_raw(*raw, properties))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let kind = if is_dynamic {
+        ObjectKind::Dylib(dylib_metadata.ok_or("Missing LC_ID_DYLIB command")?)
+    } else {
+        ObjectKind::Regular(RegularObject {
+            sections: sections.ok_or("Missing segment command")?,
+            atom_starts: DeferredIndex::default(),
+            exported_symbols_by_section: DeferredIndex::default(),
+        })
+    };
+
+    let file = File {
+        data: input,
+        symbols,
+        symbol_entries,
+        flags: header.flags(LE),
+        kind,
+    };
+    if eagerly_initialize_dead_strip_indexes && !file.is_dynamic() {
+        file.initialize_dead_strip_indexes()?;
+    }
+    Ok(file)
+}
+
 impl<'data> platform::ObjectFile<'data> for File<'data> {
     type Platform = MachO;
 
     fn parse_bytes(input: &'data [u8], is_dynamic: bool) -> Result<Self> {
-        let header = macho::MachHeader64::<object::Endianness>::parse(input, 0)?;
-        let mut commands = header.load_commands(LE, input, 0)?;
-
-        let mut symbols = None;
-        let mut sections = None;
-        let mut indirect_symbols = None;
-        let mut symbol_section_properties = Vec::new();
-        let mut dylib_metadata = None;
-
-        while let Some(command) = commands.next()? {
-            if let Some(symtab_command) = command.symtab()? {
-                ensure!(symbols.is_none(), "At most one symtab command expected");
-                symbols = Some(symtab_command.symbols::<macho::MachHeader64<_>, _>(LE, input)?);
-            } else if let Some(dysymtab_command) = command.dysymtab()? {
-                ensure!(
-                    indirect_symbols.is_none(),
-                    "At most one dysymtab command expected"
-                );
-                indirect_symbols = Some(dysymtab_command.indirect_symbols(LE, input)?);
-            } else if is_dynamic && command.cmd() == macho::LC_ID_DYLIB {
-                ensure!(
-                    dylib_metadata.is_none(),
-                    "At most one LC_ID_DYLIB command expected"
-                );
-                let dylib_command: &DylibCommand = command.data()?;
-                dylib_metadata = Some(DylibMetadata {
-                    install_name: command.string(LE, dylib_command.dylib.name)?,
-                    versions: DylibVersions {
-                        current: dylib_command.dylib.current_version.get(LE),
-                        compatibility: dylib_command.dylib.compatibility_version.get(LE),
-                    },
-                });
-            } else if let Some((segment_command, segment_data)) = command.segment_64()? {
-                let section_list = segment_command.sections(LE, segment_data)?;
-                symbol_section_properties.extend(
-                    section_list
-                        .iter()
-                        .map(symbol_section_properties_from_section),
-                );
-                if !is_dynamic {
-                    ensure!(sections.is_none(), "At most one segment command expected");
-                    sections = Some(section_list);
-                }
-            }
-        }
-
-        let symbols = symbols.ok_or("Missing symbol table")?;
-        if !is_dynamic {
-            validate_indirect_symbol_sections(
-                sections.as_deref().ok_or("Missing segment command")?,
-                symbols.len(),
-                indirect_symbols,
-            )?;
-        }
-        let symbol_entries = symbols
-            .iter()
-            .map(|raw| {
-                let properties = if !raw.n_type.is_stab()
-                    && raw.n_type.typ() == N_SECT
-                    && raw.n_sect != 0
-                {
-                    *symbol_section_properties
-                        .get(usize::from(raw.n_sect - 1))
-                        .context("Mach-O symbol section index is out of range")?
-                } else {
-                    SymbolSectionProperties::default()
-                };
-                Ok(SymtabEntry::from_raw(*raw, properties))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        let kind = if is_dynamic {
-            ObjectKind::Dylib(dylib_metadata.ok_or("Missing LC_ID_DYLIB command")?)
-        } else {
-            ObjectKind::Regular(RegularObject {
-                sections: sections.ok_or("Missing segment command")?,
-                atom_starts: Vec::new(),
-                exported_symbols_by_section: Vec::new(),
-            })
-        };
-
-        let mut file = File {
-            data: input,
-            symbols,
-            symbol_entries,
-            flags: header.flags(LE),
-            kind,
-        };
-        if !file.is_dynamic() {
-            let exported_symbols_by_section = file.compute_exported_symbols_by_section()?;
-            let ObjectKind::Regular(regular) = &mut file.kind else {
-                unreachable!("only regular Mach-O objects may have public export symbols");
-            };
-            regular.exported_symbols_by_section = exported_symbols_by_section;
-        }
-        if file.uses_subsections_via_symbols() {
-            let atom_starts = file.compute_atom_starts()?;
-            let ObjectKind::Regular(regular) = &mut file.kind else {
-                unreachable!("only regular Mach-O objects may opt into subsection atoms");
-            };
-            regular.atom_starts = atom_starts;
-        }
-        Ok(file)
+        parse_bytes_with_dead_strip_indexes(input, is_dynamic, true)
     }
 
     fn parse(input: &crate::input_data::InputBytes<'data>, _args: &MachOArgs) -> Result<Self> {
-        // TODO
-        Self::parse_bytes(input.data, input.kind == FileKind::MachODylib)
+        parse_bytes_with_dead_strip_indexes(
+            input.data,
+            input.kind == FileKind::MachODylib,
+            !input.input.has_archive_semantics(),
+        )
     }
 
     fn is_dynamic(&self) -> bool {
@@ -4733,14 +4790,21 @@ impl<'data> File<'data> {
     }
 
     fn atom_starts(&self, section_index: object::SectionIndex) -> Result<&[u64]> {
+        Ok(self
+            .atom_starts_by_section()?
+            .get(section_index.0)
+            .map(Vec::as_slice)
+            .context("Mach-O subsection atom section index out of range")?)
+    }
+
+    fn atom_starts_by_section(&self) -> Result<&[Vec<u64>]> {
         let ObjectKind::Regular(regular) = &self.kind else {
             bail!("dynamic Mach-O input has no subsection atoms");
         };
         Ok(regular
             .atom_starts
-            .get(section_index.0)
-            .map(Vec::as_slice)
-            .context("Mach-O subsection atom section index out of range")?)
+            .get_or_try_init(|| self.compute_atom_starts())?
+            .as_slice())
     }
 
     /// Returns the public definitions that belong to one live input range. Atom-level dead
@@ -4756,9 +4820,25 @@ impl<'data> File<'data> {
         };
         let symbols = regular
             .exported_symbols_by_section
+            .get_or_try_init(|| self.compute_exported_symbols_by_section())?
             .get(section_index.0)
             .context("Mach-O export symbol section index out of range")?;
         Ok(exported_symbols_in_range(symbols, range))
+    }
+
+    fn initialize_dead_strip_indexes(&self) -> Result {
+        let ObjectKind::Regular(regular) = &self.kind else {
+            return Ok(());
+        };
+        regular
+            .exported_symbols_by_section
+            .get_or_try_init(|| self.compute_exported_symbols_by_section())?;
+        if self.uses_subsections_via_symbols() {
+            regular
+                .atom_starts
+                .get_or_try_init(|| self.compute_atom_starts())?;
+        }
+        Ok(())
     }
 
     /// Builds the structural part of `export_live_symbols_in_section` once, while parsing an
@@ -5103,6 +5183,61 @@ mod tests {
         // `indirect_symbol_offset` is already zero, so it names this nlist.
         data[symbol_offset + 4] = macho::N_UNDF.0 | macho::N_EXT.0;
         data
+    }
+
+    /// Reuses the compact indirect-symbol fixture's load-command layout, then turns its one
+    /// section and nlist into an ordinary public atom. Keeping this byte-level fixture local
+    /// makes the deferred archive-index contract independent of a host compiler.
+    fn subsections_via_symbols_object() -> Vec<u8> {
+        const HEADER_SIZE: usize = 32;
+        const SEGMENT_COMMAND_SIZE: usize = 72;
+        const SECTION_SIZE: usize = 80;
+        const DYSYMTAB_SIZE: usize = 80;
+        const SYMTAB_SIZE: usize = 24;
+        const SECTION_HEADER_OFFSET: usize = HEADER_SIZE + SEGMENT_COMMAND_SIZE;
+        const DYSYMTAB_OFFSET: usize = HEADER_SIZE + SEGMENT_COMMAND_SIZE + SECTION_SIZE;
+        const SYMTAB_OFFSET: usize = DYSYMTAB_OFFSET + DYSYMTAB_SIZE;
+        const SECTION_DATA_OFFSET: usize = SYMTAB_OFFSET + SYMTAB_SIZE;
+        const SYMBOL_OFFSET: usize = SECTION_DATA_OFFSET + GOT_ENTRY_SIZE as usize + size_of::<u32>();
+
+        let mut object = indirect_symbol_object(macho::S_NON_LAZY_SYMBOL_POINTERS);
+        object[24..28].copy_from_slice(&macho::MH_SUBSECTIONS_VIA_SYMBOLS.0.to_le_bytes());
+        object[SECTION_HEADER_OFFSET + 64..SECTION_HEADER_OFFSET + 68]
+            .copy_from_slice(&u32::from(macho::S_REGULAR.0).to_le_bytes());
+        object[SYMBOL_OFFSET + 4] = macho::N_SECT.0 | macho::N_EXT.0;
+        object[SYMBOL_OFFSET + 5] = 1;
+        object
+    }
+
+    #[test]
+    fn archive_indexes_are_deferred_until_their_dead_strip_query() {
+        let object = subsections_via_symbols_object();
+        let deferred = File::parse_bytes_with_dead_strip_indexes(&object, false, false).unwrap();
+        let ObjectKind::Regular(regular) = &deferred.kind else {
+            panic!("fixture must parse as a regular Mach-O object");
+        };
+        assert!(regular.atom_starts.get().is_none());
+        assert!(regular.exported_symbols_by_section.get().is_none());
+
+        assert_eq!(deferred.atom_range(object::SectionIndex(0), 0).unwrap(), 0..GOT_ENTRY_SIZE);
+        assert!(regular.atom_starts.get().is_some());
+        assert!(regular.exported_symbols_by_section.get().is_none());
+
+        assert_eq!(
+            deferred
+                .exported_symbols_in_range(object::SectionIndex(0), Some(&(0..GOT_ENTRY_SIZE)))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(regular.exported_symbols_by_section.get().is_some());
+
+        let eager = File::parse_bytes_with_dead_strip_indexes(&object, false, true).unwrap();
+        let ObjectKind::Regular(regular) = &eager.kind else {
+            panic!("fixture must parse as a regular Mach-O object");
+        };
+        assert!(regular.atom_starts.get().is_some());
+        assert!(regular.exported_symbols_by_section.get().is_some());
     }
 
     #[test]
