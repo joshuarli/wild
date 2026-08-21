@@ -6,6 +6,7 @@
   "cargo_arguments": ["--package", "cargo-macho-macro-producer"],
   "artifact": "{profile}/deps/libcargo_macho_macro_producer-*.dylib",
   "macho_file_type": 6,
+  "stable_layout_cache_eligible": false,
   "incremental_mutation": {
     "path": "macro-producer/src/lib.rs",
     "replace_before": "40 + 2",

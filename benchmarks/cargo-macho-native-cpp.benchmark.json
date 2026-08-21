@@ -6,6 +6,7 @@
   "cargo_arguments": ["--package", "cargo-macho-corpus-native-cpp"],
   "artifact": "{target}/{profile}/cargo-macho-corpus-native-cpp",
   "macho_file_type": 2,
+  "stable_layout_cache_eligible": false,
   "incremental_mutation": {
     "path": "native-cpp/src/main.rs",
     "append": "\n// wild benchmark native-C++ incremental-rebuild marker\n"

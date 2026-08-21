@@ -104,6 +104,9 @@ class Workload:
     deployment_target: str
     runtime: RuntimeCheck | None
     artifacts: tuple[ArtifactSpec, ...] = ()
+    # A false value records a valid normal-link topology (for example a proc-macro dylib or a
+    # changed static archive) without pretending its direct replays should be cache hits.
+    stable_layout_cache_eligible: bool = True
 
 
 def load_workload(path: Path) -> Workload:
@@ -117,6 +120,9 @@ def load_workload(path: Path) -> Workload:
     artifact_entries = raw.get("artifacts")
     if not isinstance(mutation, dict) or not isinstance(goals, dict):
         raise ValueError(f"Workload {path} needs incremental_mutation and goals objects")
+    cache_eligible = raw.get("stable_layout_cache_eligible", True)
+    if not isinstance(cache_eligible, bool):
+        raise ValueError("stable_layout_cache_eligible must be a boolean when specified")
     try:
         if "append" in mutation:
             source_mutation = SourceMutation(
@@ -225,6 +231,7 @@ def load_workload(path: Path) -> Workload:
             deployment_target=str(raw.get("deployment_target", "11.0")),
             runtime=runtime_check,
             artifacts=artifact_specs,
+            stable_layout_cache_eligible=cache_eligible,
         )
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError(f"Invalid workload {path}: {error}") from error
@@ -1012,7 +1019,11 @@ def run_sample(
     logs_dir.mkdir(parents=True, exist_ok=True)
     target_dir.parent.mkdir(parents=True, exist_ok=True)
     target_dir.mkdir(parents=True, exist_ok=False)
-    cache_enabled = linker.path is not None and wild_incremental_cache_root is not None
+    cache_enabled = (
+        linker.path is not None
+        and wild_incremental_cache_root is not None
+        and workload.stable_layout_cache_eligible
+    )
     cache_dir = (
         wild_incremental_cache_root / f"{linker.name}-{sample_index}"
         if cache_enabled
@@ -1449,7 +1460,13 @@ def comparison(runs: list[dict[str, Any]], workload: Workload) -> dict[str, Any]
         "incremental_link_cpu_ns": incremental_link_cpu_ns,
         "incremental_link_disk_usage_bytes": incremental_link_disk_usage_bytes,
         "incremental_link_wild_cache_bytes_per_output_byte": wild_cache_bytes_per_output_byte,
-        "thresholds": {"cold_max": workload.cold_max, "incremental_max": workload.incremental_max},
+        "thresholds": {
+            "cold_max": workload.cold_max,
+            "incremental_max": (
+                workload.incremental_max if workload.stable_layout_cache_eligible else None
+            ),
+        },
+        "stable_layout_cache_eligible": workload.stable_layout_cache_eligible,
         "cache": {
             "hit_count": len(cache_hits),
             "miss_count": len(cache_misses),
@@ -1457,7 +1474,10 @@ def comparison(runs: list[dict[str, Any]], workload: Workload) -> dict[str, Any]
             "miss_reasons": miss_reasons,
         },
         "goals_met": cold_ratio <= workload.cold_max
-        and incremental_link_ratio <= workload.incremental_max,
+        and (
+            not workload.stable_layout_cache_eligible
+            or incremental_link_ratio <= workload.incremental_max
+        ),
     }
 
 
@@ -1595,6 +1615,7 @@ def main(argv: list[str]) -> int:
                 "cargo_arguments": list(workload.cargo_arguments),
                 "artifact": workload.artifact,
                 "profile": workload.profile,
+                "stable_layout_cache_eligible": workload.stable_layout_cache_eligible,
                 "artifacts": [
                     {
                         "path": spec.path,

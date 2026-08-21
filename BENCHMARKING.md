@@ -60,6 +60,14 @@ and validation contracts reviewable in the Wild repository. The proc-macro profi
 machine that host is ARM64 macOS; passing `--target` would suppress the host linker selection
 evidence.
 
+Each workload explicitly records whether it is `stable_layout_cache_eligible`. Eligible executable
+profiles must produce a verified cache hit when `--wild-incremental-cache` is supplied, and their
+direct replay is held to the cache-link target. Ineligible profiles still measure their normal
+incremental final link, peak RSS, CPU, output bytes, and validation evidence, but neither request
+cache sidecars nor use the cache-link target as a gate. The proc-macro dylib profile is ineligible
+because the cache only supports executables. The native/C++ profile is ineligible until the
+static-archive topology can publish and validate a safe baseline.
+
 Each workload's `incremental_mutation` is an exact append or exact one-occurrence replacement.
 Prefer a same-size replacement that changes a real emitted byte over a comment-only edit. For a
 stable-layout linker fast path, prefer a fixed-width code immediate rather than a string literal:
@@ -79,10 +87,12 @@ python3 benchmarks/cargo_link_benchmark.py \
 ```
 
 To measure Wild's opt-in stable-layout incremental path, supply a new, empty cache directory.
-The runner still measures cold Wild without the cache so the cold comparison stays comparable; it
-then creates an unmeasured cache baseline and requires a verified cache hit for each changed-source
-Wild Cargo/direct-link sample. The direct baseline is replayed once after Cargo's capture before
-it is snapshotted: a Cargo profile may run a post-link transform such as `strip = true`, so the
+The runner still measures cold Wild without the cache so the cold comparison stays comparable; for
+each cache-eligible workload it then creates an unmeasured cache baseline and requires a verified
+cache hit for each changed-source Wild Cargo/direct-link sample. Ineligible workload profiles run
+normally even when this option is supplied, so the same matrix invocation can still record their
+direct-link resource metrics. The direct baseline is replayed once after Cargo's capture before it
+is snapshotted: a Cargo profile may run a post-link transform such as `strip = true`, so the
 cache-owned raw signed Mach-O must never be paired with that transformed artifact. Every hit still
 passes the ARM64 header, strict signature, and runtime checks. The Apple ld64 run is unchanged.
 

@@ -4,6 +4,7 @@
   "target": "aarch64-apple-darwin",
   "profile": "release",
   "cargo_arguments": ["--workspace"],
+  "stable_layout_cache_eligible": true,
   "artifacts": [
     {
       "path": "{target}/{profile}/pi-agent-headless",

@@ -48,6 +48,27 @@ class PiAgentBenchmarkTests(unittest.TestCase):
             self.assertEqual(workload.cargo_arguments, ("--bin", "other"))
             self.assertEqual(workload.incremental_max, 0.5)
 
+    def test_load_workload_can_exclude_a_normal_link_topology_from_cache_goals(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "workload.json"
+            path.write_text(
+                """{
+                  "schema_version": "cargo-link-workload/v1",
+                  "name": "native-static-library",
+                  "target": "aarch64-apple-darwin",
+                  "profile": "release",
+                  "cargo_arguments": ["--bin", "native"],
+                  "artifact": "{target}/{profile}/native",
+                  "macho_file_type": 2,
+                  "incremental_mutation": {"path": "src/main.rs", "append": "\\n// marker\\n"},
+                  "runtime": {"arguments": [], "output": "exit"},
+                  "stable_layout_cache_eligible": false,
+                  "goals": {"cold_wild_over_apple_max": 1.05, "incremental_wild_over_apple_max": 0.5}
+                }"""
+            )
+            workload = BENCHMARK.load_workload(path)
+            self.assertFalse(workload.stable_layout_cache_eligible)
+
     def test_mutation_is_restored_byte_for_byte(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "pi-agent-headless.rs"
@@ -217,6 +238,42 @@ class PiAgentBenchmarkTests(unittest.TestCase):
         self.assertEqual(result["cache"]["miss_count"], 1)
         self.assertEqual(result["cache"]["hit_rate"], 0.75)
         self.assertEqual(result["cache"]["miss_reasons"], {"image state is absent": 1})
+
+    def test_comparison_does_not_apply_cache_link_goal_to_ineligible_topology(self) -> None:
+        runs = [
+            {
+                "linker": "apple-ld64",
+                "cold": {"elapsed_ns": 100},
+                "incremental": {"elapsed_ns": 50},
+                "incremental_link": {"samples": [{"elapsed_ns": 20}]},
+            },
+            {
+                "linker": "wild",
+                "cold": {"elapsed_ns": 105},
+                "incremental": {"elapsed_ns": 50},
+                "incremental_link": {"samples": [{"elapsed_ns": 30}]},
+            },
+        ]
+        workload = BENCHMARK.Workload(
+            name="native-static-library",
+            target="aarch64-apple-darwin",
+            profile="release",
+            cargo_arguments=("--bin", "native"),
+            artifact="{target}/{profile}/native",
+            macho_file_type=BENCHMARK.MH_EXECUTE,
+            mutation=BENCHMARK.SourceMutation(path="src/main.rs", append=b"\n// test\n"),
+            cold_max=1.05,
+            incremental_max=0.5,
+            deployment_target="11.0",
+            runtime=BENCHMARK.RuntimeCheck(arguments=(), output_mode="exit"),
+            stable_layout_cache_eligible=False,
+        )
+
+        result = BENCHMARK.comparison(runs, workload)
+
+        self.assertEqual(result["incremental_link_wild_over_apple"], 1.5)
+        self.assertIsNone(result["thresholds"]["incremental_max"])
+        self.assertTrue(result["goals_met"])
 
     def test_extracts_shell_quoted_final_linker_child(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
