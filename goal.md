@@ -33,6 +33,10 @@ Use the generic stdlib-Python benchmark runner and checked-in workload manifests
 
 Measure and report separately:
 
+- Signoff uses at least five interleaved Apple ld64/Wild sample pairs with alternating linker
+  order. The per-linker medians remain the pass/fail statistic; also report every paired ratio
+  and its median to expose thermal, cache, and host-load drift rather than mistaking it for a
+  linker regression.
 - cold Cargo workspace wall time;
 - Cargo incremental wall time;
 - direct final-link replay wall time;
