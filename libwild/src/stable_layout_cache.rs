@@ -305,6 +305,19 @@ struct ImageState {
     inputs: Vec<InputDigest>,
 }
 
+/// Result of reading the previous output as a possible cache baseline.
+///
+/// A [`Matched`](Self::Matched) value owns bytes that passed the complete output-identity check,
+/// so it is safe to patch those bytes directly. Keeping this distinction explicit prevents a
+/// metadata-only check, or an unreadable existing output, from being mistaken for Cargo's allowed
+/// case where the previous output path no longer exists.
+#[derive(Debug, Eq, PartialEq)]
+enum ExistingOutputBaseline {
+    Absent,
+    Matched(Vec<u8>),
+    Mismatch,
+}
+
 struct Candidate {
     bytes: Vec<u8>,
     patches: Vec<PatchRange>,
@@ -484,20 +497,15 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
     // another output layout (for example, a stale save-temps replay); never patch over such an
     // output. Cargo may retire the path before invoking the linker, so absence remains a valid
     // cache candidate and the cache-owned image is verified below.
-    let existing_output_matches = {
+    let existing_output = {
         timing_phase!("Mach-O stable-layout cache: verify current output lineage");
-        existing_output_matches_baseline(
+        read_existing_output_baseline(
             args.output(),
             state.output_len,
             &state.output_identity,
             &manifest.signature,
         )
     };
-    if let Some(matches) = existing_output_matches {
-        if !matches {
-            return cache_miss("current output does not match the cached baseline lineage");
-        }
-    }
 
     let current_inputs = {
         timing_phase!("Mach-O stable-layout cache: fingerprint inputs");
@@ -597,45 +605,52 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
         current_object
     };
 
-    // Cargo may retire the old hash-bearing `-o` before invoking the rebuilt link. Read the
-    // cache-owned baseline image instead; publication only pairs it with this manifest after the
-    // ordinary linker's input-identity check has succeeded.
-    let mut output = {
-        timing_phase!("Mach-O stable-layout cache: read and verify baseline image");
-        #[cfg(target_os = "macos")]
-        let output = clone_baseline_image(cache_dir, args).or_else(|| {
-            fs::read(cache_image_path(cache_dir, args))
+    // A present previous output has just completed the same full content-identity validation
+    // required of the cache-owned image. Reuse those owned bytes rather than cloning and hashing
+    // an identical cache image a second time. The cache image remains the safe fallback only for
+    // Cargo's documented case where it retired the previous `-o` before invoking the linker.
+    let mut output = match existing_output {
+        ExistingOutputBaseline::Matched(bytes) => MutableOutput::InMemory(bytes),
+        ExistingOutputBaseline::Mismatch => {
+            return cache_miss("current output does not match the cached baseline lineage");
+        }
+        ExistingOutputBaseline::Absent => {
+            timing_phase!("Mach-O stable-layout cache: read and verify baseline image");
+            #[cfg(target_os = "macos")]
+            let output = clone_baseline_image(cache_dir, args).or_else(|| {
+                fs::read(cache_image_path(cache_dir, args))
+                    .ok()
+                    .map(MutableOutput::InMemory)
+            });
+            #[cfg(not(target_os = "macos"))]
+            let output = fs::read(cache_image_path(cache_dir, args))
                 .ok()
-                .map(MutableOutput::InMemory)
-        });
-        #[cfg(not(target_os = "macos"))]
-        let output = fs::read(cache_image_path(cache_dir, args))
-            .ok()
-            .map(MutableOutput::InMemory);
-        let Some(output) = output else {
-            return cache_miss("owned baseline image is absent");
-        };
-        if output.bytes().len() as u64 != state.output_len
-            || !output_matches_identity(
-                output.bytes(),
-                &manifest.signature,
-                &state.output_identity,
-            )
-        {
-            output.discard();
-            return cache_miss("owned baseline image identity differs");
+                .map(MutableOutput::InMemory);
+            let Some(output) = output else {
+                return cache_miss("owned baseline image is absent");
+            };
+            if output.bytes().len() as u64 != state.output_len
+                || !output_matches_identity(
+                    output.bytes(),
+                    &manifest.signature,
+                    &state.output_identity,
+                )
+            {
+                output.discard();
+                return cache_miss("owned baseline image identity differs");
+            }
+            output
         }
-        if !moved_direct_object_paths_are_unobservable(
-            output.bytes(),
-            args,
-            &current_inputs,
-            &state.inputs,
-            &manifest.cache_approved_moved_direct_objects,
-        ) {
-            output.discard();
-            return cache_miss("a moved direct-object pathname is visible in the baseline image");
-        }
-        output
+    };
+    if !moved_direct_object_paths_are_unobservable(
+        output.bytes(),
+        args,
+        &current_inputs,
+        &state.inputs,
+        &manifest.cache_approved_moved_direct_objects,
+    ) {
+        output.discard();
+        return cache_miss("a moved direct-object pathname is visible in the baseline image");
     };
     let archive_path_patches = {
         timing_phase!("Mach-O stable-layout cache: prepare rustc archive debug paths");
@@ -742,24 +757,28 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
     true
 }
 
-fn existing_output_matches_baseline(
+fn read_existing_output_baseline(
     path: &Path,
     output_len: u64,
     output_identity: &OutputIdentity,
     signature: &SignatureInfo,
-) -> Option<bool> {
+) -> ExistingOutputBaseline {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
         // Cargo can retire the old hash-bearing output before invoking the linker. That is the
         // one absence the owned baseline image is designed to cover; every other I/O error is an
         // unverifiable existing lineage and must fall back to a normal link.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
-        Err(_) => return Some(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return ExistingOutputBaseline::Absent;
+        }
+        Err(_) => return ExistingOutputBaseline::Mismatch,
     };
     if bytes.len() as u64 != output_len {
-        return Some(false);
+        return ExistingOutputBaseline::Mismatch;
     }
-    Some(output_matches_identity(&bytes, signature, output_identity))
+    output_matches_identity(&bytes, signature, output_identity)
+        .then_some(ExistingOutputBaseline::Matched(bytes))
+        .unwrap_or(ExistingOutputBaseline::Mismatch)
 }
 
 fn discard_cache_sidecars(args: &MachOArgs) {
@@ -3609,6 +3628,7 @@ mod tests {
     use super::MAGIC;
     use super::STATE_MAGIC;
     use super::DirectObjectSnapshot;
+    use super::ExistingOutputBaseline;
     use super::InputDigest;
     use super::InputFileMetadata;
     use super::InputRange;
@@ -3625,7 +3645,7 @@ mod tests {
     use super::cache_is_eligible;
     use super::cache_approved_rustc_temporary_archives;
     use super::cache_hit_input_path;
-    use super::existing_output_matches_baseline;
+    use super::read_existing_output_baseline;
     #[cfg(target_os = "macos")]
     use super::clone_file;
     #[cfg(target_os = "macos")]
@@ -3924,7 +3944,7 @@ mod tests {
     }
 
     #[test]
-    fn existing_output_lineage_mismatch_is_rejected() {
+    fn existing_output_baseline_retains_verified_bytes_and_rejects_mismatches() {
         let unique = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
@@ -3951,36 +3971,45 @@ mod tests {
             signature_hashes_digest: identity.signature_hashes_digest,
         };
 
-        assert_eq!(
-            existing_output_matches_baseline(&path, baseline.len() as u64, &identity, &signature),
-            Some(true),
+        let matched = read_existing_output_baseline(
+            &path,
+            baseline.len() as u64,
+            &identity,
+            &signature,
         );
+        assert_eq!(matched, ExistingOutputBaseline::Matched(baseline.clone()));
+        // The retained, authenticated bytes remain a valid patch source even if Cargo removes
+        // the old output before the cache publishes its replacement.
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(matched, ExistingOutputBaseline::Matched(baseline.clone()));
+
+        std::fs::write(&path, &baseline).unwrap();
         assert_eq!(
-            existing_output_matches_baseline(
+            read_existing_output_baseline(
                 &path,
                 baseline.len() as u64 - 1,
                 &identity,
                 &signature,
             ),
-            Some(false),
+            ExistingOutputBaseline::Mismatch,
         );
         assert_eq!(
-            existing_output_matches_baseline(&path, baseline.len() as u64, &wrong_identity, &signature),
-            Some(false),
+            read_existing_output_baseline(&path, baseline.len() as u64, &wrong_identity, &signature),
+            ExistingOutputBaseline::Mismatch,
         );
 
         std::fs::remove_file(&path).unwrap();
         assert_eq!(
-            existing_output_matches_baseline(&path, baseline.len() as u64, &identity, &signature),
-            None,
+            read_existing_output_baseline(&path, baseline.len() as u64, &identity, &signature),
+            ExistingOutputBaseline::Absent,
         );
 
         // Cargo may retire the old output before a relink, but an existing path that cannot be
         // read is not equivalent to that allowed absence: it cannot prove this cache lineage.
         std::fs::create_dir(&path).unwrap();
         assert_eq!(
-            existing_output_matches_baseline(&path, baseline.len() as u64, &identity, &signature),
-            Some(false),
+            read_existing_output_baseline(&path, baseline.len() as u64, &identity, &signature),
+            ExistingOutputBaseline::Mismatch,
         );
         std::fs::remove_dir(&path).unwrap();
     }

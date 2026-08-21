@@ -1520,8 +1520,10 @@ fn run_macho_stable_layout_cache_qualification() -> Result {
     );
     verify_code_signature(&binary)?;
 
-    // Rebuild the other direct object. The second hit must verify the image identity that the
-    // first hit persisted, rather than merely using the normal-link baseline identity.
+    // Cargo is allowed to retire the old `-o` before it invokes the linker. With no authenticated
+    // current output available, the second hit must fall back to the cache-owned image and verify
+    // the identity persisted by the first hit.
+    std::fs::remove_file(&binary)?;
     compile_macho_stable_layout_cache_fixture(&changed_main_source, &main_object)?;
     let second_transcript = link_macho_stable_layout_cache_fixture(
         &binary,
