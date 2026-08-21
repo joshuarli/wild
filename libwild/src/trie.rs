@@ -28,35 +28,6 @@ struct Edge<'data> {
     child_offset_size: usize,
 }
 
-#[derive(Debug, Default)]
-struct UncompressedNode {
-    symbol: Option<usize>,
-    representative: usize,
-    depth: usize,
-    /// Export names are commonly long mangled paths with just one continuation at each byte.
-    /// Keeping that edge inline avoids a separate heap allocation for every such byte while the
-    /// temporary character trie is being compressed into Mach-O's radix representation.
-    children: SmallVec<[usize; 1]>,
-}
-
-/// Count the byte-level nodes before materializing them. Every sorted symbol contributes only the
-/// suffix after its common prefix with its predecessor, plus the root node. This avoids geometric
-/// `Vec` growth temporarily reserving almost twice the full trie for large Rust export sets.
-fn uncompressed_node_count(symbols: &[Symbol<'_>]) -> usize {
-    let mut count = 1;
-    let mut previous_name = &[][..];
-    for symbol in symbols {
-        let common_prefix = previous_name
-            .iter()
-            .zip(symbol.name)
-            .take_while(|(a, b)| a == b)
-            .count();
-        count += symbol.name.len() - common_prefix;
-        previous_name = symbol.name;
-    }
-    count
-}
-
 /// Build a Mach-O exports trie for `symbols`. `symbols` is sorted in place.
 pub(crate) fn build(symbols: &mut [Symbol<'_>]) -> Vec<u8> {
     if symbols.is_empty() {
@@ -90,56 +61,45 @@ struct Builder<'data, 'symbols> {
 
 impl<'data> Builder<'data, '_> {
     fn build_nodes(&mut self) {
-        let mut uncompressed = Vec::with_capacity(uncompressed_node_count(self.symbols));
-        uncompressed.push(UncompressedNode::default());
-        let mut previous_name = &[][..];
-        let mut previous_path = vec![0];
-
-        for (symbol_index, symbol) in self.symbols.iter().enumerate() {
-            let common_prefix = previous_name
-                .iter()
-                .zip(symbol.name)
-                .take_while(|(a, b)| a == b)
-                .count();
-
-            previous_path.truncate(common_prefix + 1);
-            let mut parent = *previous_path.last().unwrap();
-
-            for depth in common_prefix + 1..=symbol.name.len() {
-                let child = uncompressed.len();
-
-                uncompressed.push(UncompressedNode {
-                    representative: symbol_index,
-                    depth,
-                    ..Default::default()
-                });
-
-                uncompressed[parent].children.push(child);
-                previous_path.push(child);
-                parent = child;
-            }
-
-            uncompressed[parent].symbol.replace(symbol_index);
-            previous_name = symbol.name;
-        }
-
-        let mut pending: Vec<(usize, Option<usize>)> = vec![(0, None)];
-        while let Some((uncompressed_index, parent_edge)) = pending.pop() {
-            let source = &uncompressed[uncompressed_index];
+        // Construct radix nodes directly from the sorted symbol-name ranges. The previous
+        // byte-level temporary trie needed one `UncompressedNode` per non-shared input byte;
+        // Wild's self-link has enough long Rust names for that exact temporary allocation alone
+        // to exceed the final binary many times over. A range's first and last spellings bound
+        // the common prefix of every lexically sorted spelling it contains.
+        let mut pending: Vec<(usize, usize, usize, Option<usize>)> =
+            vec![(0, self.symbols.len(), 0, None)];
+        while let Some((start, end, depth, parent_edge)) = pending.pop() {
             let node_index = self.nodes.len();
             if let Some(edge_index) = parent_edge {
                 self.edges[edge_index].child = node_index;
             }
 
-            let (address, flags) = source
-                .symbol
-                .map_or((None, macho::ExportSymbolFlags(0)), |i| {
-                    (Some(self.symbols[i].address), self.symbols[i].flags)
-                });
+            let symbol = (self.symbols[start].name.len() == depth).then_some(start);
+            let (address, flags) = symbol.map_or((None, macho::ExportSymbolFlags(0)), |index| {
+                (Some(self.symbols[index].address), self.symbols[index].flags)
+            });
+            let mut children = SmallVec::<[(usize, usize, usize); 1]>::new();
+            let mut child_start = start + usize::from(symbol.is_some());
+            while child_start < end {
+                let first_name = self.symbols[child_start].name;
+                let byte = first_name[depth];
+                let mut child_end = child_start + 1;
+                while child_end < end && self.symbols[child_end].name[depth] == byte {
+                    child_end += 1;
+                }
+                let child_depth = first_name
+                    .iter()
+                    .zip(self.symbols[child_end - 1].name)
+                    .take_while(|(left, right)| left == right)
+                    .count();
+                debug_assert!(child_depth > depth);
+                children.push((child_start, child_end, child_depth));
+                child_start = child_end;
+            }
 
             let first_edge = self.edges.len();
             debug_assert!(
-                u8::try_from(source.children.len()).is_ok(),
+                u8::try_from(children.len()).is_ok(),
                 "Mach-O exports trie node has too many children"
             );
 
@@ -147,38 +107,26 @@ impl<'data> Builder<'data, '_> {
                 address,
                 flags,
                 first_edge,
-                num_edges: source.children.len(),
+                num_edges: children.len(),
                 ..Default::default()
             });
 
-            for &first_child in &source.children {
-                let mut child = first_child;
-
-                while uncompressed[child].symbol.is_none()
-                    && uncompressed[child].children.len() == 1
-                {
-                    child = uncompressed[child].children[0];
-                }
-
-                let child_node = &uncompressed[child];
-
+            for &(child_start, _, child_depth) in &children {
                 self.edges.push(Edge {
-                    label: &self.symbols[child_node.representative].name
-                        [source.depth..child_node.depth],
+                    label: &self.symbols[child_start].name[depth..child_depth],
                     child: usize::MAX,
                     child_offset_size: 1,
                 });
             }
-            for (edge_offset, &first_child) in source.children.iter().enumerate().rev() {
-                let mut child = first_child;
-
-                while uncompressed[child].symbol.is_none()
-                    && uncompressed[child].children.len() == 1
-                {
-                    child = uncompressed[child].children[0];
-                }
-
-                pending.push((child, Some(first_edge + edge_offset)));
+            for (edge_offset, &(child_start, child_end, child_depth)) in
+                children.iter().enumerate().rev()
+            {
+                pending.push((
+                    child_start,
+                    child_end,
+                    child_depth,
+                    Some(first_edge + edge_offset),
+                ));
             }
         }
     }
@@ -403,30 +351,6 @@ mod tests {
             .collect_vec();
 
         check(&mut symbols);
-    }
-
-    #[test]
-    fn counts_only_new_byte_trie_nodes() {
-        let symbols = [
-            Symbol {
-                name: b"_foo",
-                address: 0,
-                flags: macho::ExportSymbolFlags(0),
-            },
-            Symbol {
-                name: b"_foobar",
-                address: 0,
-                flags: macho::ExportSymbolFlags(0),
-            },
-            Symbol {
-                name: b"_fop",
-                address: 0,
-                flags: macho::ExportSymbolFlags(0),
-            },
-        ];
-
-        // Root plus `_foo`, then the `bar` suffix, then the one differing suffix byte.
-        assert_eq!(uncompressed_node_count(&symbols), 1 + 4 + 3 + 1);
     }
 
     #[test]
