@@ -39,6 +39,24 @@ struct UncompressedNode {
     children: SmallVec<[usize; 1]>,
 }
 
+/// Count the byte-level nodes before materializing them. Every sorted symbol contributes only the
+/// suffix after its common prefix with its predecessor, plus the root node. This avoids geometric
+/// `Vec` growth temporarily reserving almost twice the full trie for large Rust export sets.
+fn uncompressed_node_count(symbols: &[Symbol<'_>]) -> usize {
+    let mut count = 1;
+    let mut previous_name = &[][..];
+    for symbol in symbols {
+        let common_prefix = previous_name
+            .iter()
+            .zip(symbol.name)
+            .take_while(|(a, b)| a == b)
+            .count();
+        count += symbol.name.len() - common_prefix;
+        previous_name = symbol.name;
+    }
+    count
+}
+
 /// Build a Mach-O exports trie for `symbols`. `symbols` is sorted in place.
 pub(crate) fn build(symbols: &mut [Symbol<'_>]) -> Vec<u8> {
     if symbols.is_empty() {
@@ -72,7 +90,8 @@ struct Builder<'data, 'symbols> {
 
 impl<'data> Builder<'data, '_> {
     fn build_nodes(&mut self) {
-        let mut uncompressed = vec![UncompressedNode::default()];
+        let mut uncompressed = Vec::with_capacity(uncompressed_node_count(self.symbols));
+        uncompressed.push(UncompressedNode::default());
         let mut previous_name = &[][..];
         let mut previous_path = vec![0];
 
@@ -384,6 +403,30 @@ mod tests {
             .collect_vec();
 
         check(&mut symbols);
+    }
+
+    #[test]
+    fn counts_only_new_byte_trie_nodes() {
+        let symbols = [
+            Symbol {
+                name: b"_foo",
+                address: 0,
+                flags: macho::ExportSymbolFlags(0),
+            },
+            Symbol {
+                name: b"_foobar",
+                address: 0,
+                flags: macho::ExportSymbolFlags(0),
+            },
+            Symbol {
+                name: b"_fop",
+                address: 0,
+                flags: macho::ExportSymbolFlags(0),
+            },
+        ];
+
+        // Root plus `_foo`, then the `bar` suffix, then the one differing suffix byte.
+        assert_eq!(uncompressed_node_count(&symbols), 1 + 4 + 3 + 1);
     }
 
     #[test]
