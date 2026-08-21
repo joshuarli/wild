@@ -101,8 +101,30 @@ class PiAgentBenchmarkTests(unittest.TestCase):
     def test_comparison_enforces_both_goals(self) -> None:
         runs = [
             {
+                "sample": 0,
                 "linker": "apple-ld64",
                 "cold": {"elapsed_ns": 100},
+                "cold_link": {
+                    "samples": [
+                        {
+                            "elapsed_ns": 40,
+                            "peak_rss_bytes": 120,
+                            "user_cpu_ns": 31,
+                            "system_cpu_ns": 9,
+                            "disk_usage": {
+                                "output": {"apparent_bytes": 80, "allocated_bytes": 96},
+                                "incremental_cache": None,
+                            },
+                            "transient_disk_usage": {
+                                "peak_transient": {
+                                    "apparent_bytes": 8,
+                                    "allocated_bytes": 16,
+                                },
+                                "complete": True,
+                            },
+                        }
+                    ]
+                },
                 "incremental": {"elapsed_ns": 50},
                 "incremental_link": {
                     "samples": [
@@ -127,8 +149,30 @@ class PiAgentBenchmarkTests(unittest.TestCase):
                 },
             },
             {
+                "sample": 0,
                 "linker": "wild",
                 "cold": {"elapsed_ns": 105},
+                "cold_link": {
+                    "samples": [
+                        {
+                            "elapsed_ns": 30,
+                            "peak_rss_bytes": 60,
+                            "user_cpu_ns": 20,
+                            "system_cpu_ns": 5,
+                            "disk_usage": {
+                                "output": {"apparent_bytes": 100, "allocated_bytes": 128},
+                                "incremental_cache": None,
+                            },
+                            "transient_disk_usage": {
+                                "peak_transient": {
+                                    "apparent_bytes": 20,
+                                    "allocated_bytes": 32,
+                                },
+                                "complete": True,
+                            },
+                        }
+                    ]
+                },
                 "incremental": {"elapsed_ns": 25},
                 "incremental_link": {
                     "samples": [
@@ -172,8 +216,17 @@ class PiAgentBenchmarkTests(unittest.TestCase):
         result = BENCHMARK.comparison(runs, workload)
         self.assertTrue(result["goals_met"])
         self.assertEqual(result["cold_wild_over_apple"], 1.05)
+        self.assertEqual(result["cold_link_wild_over_apple"], 0.75)
         self.assertEqual(result["incremental_cargo_wild_over_apple"], 0.5)
         self.assertEqual(result["incremental_link_wild_over_apple"], 0.5)
+        self.assertEqual(result["medians_ns"]["apple-ld64"]["cold_link"], 40)
+        self.assertEqual(result["medians_ns"]["wild"]["cold_link"], 30)
+        self.assertEqual(
+            result["paired_wild_over_apple"]["cold_link"],
+            {"ratios": [{"sample": 0, "wild_over_apple": 0.75}], "median": 0.75},
+        )
+        self.assertEqual(result["cold_link_peak_rss_bytes"], {"apple-ld64": 120, "wild": 60})
+        self.assertEqual(result["cold_link_peak_rss_wild_over_apple"], 0.5)
         self.assertEqual(result["incremental_link_peak_rss_bytes"], {"apple-ld64": 100, "wild": 50})
         self.assertEqual(result["incremental_link_peak_rss_wild_over_apple"], 0.5)
         self.assertEqual(
@@ -211,14 +264,18 @@ class PiAgentBenchmarkTests(unittest.TestCase):
     def test_comparison_aggregates_cache_hit_rate_and_miss_reasons(self) -> None:
         runs = [
             {
+                "sample": 0,
                 "linker": "apple-ld64",
                 "cold": {"elapsed_ns": 100},
+                "cold_link": {"samples": [{"elapsed_ns": 40}]},
                 "incremental": {"elapsed_ns": 50},
                 "incremental_link": {"samples": [{"elapsed_ns": 20}]},
             },
             {
+                "sample": 0,
                 "linker": "wild",
                 "cold": {"elapsed_ns": 100},
+                "cold_link": {"samples": [{"elapsed_ns": 30}]},
                 "incremental": {
                     "elapsed_ns": 50,
                     "cache_setup_misses": [
@@ -263,14 +320,18 @@ class PiAgentBenchmarkTests(unittest.TestCase):
     def test_comparison_does_not_apply_cache_link_goal_to_ineligible_topology(self) -> None:
         runs = [
             {
+                "sample": 0,
                 "linker": "apple-ld64",
                 "cold": {"elapsed_ns": 100},
+                "cold_link": {"samples": [{"elapsed_ns": 40}]},
                 "incremental": {"elapsed_ns": 50},
                 "incremental_link": {"samples": [{"elapsed_ns": 20}]},
             },
             {
+                "sample": 0,
                 "linker": "wild",
                 "cold": {"elapsed_ns": 105},
+                "cold_link": {"samples": [{"elapsed_ns": 30}]},
                 "incremental": {"elapsed_ns": 50},
                 "incremental_link": {"samples": [{"elapsed_ns": 30}]},
             },
@@ -338,6 +399,24 @@ class PiAgentBenchmarkTests(unittest.TestCase):
                 BENCHMARK.stable_layout_cache_miss_evidence(log),
                 ["wild: Mach-O stable-layout cache miss: image state is absent"],
             )
+
+    def test_wild_timing_is_added_only_to_a_direct_wild_replay(self) -> None:
+        command = ["/tmp/linker", "-o", "/tmp/e", "/tmp/e.o"]
+        self.assertEqual(
+            BENCHMARK.with_wild_timing_json(command, BENCHMARK.Linker("apple-ld64", None)),
+            command,
+        )
+        self.assertEqual(
+            BENCHMARK.with_wild_timing_json(command, BENCHMARK.Linker("wild", Path("/tmp/wild"))),
+            [*command, "--time=json"],
+        )
+        environment = BENCHMARK.sanitized_environment(
+            clang=Path("/tmp/clang"),
+            sdk="/tmp/sdk",
+            wild=Path("/tmp/wild"),
+            deployment_target="11.0",
+        )
+        self.assertNotIn("--time=json", environment["RUSTFLAGS"])
 
     def test_macos_time_peak_rss_parser_requires_the_resource_record(self) -> None:
         report = (
@@ -415,7 +494,7 @@ class PiAgentBenchmarkTests(unittest.TestCase):
         """The direct cache image must match Wild's raw output, not Cargo's stripped artifact."""
         baseline_output = Path("/tmp/e-raw-link")
         baseline = {"elapsed_ns": 123}
-        with patch.object(BENCHMARK, "replay_incremental_link", return_value=[baseline]) as replay:
+        with patch.object(BENCHMARK, "replay_final_link", return_value=[baseline]) as replay:
             result = BENCHMARK.establish_cache_direct_baseline(
                 command=["/tmp/wild", "-o", str(baseline_output), "/tmp/e.o"],
                 environment={"RUSTFLAGS": "-C linker=/tmp/clang"},
@@ -454,6 +533,7 @@ class PiAgentBenchmarkTests(unittest.TestCase):
             ]
         )
         self.assertEqual(args.cargo, Path("/opt/homebrew/opt/rustup/bin/cargo"))
+        self.assertEqual(args.repetitions, 5)
 
     def test_macho_header_rejects_wrong_architecture(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

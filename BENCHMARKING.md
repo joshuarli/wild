@@ -21,18 +21,22 @@ For repeatable source-build comparisons, use the standard-library Python runner 
 [`benchmarks/cargo_link_benchmark.py`](benchmarks/cargo_link_benchmark.py) with a checked-in
 workload profile such as [`benchmarks/pi-agent-headless.benchmark.json`](benchmarks/pi-agent-headless.benchmark.json)
 or [`benchmarks/e.benchmark.json`](benchmarks/e.benchmark.json).
-It measures a fresh Cargo target, a Cargo incremental rebuild after a controlled source edit, and
-direct replays of that incremental final-link argv. This separates Rust/LTO rebuild time from the
-incremental linker target. It records Apple-ld64/Wild linker-selection evidence and validates the
-resulting ARM64 Mach-O header, strict `codesign --verify --strict` evidence, and a checked-in
-workload runtime smoke check. Runtime checks execute with all `DYLD_*` environment overrides
-removed; a cache-hit record is emitted only after that artifact passes all three validations. It
-alternates Apple ld64 and Wild by sample to avoid link-order thermal or filesystem-cache bias. The
-runner copies the source checkout to a disposable sibling and never mutates it. Rustc deletes the
-final temporary codegen object after ordinary links, so the unmeasured direct-link capture uses a
-separate disposable `-C save-temps` rebuild. With `--wild-timing-json`, each direct Wild replay's
-matching `--time=json` phase records are retained under `wild_timing_phases` in the result JSON;
-the runner rejects a requested timing capture that emits no records. See
+It measures a fresh Cargo target, a no-cache cold final-link replay, a Cargo incremental rebuild
+after a controlled source edit, and direct replays of that incremental final-link argv. This
+separates Rust/LTO rebuild time from the linker's cold and incremental targets. It records
+Apple-ld64/Wild linker-selection evidence and validates the resulting ARM64 Mach-O header, strict
+`codesign --verify --strict` evidence, and a checked-in workload runtime smoke check. Runtime
+checks execute with all `DYLD_*` environment overrides removed; a cache-hit record is emitted only
+after that artifact passes all three validations. It alternates Apple ld64 and Wild by sample to
+avoid link-order thermal or filesystem-cache bias, and reports every per-sample Wild/Apple ratio
+alongside its median. The runner copies the source checkout to a disposable sibling and never
+mutates it. Rustc deletes the final temporary codegen object after ordinary links, so each
+unmeasured direct-link capture uses a separate disposable `-C save-temps` rebuild. With
+`--wild-timing-json`, only saved direct Wild replays receive `--time=json`; cold and incremental
+Cargo wall-time runs remain command-equivalent between linkers. Matching phase records are retained
+under `wild_timing_phases` in the result JSON, and the runner rejects a requested timing capture
+that emits no records. The separate resource batch records peak RSS, CPU, final-output bytes, cache
+bytes, and observed transient-disk bytes for both cold and incremental direct replays. See
 `python3 benchmarks/cargo_link_benchmark.py --help` for the required result path and opt-in goal
 enforcement. Its default Wild path is `target/release/wild`; do not use the unoptimized `ci`
 profile for a wall-time comparison.
@@ -114,8 +118,9 @@ measurement rather than a fast sample.
 
 Use `--enforce-goals` only in a gating job: it requires Wild's fresh-Cargo wall time to be at most
 1.05× Apple ld64 and Wild's direct changed-source final link to be at most 0.75× Apple ld64. The
-Cargo-incremental ratio remains in the report as context, but does not conflate compiler/LTO work
-with the linker's own target.
+cold no-cache direct-link ratio is reported as the authoritative cold linker comparison, while the
+Cargo-incremental ratio remains context and does not conflate compiler/LTO work with the linker's
+own target.
 
 ### Preparing the "run-with" files
 
