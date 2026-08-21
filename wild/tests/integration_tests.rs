@@ -1431,10 +1431,11 @@ fn run_native_staticlib_consumer(binary: &Path, expected_exit: i32) -> Result {
     Ok(())
 }
 
-/// Covers the one stable-layout-cache expansion that is safe without changing the writer's
-/// section-allocation contract: a linker-private symbol moves within an otherwise equal-sized,
-/// relocation-free direct object. The cache must update the final `n_value`, retain the other
-/// layout, re-sign the executable, and run it without invoking a normal link.
+/// Covers independently validated direct-object patches that preserve the writer's fixed section
+/// allocation: one object changes instruction bytes while another moves a linker-private symbol
+/// within an otherwise equal-sized, relocation-free section. The cache must compose both updates,
+/// update the final `n_value`, retain the other layout, re-sign the executable, and run it
+/// without invoking a normal link.
 #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "macho"))]
 fn collect_macho_stable_layout_cache_qualification(
     tests: &mut Vec<Trial>,
@@ -1470,6 +1471,8 @@ fn run_macho_stable_layout_cache_qualification() -> Result {
     let local_object = output_dir.join("local.o");
     let binary = output_dir.join("stable-layout-cache");
     let cache_dir = output_dir.join("cache");
+    let normal_composed_output_dir = output_dir.join("normal-composed-output");
+    let normal_composed_cache_dir = output_dir.join("normal-composed-cache");
     let normal_output_dir = output_dir.join("normal-output");
     let normal_cache_dir = output_dir.join("normal-cache");
 
@@ -1493,9 +1496,11 @@ fn run_macho_stable_layout_cache_qualification() -> Result {
     let baseline_target = macho_symbol_address(&binary, b"_stable_layout_local_target")?;
     verify_code_signature(&binary)?;
 
-    // The replacement object has the same `__text` length and no relocations, but moves its
-    // linker-private nlist value by one ARM64 instruction. Reusing the old output value would
-    // leave stale symbol metadata despite a bytewise-valid code patch.
+    // Both replacement objects have the same `__text` length and no relocations. The local
+    // object moves its linker-private nlist value by one ARM64 instruction, while the entry
+    // object changes its instruction bytes. The cache must compose independent records rather
+    // than falling back merely because more than one direct object changed.
+    compile_macho_stable_layout_cache_fixture(&changed_main_source, &main_object)?;
     compile_macho_stable_layout_cache_fixture(&moved_local_source, &local_object)?;
     let transcript = link_macho_stable_layout_cache_fixture(
         &binary,
@@ -1507,7 +1512,7 @@ fn run_macho_stable_layout_cache_qualification() -> Result {
     )?;
     ensure!(
         transcript.contains("wild: Mach-O stable-layout cache hit:"),
-        "private-symbol offset rebuild did not take the cache path:\n{transcript}"
+        "two-object rebuild did not take the cache path:\n{transcript}"
     );
     ensure!(
         macho_symbol_address(&binary, b"_main")? == baseline_main,
@@ -1520,11 +1525,30 @@ fn run_macho_stable_layout_cache_qualification() -> Result {
     );
     verify_code_signature(&binary)?;
 
+    // A successful signature and runtime are necessary but insufficient evidence that both raw
+    // patch records composed exactly like the writer. Compare against a normal link before any
+    // subsequent cache hit changes the first composed output.
+    std::fs::create_dir(&normal_composed_output_dir)?;
+    let normal_composed_binary = normal_composed_output_dir.join("stable-layout-cache");
+    link_macho_stable_layout_cache_fixture(
+        &normal_composed_binary,
+        &normal_composed_cache_dir,
+        &sdk,
+        &main_object,
+        &local_object,
+        false,
+    )?;
+    ensure!(
+        std::fs::read(&binary)? == std::fs::read(&normal_composed_binary)?,
+        "composed cache output differs from a normal link with the same basename"
+    );
+
     // Cargo is allowed to retire the old `-o` before it invokes the linker. With no authenticated
     // current output available, the second hit must fall back to the cache-owned image and verify
-    // the identity persisted by the first hit.
+    // the identity persisted by the composed update. Reverting only the entry object also checks
+    // that the image state advances every changed direct-object identity together.
     std::fs::remove_file(&binary)?;
-    compile_macho_stable_layout_cache_fixture(&changed_main_source, &main_object)?;
+    compile_macho_stable_layout_cache_fixture(&main_source, &main_object)?;
     let second_transcript = link_macho_stable_layout_cache_fixture(
         &binary,
         &cache_dir,
@@ -1540,6 +1564,10 @@ fn run_macho_stable_layout_cache_qualification() -> Result {
     ensure!(
         macho_symbol_address(&binary, b"_stable_layout_local_target")? == baseline_target + 4,
         "second cache hit changed the prior local-symbol offset"
+    );
+    ensure!(
+        macho_symbol_address(&binary, b"_main")? == baseline_main,
+        "second cache hit did not restore the entry-object bytes"
     );
     verify_code_signature(&binary)?;
 

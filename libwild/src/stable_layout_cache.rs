@@ -1,13 +1,14 @@
 //! Opt-in persistent stable-layout patches for ARM64 Mach-O executables.
 //!
-//! This is deliberately narrower than a general incremental linker. A cache hit requires one
-//! changed direct `MH_OBJECT` input, unchanged link-visible files and arguments, unchanged object
-//! structure, unchanged relocation source fields, and a cache-owned output image that exactly
-//! matches the cached baseline. Rustc's equal-content temporary `.rlib` copies are the sole path
-//! exception: their directory spelling may change only after every old-path byte is proved to be
-//! a rewritable `N_OSO` debug-map entry. The fast path only changes ranges whose old layout is
-//! therefore still valid, then rebuilds the UUID and ad-hoc signature. Every mismatch is a cache
-//! miss and performs the ordinary link; the cache is never an exact-input output-reuse shortcut.
+//! This is deliberately narrower than a general incremental linker. A cache hit requires a small,
+//! bounded group of changed direct `MH_OBJECT` inputs, unchanged link-visible files and arguments,
+//! unchanged object structure, unchanged relocation source fields, mutually disjoint output patch
+//! ranges, and a cache-owned output image that exactly matches the cached baseline. Rustc's
+//! equal-content temporary `.rlib` copies are the sole path exception: their directory spelling
+//! may change only after every old-path byte is proved to be a rewritable `N_OSO` debug-map entry.
+//! The fast path only changes ranges whose old layout is therefore still valid, then rebuilds the
+//! UUID and ad-hoc signature. Every mismatch is a cache miss and performs the ordinary link; the
+//! cache is never an exact-input output-reuse shortcut.
 
 use crate::args::InputSpec;
 use crate::args::macho::MachOArgs;
@@ -47,6 +48,11 @@ const VERSION: u32 = 10;
 const STATE_VERSION: u32 = 4;
 const HASH_SIZE: usize = 32;
 const MAX_RECORDS: usize = 100_000;
+/// Cache hits may compose a small group of independent direct objects. Bounding both dimensions
+/// keeps an unexpectedly broad rebuild on the normal-link path instead of retaining many mapped
+/// inputs or spending an unbounded amount of time validating their structures.
+const MAX_CHANGED_DIRECT_OBJECTS: usize = 8;
+const MAX_CHANGED_DIRECT_OBJECT_BYTES: usize = 16 * 1024 * 1024;
 const DIAGNOSTICS_ENV: &str = "WILD_MACHO_INCREMENTAL_CACHE_DIAGNOSTICS";
 /// Domains the v5 structural digest away from ordinary byte hashes and older cache layouts.
 const STRUCTURE_DIGEST_DOMAIN: &[u8] = b"wild-macho-stable-layout-structure-v5\0";
@@ -59,8 +65,8 @@ const STATE_CHECKSUM_DOMAIN: &[u8] = b"wild-macho-stable-layout-state-v4\0";
 struct InputDigest {
     path: String,
     digest: [u8; HASH_SIZE],
-    /// The one direct object selected by path/metadata change remains mapped until patching is
-    /// complete. It is intentionally process-local and excluded from manifest identity.
+    /// A changed direct object remains mapped until every selected patch has been validated and
+    /// applied. It is intentionally process-local and excluded from manifest identity.
     direct_object_bytes: Option<DirectObjectSnapshot>,
     /// Filesystem identity captured around the full digest and persisted in the immutable
     /// manifest and mutable image state. Cache hits use it to avoid rehashing unchanged
@@ -183,7 +189,7 @@ struct ProtectedRange {
 struct ObjectRecord {
     /// Position of this direct object in `Manifest::inputs`. Rustc gives rebuilt codegen objects
     /// a new hash-bearing pathname, so this stable positional role is the safe identity across a
-    /// one-object incremental invocation.
+    /// bounded incremental invocation.
     input_index: u32,
     structure_digest: [u8; HASH_SIZE],
     patches: Vec<PatchRange>,
@@ -242,7 +248,7 @@ struct Manifest {
 /// The normal-link publication path still decodes [`Manifest`] into owned records because it
 /// needs its complete input list. On a hit, however, the mutable image state already owns those
 /// input identities. Rebuilding 13k patch records and their protected-relocation byte vectors
-/// merely to inspect one rebuilt object showed up directly in the incremental-link profile.
+/// merely to inspect a selected rebuilt object showed up directly in the incremental-link profile.
 /// This view validates the on-disk shape and yields the selected object's serialized ranges
 /// without allocating patch records; it owns only the small path-approval index list.
 struct ManifestView<'a> {
@@ -266,6 +272,13 @@ struct ObjectRecordView<'a> {
     symbol_value_bytes: &'a [u8],
     protected_bytes: &'a [u8],
     protected_count: usize,
+}
+
+/// A changed direct input paired with its immutable manifest record. Both contracts must hold
+/// independently before their output patches can be composed on a cache-owned image.
+struct ChangedObject<'manifest, 'input> {
+    object: ObjectRecordView<'manifest>,
+    bytes: &'input [u8],
 }
 
 #[derive(Clone)]
@@ -292,7 +305,7 @@ struct ProtectedRangeIter<'a> {
 
 /// Mutable identity for the cache-owned baseline image. Keeping this separate from the immutable
 /// patch topology avoids rewriting tens of thousands of patch records after every cache hit.
-/// It tracks every current input so consecutive one-object changes can affect different direct
+/// It tracks every current input so consecutive bounded direct-object changes can affect different
 /// objects while exact-input invocations still miss.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ImageState {
@@ -419,9 +432,9 @@ fn cache_miss(reason: &str) -> bool {
     false
 }
 
-/// Attempts the one-object stable-layout patch. All errors are intentionally cache misses: the
-/// caller will run the normal linker, which is both the correctness fallback and cache recovery
-/// path for interrupted writers or manually deleted cache data.
+/// Attempts a bounded, independently validated stable-layout patch. All errors are intentionally
+/// cache misses: the caller will run the normal linker, which is both the correctness fallback
+/// and cache recovery path for interrupted writers or manually deleted cache data.
 pub(crate) fn try_apply(args: &MachOArgs) -> bool {
     let hit = try_apply_inner(args);
     if !hit {
@@ -523,7 +536,7 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
         return cache_miss("link-visible input count differs");
     }
     let changed = {
-        timing_phase!("Mach-O stable-layout cache: select changed input");
+        timing_phase!("Mach-O stable-layout cache: select changed inputs");
         current_inputs
             .iter()
             .zip(&state.inputs)
@@ -549,60 +562,95 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
             })
             .collect::<Vec<_>>()
     };
-    let [changed_index] = changed.as_slice() else {
-        // Deliberately do not reuse an output for an exact-input invocation. This cache exists to
-        // patch one changed object, not to turn normal links into output-copy/cache hits.
+    if !changed_object_count_is_supported(changed.len()) {
+        // Deliberately do not reuse an output for an exact-input invocation. The cache patches a
+        // small, bounded group of independently verified direct objects; all other topology goes
+        // through a normal link rather than becoming an output-copy/cache hit.
         return cache_miss(&format!(
-            "input comparison found {} changed inputs (expected one)",
-            changed.len()
-        ));
-    };
-    let changed_input = &current_inputs[*changed_index];
-    let cached_input = &state.inputs[*changed_index];
-    if !is_mach_object_path(&changed_input.path) || !is_mach_object_path(&cached_input.path) {
-        return cache_miss(&format!(
-            "changed input {changed_index} is not a direct Mach-O object: {}",
-            changed_input.path
+            "input comparison found {} changed inputs (expected 1..={MAX_CHANGED_DIRECT_OBJECTS})",
+            changed.len(),
         ));
     }
-    let Ok(changed_input_index) = u32::try_from(*changed_index) else {
-        return cache_miss("changed input index is not representable");
+    let changed_input_indices = changed
+        .iter()
+        .map(|&index| {
+            let changed_input = &current_inputs[index];
+            let cached_input = &state.inputs[index];
+            if !is_mach_object_path(&changed_input.path) || !is_mach_object_path(&cached_input.path) {
+                return Err(cache_miss(&format!(
+                    "changed input {index} is not a direct Mach-O object: {}",
+                    changed_input.path
+                )));
+            }
+            u32::try_from(index).map_err(|_| cache_miss("changed input index is not representable"))
+        })
+        .collect::<Result<Vec<_>, _>>();
+    let Ok(changed_input_indices) = changed_input_indices else {
+        return false;
     };
-    let object = {
-        timing_phase!("Mach-O stable-layout cache: find cached object record");
-        manifest.object_for_input(changed_input_index).ok().flatten()
-    };
-    let Some(object) = object else {
-        return cache_miss("changed object has no cached positional record");
+    let objects = {
+        timing_phase!("Mach-O stable-layout cache: find cached object records");
+        let objects = match changed_input_indices.as_slice() {
+            [input_index] => manifest
+                .object_for_input(*input_index)
+                .ok()
+                .flatten()
+                .map(|object| vec![object]),
+            _ => manifest.objects_for_inputs(&changed_input_indices).ok(),
+        };
+        let Some(objects) = objects else {
+            return cache_miss("a changed object has no cached positional record");
+        };
+        objects
     };
 
-    let current_object = {
-        timing_phase!("Mach-O stable-layout cache: validate changed object snapshot");
-        let Some(current_object) = changed_input
-            .direct_object_bytes
-            .as_ref()
-            .map(DirectObjectSnapshot::bytes)
-        else {
-            return cache_miss("changed direct object snapshot is absent");
-        };
-        // This immutable snapshot is the exact mapping selected by the initial metadata scan.
-        // The metadata recheck below guards against its source pathname being replaced before we
-        // publish its patched output.
-        let structure_matches = {
-            timing_phase!("Mach-O stable-layout cache: compute object structure digest");
-            object.structure_digest == masked_digest_from_iter(current_object, object.structure_masks())
-        };
-        if !structure_matches {
-            return cache_miss("changed object structural digest differs");
+    let changed_objects = {
+        timing_phase!("Mach-O stable-layout cache: validate changed object snapshots");
+        let mut changed_objects = Vec::with_capacity(objects.len());
+        let mut total_object_bytes = 0_usize;
+        for (changed_index, object) in changed.iter().copied().zip(objects) {
+            let changed_input = &current_inputs[changed_index];
+            let Some(current_object) = changed_input
+                .direct_object_bytes
+                .as_ref()
+                .map(DirectObjectSnapshot::bytes)
+            else {
+                return cache_miss("changed direct object snapshot is absent");
+            };
+            let Some(next_total_object_bytes) = total_object_bytes.checked_add(current_object.len()) else {
+                return cache_miss("changed direct object byte count overflows");
+            };
+            if next_total_object_bytes > MAX_CHANGED_DIRECT_OBJECT_BYTES {
+                return cache_miss(&format!(
+                    "changed direct objects total {next_total_object_bytes} bytes (maximum {MAX_CHANGED_DIRECT_OBJECT_BYTES})"
+                ));
+            }
+            total_object_bytes = next_total_object_bytes;
+
+            // This immutable snapshot is the exact mapping selected by the initial metadata scan.
+            // The metadata recheck below guards against its source pathname being replaced before
+            // we publish the composed patched output.
+            let structure_matches = {
+                timing_phase!("Mach-O stable-layout cache: compute object structure digest");
+                object.structure_digest
+                    == masked_digest_from_iter(current_object, object.structure_masks())
+            };
+            if !structure_matches {
+                return cache_miss("changed object structural digest differs");
+            }
+            let relocation_sources_match = {
+                timing_phase!("Mach-O stable-layout cache: validate relocation source");
+                protected_ranges_match_from_iter(current_object, object.protected())
+            };
+            if !relocation_sources_match {
+                return cache_miss("changed object relocation storage differs");
+            }
+            changed_objects.push(ChangedObject {
+                object,
+                bytes: current_object,
+            });
         }
-        let relocation_sources_match = {
-            timing_phase!("Mach-O stable-layout cache: validate relocation source");
-            protected_ranges_match_from_iter(current_object, object.protected())
-        };
-        if !relocation_sources_match {
-            return cache_miss("changed object relocation storage differs");
-        }
-        current_object
+        changed_objects
     };
 
     // A present previous output has just completed the same full content-identity validation
@@ -668,31 +716,98 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
     };
     let output_identity = {
         timing_phase!("Mach-O stable-layout cache: patch and sign");
-        if !apply_output_path_patches(output.bytes_mut(), &archive_path_patches)
-            || !apply_patches_from_iter(output.bytes_mut(), current_object, object.patches())
-            || !apply_symbol_value_patches_from_iter(
-                output.bytes_mut(),
-                current_object,
-                object.symbol_values(),
-            )
-        {
-            output.discard();
-            return cache_miss("patch mapping or signature refresh is not valid");
-        }
-        let Some(output_identity) = refresh_uuid_and_signature(
+        if let [changed] = changed_objects.as_slice() {
+            // Retain the existing one-object hot path. The immutable record already proves that
+            // its raw and symbol-value ranges do not overlap, so sorting them merely to prove a
+            // cross-record invariant would tax the common single-object case.
+            if !apply_output_path_patches(output.bytes_mut(), &archive_path_patches)
+                || !apply_patches_from_iter(
+                    output.bytes_mut(),
+                    changed.bytes,
+                    changed.object.patches(),
+                )
+                || !apply_symbol_value_patches_from_iter(
+                    output.bytes_mut(),
+                    changed.bytes,
+                    changed.object.symbol_values(),
+                )
+            {
+                output.discard();
+                return cache_miss("patch mapping or signature refresh is not valid");
+            }
+            let Some(output_identity) = refresh_uuid_and_signature(
                 output.bytes_mut(),
                 &manifest.signature,
                 args,
-                object
+                changed
+                    .object
                     .patches()
-                    .chain(object.symbol_values().map(SymbolValuePatch::signature_range))
+                    .chain(changed.object.symbol_values().map(SymbolValuePatch::signature_range))
                     .chain(archive_path_patches.iter().map(OutputPathPatch::signature_range)),
             ) else {
-            output.discard();
-            return cache_miss("patch mapping or signature refresh is not valid");
-        };
-        output.invalidate_code_signature_cache();
-        output_identity
+                output.discard();
+                return cache_miss("patch mapping or signature refresh is not valid");
+            };
+            output.invalidate_code_signature_cache();
+            output_identity
+        } else {
+            let changed_output_ranges = changed_objects
+                .iter()
+                .flat_map(|changed| {
+                    changed
+                        .object
+                        .patches()
+                        .chain(changed.object.symbol_values().map(SymbolValuePatch::signature_range))
+                })
+                .chain(archive_path_patches.iter().map(OutputPathPatch::signature_range))
+                .collect::<Vec<_>>();
+            if !output_patch_ranges_are_disjoint(
+                output.bytes().len(),
+                changed_output_ranges.iter().copied(),
+            ) || !output_path_patches_are_applicable(output.bytes(), &archive_path_patches)
+                || !changed_objects.iter().all(|changed| {
+                    patch_ranges_are_applicable(
+                        output.bytes().len(),
+                        changed.bytes,
+                        changed.object.patches(),
+                    ) && symbol_value_patches_are_applicable(
+                        output.bytes(),
+                        changed.bytes,
+                        changed.object.symbol_values(),
+                    )
+                })
+            {
+                output.discard();
+                return cache_miss("patch mapping overlaps or is not valid");
+            }
+            let patch_mapping_applied = {
+                let output_bytes = output.bytes_mut();
+                apply_output_path_patches(output_bytes, &archive_path_patches)
+                    && changed_objects.iter().all(|changed| {
+                        apply_patches_from_iter(output_bytes, changed.bytes, changed.object.patches())
+                            && apply_symbol_value_patches_from_iter(
+                                output_bytes,
+                                changed.bytes,
+                                changed.object.symbol_values(),
+                            )
+                    })
+            };
+            if !patch_mapping_applied {
+                output.discard();
+                return cache_miss("patch mapping or signature refresh is not valid");
+            }
+            let Some(output_identity) = refresh_uuid_and_signature(
+                    output.bytes_mut(),
+                    &manifest.signature,
+                    args,
+                    changed_output_ranges.iter().copied(),
+                ) else {
+                output.discard();
+                return cache_miss("patch mapping or signature refresh is not valid");
+            };
+            output.invalidate_code_signature_cache();
+            output_identity
+        }
     };
 
     // Recheck the filesystem identity captured around the initial full input hash immediately
@@ -755,6 +870,10 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
         args.output().display()
     );
     true
+}
+
+fn changed_object_count_is_supported(count: usize) -> bool {
+    (1..=MAX_CHANGED_DIRECT_OBJECTS).contains(&count)
 }
 
 fn read_existing_output_baseline(
@@ -1130,7 +1249,7 @@ fn input_digests(args: &MachOArgs) -> Option<Vec<InputDigest>> {
         .collect()
 }
 
-/// Fingerprints only a potentially changed direct object. Every path-identical input with
+/// Fingerprints only potentially changed direct objects. Every path-identical input with
 /// unchanged stored metadata reuses its baseline BLAKE3 digest. A baseline image can additionally
 /// approve equal-content Rust temporary archives and moved direct objects only after it proves
 /// their old path is not link-visible; those exceptional inputs are fully hashed before
@@ -1632,9 +1751,9 @@ fn read_hashed_input(path: String) -> Option<InputDigest> {
     })
 }
 
-/// Capture the one direct object selected by path/metadata change without a redundant raw object
-/// digest. Normal-link staging still hashes every input. On a hit, the changed object's complete
-/// mapped bytes are validated against the persisted structural and relocation contracts, then its
+/// Capture a direct object selected by path/metadata change without a redundant raw object digest.
+/// Normal-link staging still hashes every input. On a hit, each changed object's complete mapped
+/// bytes are validated against the persisted structural and relocation contracts, then their
 /// metadata is checked again before publication. This is the same filesystem-change boundary the
 /// normal linker uses, strengthened by the persisted device/inode/ctime snapshot.
 fn read_changed_direct_object(path: String, cached: &InputDigest) -> Option<InputDigest> {
@@ -1763,7 +1882,7 @@ fn object_records(
         .enumerate()
         .filter(|(_, input)| is_mach_object_path(&input.path))
     {
-        // A repeated direct object has no unambiguous one-object role.
+        // A repeated direct object has no unambiguous incremental-cache role.
         if direct_object_indices.contains_key(input.path.as_str()) {
             direct_object_indices.remove(input.path.as_str());
             repeated_direct_object_paths.insert(input.path.as_str());
@@ -2361,6 +2480,120 @@ fn protected_ranges_match_from_iter<'a>(
     })
 }
 
+/// Every source type must own disjoint output bytes before a multi-object hit mutates its private
+/// output image. Individual records already prove their own ranges; this check closes the
+/// cross-record, symbol-value, and rewritten-debug-path gap before patch order could matter.
+fn output_patch_ranges_are_disjoint(
+    output_len: usize,
+    ranges: impl IntoIterator<Item = PatchRange>,
+) -> bool {
+    let mut ranges = ranges.into_iter().collect::<Vec<_>>();
+    ranges.sort_unstable_by_key(|range| range.output_offset);
+    let mut previous_end = 0_usize;
+    ranges.into_iter().all(|range| {
+        let Some(start) = usize::try_from(range.output_offset).ok() else {
+            return false;
+        };
+        let Some(len) = usize::try_from(range.len).ok() else {
+            return false;
+        };
+        let Some(end) = start.checked_add(len) else {
+            return false;
+        };
+        let valid = len != 0 && start >= previous_end && end <= output_len;
+        previous_end = end;
+        valid
+    })
+}
+
+fn patch_ranges_are_applicable(
+    output_len: usize,
+    input: &[u8],
+    mut ranges: impl Iterator<Item = PatchRange>,
+) -> bool {
+    ranges.all(|range| {
+        let Some(input_start) = usize::try_from(range.input_offset).ok() else {
+            return false;
+        };
+        let Some(output_start) = usize::try_from(range.output_offset).ok() else {
+            return false;
+        };
+        let Some(len) = usize::try_from(range.len).ok() else {
+            return false;
+        };
+        let Some(input_end) = input_start.checked_add(len) else {
+            return false;
+        };
+        let Some(output_end) = output_start.checked_add(len) else {
+            return false;
+        };
+        len != 0 && input_end <= input.len() && output_end <= output_len
+    })
+}
+
+fn symbol_value_patches_are_applicable(
+    output: &[u8],
+    input: &[u8],
+    mut patches: impl Iterator<Item = SymbolValuePatch>,
+) -> bool {
+    patches.all(|patch| {
+        let Some(input_offset) = usize::try_from(patch.input_value_offset).ok() else {
+            return false;
+        };
+        let Some(output_offset) = usize::try_from(patch.output_value_offset).ok() else {
+            return false;
+        };
+        let Some(input_end) = input_offset.checked_add(size_of::<u64>()) else {
+            return false;
+        };
+        let Some(output_end) = output_offset.checked_add(size_of::<u64>()) else {
+            return false;
+        };
+        let Some(input_value) = input
+            .get(input_offset..input_end)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u64::from_le_bytes)
+        else {
+            return false;
+        };
+        let Some(current_output) = output
+            .get(output_offset..output_end)
+            .and_then(|bytes| bytes.try_into().ok())
+            .map(u64::from_le_bytes)
+        else {
+            return false;
+        };
+        let Some(input_section_offset) = input_value.checked_sub(patch.input_section_address)
+        else {
+            return false;
+        };
+        input_section_offset < patch.input_section_size
+            && current_output == patch.baseline_value
+            && patch
+                .output_section_address
+                .checked_add(input_section_offset)
+                .is_some()
+    })
+}
+
+fn output_path_patches_are_applicable(output: &[u8], patches: &[OutputPathPatch]) -> bool {
+    let mut previous_end = 0_usize;
+    patches.iter().all(|patch| {
+        if patch.expected.len() != patch.replacement.len() || patch.expected.is_empty() {
+            return false;
+        }
+        let Some(start) = usize::try_from(patch.output_offset).ok() else {
+            return false;
+        };
+        let Some(end) = start.checked_add(patch.expected.len()) else {
+            return false;
+        };
+        let valid = start >= previous_end && output.get(start..end) == Some(patch.expected.as_slice());
+        previous_end = end;
+        valid
+    })
+}
+
 #[cfg(test)]
 fn apply_patches(output: &mut [u8], input: &[u8], ranges: &[PatchRange]) -> bool {
     apply_patches_from_iter(output, input, ranges.iter().copied())
@@ -2458,24 +2691,15 @@ fn apply_symbol_value_patches_from_iter(
 }
 
 fn apply_output_path_patches(output: &mut [u8], patches: &[OutputPathPatch]) -> bool {
-    let mut previous_end = 0usize;
-    patches.iter().all(|patch| {
-        if patch.expected.len() != patch.replacement.len() {
-            return false;
-        }
-        let Some(start) = usize::try_from(patch.output_offset).ok() else {
-            return false;
-        };
-        let Some(end) = start.checked_add(patch.expected.len()) else {
-            return false;
-        };
-        if start < previous_end || output.get(start..end) != Some(patch.expected.as_slice()) {
-            return false;
-        }
+    if !output_path_patches_are_applicable(output, patches) {
+        return false;
+    }
+    for patch in patches {
+        let start = usize::try_from(patch.output_offset).unwrap();
+        let end = start.checked_add(patch.expected.len()).unwrap();
         output[start..end].copy_from_slice(&patch.replacement);
-        previous_end = end;
-        true
-    })
+    }
+    true
 }
 
 fn signature_info(layout: &Layout<'_, MachO>, output: &[u8]) -> Option<SignatureInfo> {
@@ -2648,7 +2872,7 @@ fn refresh_uuid_and_signature(
     // clear the previous UUID as well as the code hashes so the replacement is byte-identical
     // to a normal link of the same changed inputs.
     // Every cache-owned baseline image is identity-verified before use, so these are the valid
-    // hash slots for all code pages before this one-object patch. Keep them while zeroing the
+    // hash slots for all code pages before these object patches. Keep them while zeroing the
     // slots for the UUID's whole-output hash, then recompute only pages changed by the patch and
     // the UUID itself. This preserves byte-for-byte normal-link signing without rehashing static
     // Rust archive pages on every cache hit.
@@ -3200,9 +3424,9 @@ impl<'a> ManifestView<'a> {
             read_cache_approved_rustc_temporary_archives(&mut reader, input_count)?;
         let object_count = reader.count()?;
         let object_records_start = reader.offset;
-        // The checksum above covers every record. On a hit, only the object selected from
-        // `ImageState::inputs` can affect the patch, so decode and validate that record on
-        // demand rather than walking every unrelated object first.
+        // The checksum above covers every record. On a hit, only the selected objects from
+        // `ImageState::inputs` can affect the patch, so decode and validate their records on
+        // demand rather than rebuilding owned records for every unrelated object.
         Ok(Self {
             arguments_digest,
             checksum,
@@ -3228,6 +3452,47 @@ impl<'a> ManifestView<'a> {
         }
         anyhow::ensure!(reader.offset == self.object_records.len(), "truncated object record list");
         Ok(None)
+    }
+
+    /// Decodes every selected record in one linear scan. The usual one-object hit keeps the
+    /// historical early-exit lookup above; composing several objects must also reject duplicate
+    /// input records and requires the records in input order for deterministic patching.
+    fn objects_for_inputs(
+        &self,
+        input_indices: &[u32],
+    ) -> anyhow::Result<Vec<ObjectRecordView<'a>>> {
+        anyhow::ensure!(
+            !input_indices.is_empty() && input_indices.windows(2).all(|pair| pair[0] < pair[1]),
+            "changed input indices are not strictly ordered"
+        );
+        let mut reader = Reader {
+            bytes: self.object_records,
+            offset: 0,
+        };
+        let mut objects = Vec::with_capacity(input_indices.len());
+        for _ in 0..self.object_count {
+            let object = ObjectRecordView::decode(&mut reader)?;
+            if input_indices.binary_search(&object.input_index).is_ok() {
+                anyhow::ensure!(
+                    !objects.iter().any(|previous: &ObjectRecordView<'_>| {
+                        previous.input_index == object.input_index
+                    }),
+                    "cache contains duplicate direct-object records"
+                );
+                objects.push(object);
+            }
+        }
+        anyhow::ensure!(reader.offset == self.object_records.len(), "truncated object record list");
+        objects.sort_unstable_by_key(|object| object.input_index);
+        anyhow::ensure!(
+            objects.len() == input_indices.len()
+                && objects
+                    .iter()
+                    .map(|object| object.input_index)
+                    .eq(input_indices.iter().copied()),
+            "changed object has no cached positional record"
+        );
+        Ok(objects)
     }
 }
 
@@ -4271,6 +4536,60 @@ mod tests {
         let mut output = *b"0123456789";
         assert!(apply_patches(&mut output, &changed_object, &patches));
         assert_eq!(&output[5..8], b"cde");
+    }
+
+    #[test]
+    fn output_patch_ranges_reject_cross_record_overlap_before_patching() {
+        assert!(!super::changed_object_count_is_supported(0));
+        assert!(super::changed_object_count_is_supported(1));
+        assert!(super::changed_object_count_is_supported(
+            super::MAX_CHANGED_DIRECT_OBJECTS
+        ));
+        assert!(!super::changed_object_count_is_supported(
+            super::MAX_CHANGED_DIRECT_OBJECTS + 1
+        ));
+
+        let raw_object_patch = PatchRange {
+            input_offset: 4,
+            output_offset: 8,
+            len: 4,
+        };
+        let linker_private_symbol_patch = SymbolValuePatch {
+            input_value_offset: 0,
+            input_section_address: 0,
+            input_section_size: 8,
+            output_value_offset: 24,
+            output_section_address: 0x1_0000_0000,
+            baseline_value: 0x1_0000_0000,
+        }
+        .signature_range();
+        let rewritten_debug_path = PatchRange {
+            input_offset: 0,
+            output_offset: 40,
+            len: 6,
+        };
+        assert!(super::output_patch_ranges_are_disjoint(
+            64,
+            [raw_object_patch, linker_private_symbol_patch, rewritten_debug_path]
+        ));
+
+        let overlapping_second_object = PatchRange {
+            input_offset: 12,
+            output_offset: 10,
+            len: 4,
+        };
+        assert!(!super::output_patch_ranges_are_disjoint(
+            64,
+            [raw_object_patch, overlapping_second_object]
+        ));
+        assert!(!super::output_patch_ranges_are_disjoint(
+            64,
+            [PatchRange {
+                input_offset: 0,
+                output_offset: 63,
+                len: 2,
+            }]
+        ));
     }
 
     #[test]
