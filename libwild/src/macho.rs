@@ -1272,6 +1272,17 @@ impl<'data> File<'data> {
         self.symbol_name(self.symbol(symbol_index)?)
     }
 
+    /// Whether this input has a synthetic Objective-C selector-dispatch symbol. The string table
+    /// is the only place such a symbol can occur, so checking it avoids faulting unrelated object
+    /// sections before selector relocation processing.
+    fn has_objc_message_symbol(&self) -> bool {
+        self.symbols.iter().any(|symbol| {
+            symbol
+                .name(LE, self.symbols.strings())
+                .is_ok_and(|name| objc_message_selector(name).is_some())
+        })
+    }
+
     fn dylib_metadata(&self) -> Option<DylibMetadata<'data>> {
         match self.kind {
             ObjectKind::Regular(_) => None,
@@ -4746,10 +4757,10 @@ fn is_dynamic_library(file: &SequencedInput<MachO>) -> bool {
 fn objc_message_references_for_object<'data>(
     object: &layout::ObjectLayoutState<'data, MachO>,
 ) -> Result<Vec<(ObjcMessageSymbol, &'data [u8], ObjcMessageSymbol)>> {
-    // `raw_symbol_name` borrows the input's Mach-O string table, so an object without this byte
-    // sequence cannot contain a synthetic selector-send symbol. Avoid walking every live
-    // relocation in the overwhelmingly common non-Objective-C case.
-    if memchr::memmem::find(object.object.data, b"_objc_msgSend$").is_none() {
+    // A synthetic selector-send is necessarily an input symbol. Avoid faulting every section of
+    // the overwhelmingly common non-Objective-C case just to rule it out before walking live
+    // relocations.
+    if !object.object.has_objc_message_symbol() {
         return Ok(Vec::new());
     }
 
