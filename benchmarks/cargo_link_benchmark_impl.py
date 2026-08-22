@@ -44,7 +44,13 @@ from typing import Callable
 
 
 SCHEMA_VERSION = "cargo-link-build-benchmark/v3"
-DIRECT_CAPTURE_SCHEMA_VERSION = "cargo-incremental-direct-capture/v1"
+# v2 retains one paired `-C save-temps` baseline beside the changed direct command.  The pair is
+# necessary to evaluate a persistent linker cache: mixing a normal baseline with a save-temps
+# changed build changes Cargo's Rustflags fingerprint and is not a valid incremental topology.
+DIRECT_CAPTURE_SCHEMA_VERSION = "cargo-incremental-direct-capture/v2"
+DIRECT_CAPTURE_COMPATIBLE_SCHEMA_VERSIONS = frozenset(
+    {"cargo-incremental-direct-capture/v1", DIRECT_CAPTURE_SCHEMA_VERSION}
+)
 MACHO_64_MAGIC = 0xFEEDFACF
 CPU_TYPE_ARM64 = 0x0100000C
 MH_EXECUTE = 2
@@ -1140,12 +1146,13 @@ def capture_incremental_direct_inputs(
     toolchain: dict[str, str],
     keep_failed_capture: bool = False,
 ) -> dict[str, Any]:
-    """Creates one reusable, verified changed-source direct-link capture.
+    """Creates a reusable, verified baseline-to-changed direct-link capture.
 
     This is intentionally not a Cargo timing measurement. It performs the minimum baseline,
-    changed-source, and `save-temps` builds necessary to retain one exact final linker input set
-    for fast candidate screening. The capture owns its workspace and target tree until its caller
-    explicitly deletes `capture_root`.
+    changed-source builds necessary to retain exact final linker input sets for fast candidate
+    screening and persistent-cache experiments. Both builds use the same `-C save-temps` flag so
+    their Cargo artifact topology is comparable. The capture owns its workspace and target tree
+    until its caller explicitly deletes `capture_root`.
     """
     capture_root = require_benchmark_cache_path(capture_root)
     if capture_root.exists():
@@ -1169,37 +1176,6 @@ def capture_incremental_direct_inputs(
         before_hash = hashlib.sha256(before).hexdigest()
         baseline_log = logs_dir / "baseline.log"
         incremental_log = logs_dir / "incremental.log"
-        capture_log = logs_dir / "incremental-direct-capture.log"
-        run_cargo_build(
-            command,
-            workspace=workspace,
-            environment=environment,
-            target_dir=target_dir,
-            log_path=baseline_log,
-        )
-        mutation_before, mutation_after = mutate_incremental_source(mutation_path, workload.mutation)
-        assert mutation_before == before_hash
-        run_cargo_build(
-            command,
-            workspace=workspace,
-            environment=environment,
-            target_dir=target_dir,
-            log_path=incremental_log,
-        )
-        incremental_output = primary_artifact_path(target_dir, workload, incremental_log, linker)
-        incremental_artifact = validate_artifact(
-            incremental_output,
-            workload.macho_file_type,
-            workload.runtime,
-            cwd=workspace,
-            environment=environment,
-        )
-        incremental_selection = linker_selection_evidence(incremental_log, linker)
-
-        capture_before, capture_after = append_capture_marker(
-            mutation_path, b"\n// wild benchmark reusable direct capture marker\n"
-        )
-        assert capture_before == mutation_after
         capture_environment = dict(environment)
         capture_environment["RUSTFLAGS"] = (
             capture_environment.get("RUSTFLAGS", "") + " -C save-temps"
@@ -1209,22 +1185,48 @@ def capture_incremental_direct_inputs(
             workspace=workspace,
             environment=capture_environment,
             target_dir=target_dir,
-            log_path=capture_log,
+            log_path=baseline_log,
         )
-        capture_output = primary_artifact_path(target_dir, workload, capture_log, linker)
-        direct_command = final_link_command(capture_log, linker, output=capture_output)
-        capture_artifact = validate_artifact(
-            capture_output,
+        baseline_output = primary_artifact_path(target_dir, workload, baseline_log, linker)
+        baseline_command = final_link_command(baseline_log, linker, output=baseline_output)
+        baseline_artifact = validate_artifact(
+            baseline_output,
             workload.macho_file_type,
             workload.runtime,
             cwd=workspace,
             environment=capture_environment,
         )
+        baseline_input_records = direct_capture_input_records(baseline_command)
+        baseline_selection = linker_selection_evidence(baseline_log, linker)
+
+        mutation_before, mutation_after = mutate_incremental_source(mutation_path, workload.mutation)
+        assert mutation_before == before_hash
+        run_cargo_build(
+            command,
+            workspace=workspace,
+            environment=capture_environment,
+            target_dir=target_dir,
+            log_path=incremental_log,
+        )
+        incremental_output = primary_artifact_path(target_dir, workload, incremental_log, linker)
+        direct_command = final_link_command(incremental_log, linker, output=incremental_output)
+        changed_artifact = validate_artifact(
+            incremental_output,
+            workload.macho_file_type,
+            workload.runtime,
+            cwd=workspace,
+            environment=capture_environment,
+        )
+        incremental_selection = linker_selection_evidence(incremental_log, linker)
         input_records = direct_capture_input_records(direct_command)
         restored_hash = restore_source(mutation_path, before, before_hash)
-        if any(Path(record["path"]).is_relative_to(temporary_directory) for record in input_records):
+        captured_records = [*baseline_input_records, *input_records]
+        if any(
+            Path(record["path"]).is_relative_to(temporary_directory) for record in captured_records
+        ):
             raise RuntimeError("Direct capture depends on a compiler temporary outside its target tree")
         shutil.rmtree(temporary_directory)
+        verify_direct_capture_input_records(baseline_input_records)
         verify_direct_capture_input_records(input_records)
         manifest = {
             "schema_version": DIRECT_CAPTURE_SCHEMA_VERSION,
@@ -1247,18 +1249,23 @@ def capture_incremental_direct_inputs(
             "capture": {
                 "workspace": str(workspace),
                 "target_dir": str(target_dir),
+                "baseline": {
+                    "direct_command": baseline_command,
+                    "direct_output": str(baseline_output),
+                    "input_records": baseline_input_records,
+                    "selection_evidence": baseline_selection,
+                    "artifact": baseline_artifact,
+                },
                 "direct_command": direct_command,
-                "direct_output": str(capture_output),
+                "direct_output": str(incremental_output),
                 "input_records": input_records,
                 "incremental_selection_evidence": incremental_selection,
-                "incremental_artifact": incremental_artifact,
-                "capture_artifact": capture_artifact,
+                "incremental_artifact": changed_artifact,
                 "mutation": {
                     "before_sha256": mutation_before,
                     "after_sha256": mutation_after,
-                    "capture_before_sha256": capture_before,
-                    "capture_after_sha256": capture_after,
                     "restored_sha256": restored_hash,
+                    "uses_rustc_save_temps": True,
                 },
                 "environment": {
                     key: environment[key]

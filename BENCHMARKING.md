@@ -134,6 +134,14 @@ LLVM-internal symbol disambiguators and relocation-table bytes, so the cache's f
 contract correctly falls back to a normal incremental link. Its benchmark therefore measures the
 ordinary Cargo incremental path against ld64.
 
+The macOS incremental-link objective is more demanding than that normal-path qualification:
+on a matched baseline-to-changed Cargo topology, a persistent-cache candidate must produce a
+verified hit on every replay and have a median direct-link time at most `0.333×` Apple ld64's
+unchanged changed-link control. Five interleaved replays rank candidates; an 11-replay confirmation
+is required before promotion. The normal Cargo profile remains a `1.0×` parity gate until that cache
+contract can prove its broader Rust symbol and relocation churn safe. Never relabel a normal-link
+result as progress toward the cache target.
+
 Each workload's `incremental_mutation` is an exact append or exact one-occurrence replacement.
 Prefer a same-size replacement that changes a real emitted byte over a comment-only edit. For a
 stable-layout linker fast path, prefer a fixed-width code immediate rather than a string literal:
@@ -149,13 +157,19 @@ stripping, 16 codegen units, and no LTO. This intentionally keeps Rust compilati
 enough that the ordinary changed-source final link remains visible. The profile is ineligible for
 the stable-layout cache because its changed codegen unit legitimately changes the internal
 symbol/relocation structure; this workflow measures the normal incremental path.
+Its paired direct capture is nevertheless the primary research control for extending the cache
+safely: it preserves the exact same `save-temps` compiler flags for baseline and changed objects,
+rather than comparing two incompatible Cargo target fingerprints.
 
 The Cargo checkout pins `nightly-2026-07-24` because it has no `rust-toolchain.toml`. Apple samples
 omit all Wild arguments and therefore select vanilla Xcode ld64. Every Wild sample is required to
 retain ARM64 header evidence, strict `codesign` evidence, the Cargo `--version` runtime smoke check,
 and the direct-link RSS measurement. Its qualification goals are explicitly the normal incremental
 Cargo median and the incremental direct-link median, each at or below `1.0×` Wild/ld64. Cold Cargo
-time is recorded as context only and cannot fail this Cargo-focused profile.
+time is recorded as context only and cannot fail this Cargo-focused profile. The separate hard
+target is a `100%` verified cache-hit rate and a direct-link median at or below `0.333×` Apple ld64
+on the matched paired-capture cache screen; cold builds and unrelated compile throughput do not
+participate in that decision.
 
 ### One authoritative qualification run
 
@@ -247,15 +261,37 @@ python3 benchmarks/cargo_direct_screen.py \
   --output "$cache_root/benchmarks/cargo-direct-screen-$(date +%F).json"
 ```
 
-The capture performs the three required Cargo builds once and retains its copied workspace and
-target tree so its direct inputs remain valid; it can therefore be substantial. A failed partial
-capture is removed by default; `--keep-failed-capture` is the explicit diagnostic escape hatch.
+The capture performs exactly two unmeasured Cargo builds: a baseline and its one-source-change
+successor, both with `-C save-temps`. It retains both immutable direct commands and input records
+in the same manifest, so persistent-cache work never compares artifacts generated with different
+Rustflags fingerprints. The ordinary direct screen continues to use the changed command. The
+capture retains its copied workspace and target tree so those direct inputs remain valid; it can
+therefore be substantial. A failed partial capture is removed by default;
+`--keep-failed-capture` is the explicit diagnostic escape hatch.
 The screen removes disposable output artifacts on either success or failure unless
 `--keep-artifacts` is supplied, leaving its JSON result on success. After selecting a winner or
 invalidating the input revision, remove that exact `"$capture_root"` directory. Do not run two
 screens concurrently on the same Mac; instead, build and test variants in parallel, then put all
 surviving candidates in one round-robin screen with the shared Apple control. Use separate
 machines only when each has its own capture and Apple controls.
+
+For persistent-cache work, pass `--stable-layout-cache` to the same direct screen. It requires a
+v2 paired capture, rebuilds each candidate's baseline once with `-incremental_cache`, snapshots the
+baseline image and sidecars, restores them before every changed replay, and rejects a sample unless
+Wild reports a cache hit. This setup and restoration are deliberately outside the timed link.
+
+```sh
+python3 benchmarks/cargo_direct_screen.py \
+  --capture "$capture_root/manifest.json" \
+  --candidate cache-candidate="$cargo_target/aarch64-apple-darwin/dist/wild" \
+  --stable-layout-cache \
+  --repetitions 5 \
+  --output "$cache_root/benchmarks/cargo-direct-cache-screen-$(date +%F).json"
+```
+
+Use this cache mode only for a topology whose current cache implementation can prove safe. A
+structural miss is useful evidence for the next implementation change, but it is not a timed result
+and leaves no retained replay artifacts by default.
 
 The latest phase profile identifies input opening, layout, and output writing as the largest visible
 Wild direct-link phases. They are the first targets for a reusable-capture screen; do not repeatedly

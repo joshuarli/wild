@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import importlib.util
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -121,6 +122,159 @@ class CargoLinkBenchmarkTests(unittest.TestCase):
 
             self.assertFalse(capture_root.exists())
 
+    def test_direct_capture_keeps_a_matched_save_temps_baseline_and_changed_pair(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cache_root = root / "cache" / "wild"
+            source = root / "source"
+            source_file = source / "src" / "main.rs"
+            source_file.parent.mkdir(parents=True)
+            original_source = b"fn main() {}\n"
+            source_file.write_bytes(original_source)
+            (source / "Cargo.toml").write_text("[package]\nname = 'fixture'\n")
+            capture_root = cache_root / "captures" / "paired"
+            workload = BENCHMARK.Workload(
+                name="fixture",
+                target="aarch64-apple-darwin",
+                profile="release",
+                cargo_arguments=("--bin", "fixture"),
+                artifact="{target}/{profile}/fixture",
+                macho_file_type=2,
+                mutation=BENCHMARK.SourceMutation(
+                    path="src/main.rs", append=b"// incremental edit\n"
+                ),
+                cold_max=None,
+                incremental_max=None,
+                deployment_target="11.0",
+                runtime=None,
+            )
+            build_environments: list[dict[str, str]] = []
+
+            def fake_build(
+                command: list[str],
+                *,
+                workspace: Path,
+                environment: dict[str, str],
+                target_dir: Path,
+                log_path: Path,
+            ) -> tuple[int, int]:
+                del command, workspace
+                build_environments.append(dict(environment))
+                target_dir.mkdir(parents=True, exist_ok=True)
+                (target_dir / "output").write_bytes(b"executable")
+                input_name = "baseline.o" if log_path.name == "baseline.log" else "changed.o"
+                (target_dir / input_name).write_bytes(input_name.encode("utf-8"))
+                log_path.write_text(input_name)
+                return 0, 1
+
+            def fake_final_link(
+                log_path: Path,
+                linker: BENCHMARK.Linker,
+                *,
+                output: Path | None = None,
+                cargo_artifact: Path | None = None,
+            ) -> list[str]:
+                del linker, cargo_artifact
+                assert output is not None
+                input_name = log_path.read_text()
+                return ["/usr/bin/ld", "-o", str(output), str(output.parent / input_name)]
+
+            with (
+                patch.object(BENCHMARK, "default_benchmark_cache_root", return_value=cache_root),
+                patch.object(BENCHMARK, "run_cargo_build", side_effect=fake_build),
+                patch.object(
+                    BENCHMARK,
+                    "primary_artifact_path",
+                    side_effect=lambda target_dir, workload, log_path, linker: target_dir / "output",
+                ),
+                patch.object(BENCHMARK, "final_link_command", side_effect=fake_final_link),
+                patch.object(
+                    BENCHMARK,
+                    "validate_artifact",
+                    side_effect=lambda path, *_args, **_kwargs: {"path": str(path)},
+                ),
+                patch.object(
+                    BENCHMARK,
+                    "linker_selection_evidence",
+                    side_effect=lambda log_path, linker: [f"selected {log_path.name}"],
+                ),
+            ):
+                manifest = BENCHMARK.capture_incremental_direct_inputs(
+                    source=source,
+                    capture_root=capture_root,
+                    command=["cargo"],
+                    workload=workload,
+                    environment={"PATH": "/bin"},
+                    linker=BENCHMARK.Linker("apple-ld64", None),
+                    source_revision="revision",
+                    cargo_lock_sha256="lock",
+                    toolchain={"channel": "nightly"},
+                )
+
+            self.assertEqual(len(build_environments), 2)
+            self.assertEqual(
+                [environment["RUSTFLAGS"] for environment in build_environments],
+                ["-C save-temps", "-C save-temps"],
+            )
+            capture = manifest["capture"]
+            self.assertEqual(manifest["schema_version"], BENCHMARK.DIRECT_CAPTURE_SCHEMA_VERSION)
+            self.assertEqual(capture["baseline"]["direct_command"][-1].split("/")[-1], "baseline.o")
+            self.assertEqual(capture["direct_command"][-1].split("/")[-1], "changed.o")
+            self.assertTrue(capture["mutation"]["uses_rustc_save_temps"])
+            self.assertEqual(source_file.read_bytes(), original_source)
+            self.assertFalse((capture_root / "tmp").exists())
+            self.assertFalse((capture_root / "logs").exists())
+
+    def test_direct_screen_accepts_legacy_capture_and_requires_a_paired_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            workspace = root / "workspace"
+            workspace.mkdir()
+            baseline_input = root / "baseline.o"
+            changed_input = root / "changed.o"
+            baseline_input.write_bytes(b"baseline")
+            changed_input.write_bytes(b"changed")
+            baseline_output = root / "baseline-output"
+            changed_output = root / "changed-output"
+            baseline_command = ["/usr/bin/ld", "-o", str(baseline_output), str(baseline_input)]
+            changed_command = ["/usr/bin/ld", "-o", str(changed_output), str(changed_input)]
+            capture = {
+                "workspace": str(workspace),
+                "target_dir": str(root / "target"),
+                "direct_command": changed_command,
+                "direct_output": str(changed_output),
+                "input_records": BENCHMARK.direct_capture_input_records(changed_command),
+                "environment": {},
+            }
+            manifest = {
+                "schema_version": BENCHMARK.DIRECT_CAPTURE_SCHEMA_VERSION,
+                "source": {},
+                "workload": {"macho_file_type": 2, "runtime": None},
+                "capture": capture,
+            }
+            path = root / "manifest.json"
+            path.write_text(json.dumps(manifest))
+
+            with self.assertRaisesRegex(ValueError, "missing its baseline"):
+                SCREEN.load_capture(path)
+
+            capture["baseline"] = {
+                "direct_command": baseline_command,
+                "direct_output": str(baseline_output),
+                "input_records": BENCHMARK.direct_capture_input_records(baseline_command),
+            }
+            path.write_text(json.dumps(manifest))
+            paired = SCREEN.load_capture(path)[0]
+            self.assertEqual(SCREEN.paired_baseline(paired)[0], baseline_command)
+            self.assertEqual(SCREEN.load_capture(path)[1], changed_command)
+
+            manifest["schema_version"] = "cargo-incremental-direct-capture/v1"
+            del capture["baseline"]
+            path.write_text(json.dumps(manifest))
+            self.assertEqual(SCREEN.load_capture(path)[1], changed_command)
+            with self.assertRaisesRegex(ValueError, "requires a v2"):
+                SCREEN.paired_baseline(SCREEN.load_capture(path)[0])
+
     def test_parse_toolchain_channel(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "rust-toolchain.toml"
@@ -191,6 +345,18 @@ class CargoLinkBenchmarkTests(unittest.TestCase):
             SCREEN.parse_candidate_environment("groups-96=PATH=/bin")
         with self.assertRaisesRegex(argparse.ArgumentTypeError, "long linker"):
             SCREEN.parse_candidate_argument("threads-8=-threads=8")
+        arguments = SCREEN.parse_args(
+            [
+                "--capture",
+                "/tmp/capture.json",
+                "--candidate",
+                "current=/tmp/wild",
+                "--output",
+                "/tmp/result.json",
+                "--stable-layout-cache",
+            ]
+        )
+        self.assertTrue(arguments.stable_layout_cache)
 
     def test_linker_selection_accepts_xcode_response_file_diagnostic(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
