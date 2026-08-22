@@ -97,7 +97,6 @@ use std::num::NonZeroU64;
 use std::ops::Range;
 use std::slice::Iter;
 use std::sync::atomic::Ordering;
-use std::sync::Mutex;
 use std::sync::OnceLock;
 
 use gimli::Reader as _;
@@ -1521,18 +1520,17 @@ struct RegularObject<'data> {
 /// Builds one immutable parse-time index at most once, while preserving linker diagnostics from
 /// the fallible build. Archive members are parsed before symbol resolution knows which of them
 /// will become live, so computing their dead-strip indexes eagerly adds work for every rejected
-/// member. The mutex is used only by the first builder; the steady state is `OnceLock::get`.
+/// member. `OnceLock::get_or_try_init` retries a fallible initializer without allocating a
+/// separate mutex for every deferred archive index.
 #[derive(Debug)]
 struct DeferredIndex<T> {
     value: OnceLock<T>,
-    initializing: Mutex<()>,
 }
 
 impl<T> Default for DeferredIndex<T> {
     fn default() -> Self {
         Self {
             value: OnceLock::new(),
-            initializing: Mutex::new(()),
         }
     }
 }
@@ -1544,26 +1542,7 @@ impl<T> DeferredIndex<T> {
     }
 
     fn get_or_try_init(&self, initialize: impl FnOnce() -> Result<T>) -> Result<&T> {
-        if let Some(value) = self.value.get() {
-            return Ok(value);
-        }
-
-        let _initializing = self
-            .initializing
-            .lock()
-            .expect("dead-strip index initialization mutex was poisoned");
-        if let Some(value) = self.value.get() {
-            return Ok(value);
-        }
-        let value = initialize()?;
-        match self.value.set(value) {
-            Ok(()) => {}
-            Err(_) => unreachable!("dead-strip index was initialized while its mutex was held"),
-        }
-        Ok(self
-            .value
-            .get()
-            .expect("dead-strip index was initialized before being returned"))
+        self.value.get_or_try_init(initialize)
     }
 }
 
@@ -1600,7 +1579,6 @@ impl AtomStarts {
                     }
                     DeferredIndex {
                         value,
-                        initializing: Mutex::new(()),
                     }
                 })
                 .collect::<Vec<_>>()

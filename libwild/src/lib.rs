@@ -1,3 +1,5 @@
+#![feature(once_cell_try)]
+
 pub(crate) mod alignment;
 pub use args::Args;
 pub(crate) mod arch;
