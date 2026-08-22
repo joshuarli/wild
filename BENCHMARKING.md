@@ -104,7 +104,9 @@ symbol/relocation structure; this workflow measures the normal incremental path.
 The Cargo checkout pins `nightly-2026-07-24` because it has no `rust-toolchain.toml`. Apple samples
 omit all Wild arguments and therefore select vanilla Xcode ld64. Every Wild sample is required to
 retain ARM64 header evidence, strict `codesign` evidence, the Cargo `--version` runtime smoke check,
-and the direct-link RSS measurement.
+and the direct-link RSS measurement. Its qualification goals are explicitly the normal incremental
+Cargo median and the incremental direct-link median, each at or below `1.0×` Wild/ld64. Cold Cargo
+time is recorded as context only and cannot fail this Cargo-focused profile.
 
 ### One authoritative qualification run
 
@@ -131,7 +133,8 @@ python3 benchmarks/cargo_link_benchmark.py \
   --link-repetitions 5 \
   --resource-link-repetitions 1 \
   --wild-timing-json \
-  --output "$cache_root/benchmarks/cargo-qualified-$(date +%F).json"
+  --output "$cache_root/benchmarks/cargo-qualified-$(date +%F).json" \
+  --enforce-goals
 ```
 
 The successful runner keeps only this JSON result by default. It contains selected Wild phase

@@ -108,8 +108,10 @@ class Workload:
     artifact: str
     macho_file_type: int
     mutation: SourceMutation
-    cold_max: float
-    incremental_max: float
+    # These are legacy cache-qualification thresholds. A normal Cargo workload can omit both and
+    # use the explicit incremental Cargo/direct-link thresholds below instead.
+    cold_max: float | None
+    incremental_max: float | None
     deployment_target: str
     runtime: RuntimeCheck | None
     artifacts: tuple[ArtifactSpec, ...] = ()
@@ -119,6 +121,11 @@ class Workload:
     # Workloads outside this repository (for example rust-lang/cargo) can pin the toolchain in
     # their profile when they do not carry a rust-toolchain.toml file.
     toolchain: str | None = None
+    # Normal incremental qualification does not depend on stable-layout cache eligibility: a
+    # changed object can make that cache inapplicable while the ordinary linker path remains the
+    # benchmark target.
+    incremental_cargo_max: float | None = None
+    incremental_link_max: float | None = None
 
 
 def load_workload(path: Path) -> Workload:
@@ -235,6 +242,11 @@ def load_workload(path: Path) -> Workload:
             )
             runtime_check = artifact_specs[0].runtime
         primary = artifact_specs[0]
+
+        def optional_goal(name: str) -> float | None:
+            value = goals.get(name)
+            return float(value) if value is not None else None
+
         workload = Workload(
             name=str(raw["name"]),
             target=(str(raw["target"]) if raw.get("target") is not None else None),
@@ -243,13 +255,15 @@ def load_workload(path: Path) -> Workload:
             artifact=primary.path,
             macho_file_type=primary.macho_file_type,
             mutation=source_mutation,
-            cold_max=float(goals["cold_wild_over_apple_max"]),
-            incremental_max=float(goals["incremental_wild_over_apple_max"]),
+            cold_max=optional_goal("cold_wild_over_apple_max"),
+            incremental_max=optional_goal("incremental_wild_over_apple_max"),
             deployment_target=str(raw.get("deployment_target", "11.0")),
             runtime=runtime_check,
             artifacts=artifact_specs,
             stable_layout_cache_eligible=cache_eligible,
             toolchain=configured_toolchain,
+            incremental_cargo_max=optional_goal("incremental_cargo_wild_over_apple_max"),
+            incremental_link_max=optional_goal("incremental_link_wild_over_apple_max"),
         )
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError(f"Invalid workload {path}: {error}") from error
@@ -259,6 +273,13 @@ def load_workload(path: Path) -> Workload:
         raise ValueError(f"Workload {path} has an empty target; omit target for the host")
     if workload.toolchain == "":
         raise ValueError(f"Workload {path} has an empty toolchain")
+    if (
+        workload.cold_max is None
+        and workload.incremental_max is None
+        and workload.incremental_cargo_max is None
+        and workload.incremental_link_max is None
+    ):
+        raise ValueError(f"Workload {path} needs at least one performance goal")
     return workload
 
 
@@ -2001,6 +2022,15 @@ def comparison(runs: list[dict[str, Any]], workload: Workload) -> dict[str, Any]
     for miss in cache_misses:
         reason = miss.removeprefix(STABLE_LAYOUT_CACHE_MISS_PREFIX).strip()
         miss_reasons[reason] = miss_reasons.get(reason, 0) + 1
+    goal_checks = []
+    if workload.cold_max is not None:
+        goal_checks.append(cold_ratio <= workload.cold_max)
+    if workload.stable_layout_cache_eligible and workload.incremental_max is not None:
+        goal_checks.append(incremental_link_ratio <= workload.incremental_max)
+    if workload.incremental_cargo_max is not None:
+        goal_checks.append(cargo_incremental_ratio <= workload.incremental_cargo_max)
+    if workload.incremental_link_max is not None:
+        goal_checks.append(incremental_link_ratio <= workload.incremental_link_max)
     return {
         "medians_ns": medians,
         "cold_wild_over_apple": cold_ratio,
@@ -2037,6 +2067,8 @@ def comparison(runs: list[dict[str, Any]], workload: Workload) -> dict[str, Any]
             "incremental_max": (
                 workload.incremental_max if workload.stable_layout_cache_eligible else None
             ),
+            "incremental_cargo_max": workload.incremental_cargo_max,
+            "incremental_link_max": workload.incremental_link_max,
         },
         "stable_layout_cache_eligible": workload.stable_layout_cache_eligible,
         "cache": {
@@ -2045,11 +2077,7 @@ def comparison(runs: list[dict[str, Any]], workload: Workload) -> dict[str, Any]
             "hit_rate": len(cache_hits) / cache_events if cache_events else None,
             "miss_reasons": miss_reasons,
         },
-        "goals_met": cold_ratio <= workload.cold_max
-        and (
-            not workload.stable_layout_cache_eligible
-            or incremental_link_ratio <= workload.incremental_max
-        ),
+        "goals_met": all(goal_checks),
     }
 
 

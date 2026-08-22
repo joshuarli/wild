@@ -19,7 +19,7 @@
     "stdout_contains": "cargo "
   },
   "goals": {
-    "cold_wild_over_apple_max": 0.95,
-    "incremental_wild_over_apple_max": 0.70
+    "incremental_cargo_wild_over_apple_max": 1.0,
+    "incremental_link_wild_over_apple_max": 1.0
   }
 }

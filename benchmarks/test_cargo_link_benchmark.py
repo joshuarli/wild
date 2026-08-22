@@ -226,6 +226,35 @@ class CargoLinkBenchmarkTests(unittest.TestCase):
             self.assertEqual(workload.cargo_arguments, ("--bin", "other"))
             self.assertEqual(workload.incremental_max, 0.5)
 
+    def test_load_workload_allows_incremental_only_normal_link_goals(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "workload.json"
+            path.write_text(
+                """{
+                  "schema_version": "cargo-link-workload/v1",
+                  "name": "normal-incremental",
+                  "target": "aarch64-apple-darwin",
+                  "profile": "release",
+                  "cargo_arguments": ["--bin", "normal"],
+                  "artifact": "{target}/{profile}/normal",
+                  "macho_file_type": 2,
+                  "incremental_mutation": {"path": "src/main.rs", "append": "\\n// marker\\n"},
+                  "runtime": {"arguments": ["--version"], "stdout_contains": "normal "},
+                  "stable_layout_cache_eligible": false,
+                  "goals": {
+                    "incremental_cargo_wild_over_apple_max": 1.0,
+                    "incremental_link_wild_over_apple_max": 1.0
+                  }
+                }"""
+            )
+
+            workload = BENCHMARK.load_workload(path)
+
+        self.assertIsNone(workload.cold_max)
+        self.assertIsNone(workload.incremental_max)
+        self.assertEqual(workload.incremental_cargo_max, 1.0)
+        self.assertEqual(workload.incremental_link_max, 1.0)
+
     def test_load_workload_can_pin_toolchain_without_a_source_toolchain_file(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "workload.json"
@@ -554,6 +583,53 @@ class CargoLinkBenchmarkTests(unittest.TestCase):
         self.assertEqual(result["incremental_link_wild_over_apple"], 1.5)
         self.assertIsNone(result["thresholds"]["incremental_max"])
         self.assertTrue(result["goals_met"])
+
+    def test_comparison_applies_explicit_normal_incremental_goals(self) -> None:
+        runs = [
+            {
+                "sample": 0,
+                "linker": "apple-ld64",
+                "cold": {"elapsed_ns": 100},
+                "cold_link": {"samples": [{"elapsed_ns": 40}]},
+                "incremental": {"elapsed_ns": 100},
+                "incremental_link": {"samples": [{"elapsed_ns": 20}]},
+            },
+            {
+                "sample": 0,
+                "linker": "wild",
+                "cold": {"elapsed_ns": 160},
+                "cold_link": {"samples": [{"elapsed_ns": 30}]},
+                "incremental": {"elapsed_ns": 101},
+                "incremental_link": {"samples": [{"elapsed_ns": 19}]},
+            },
+        ]
+        workload = BENCHMARK.Workload(
+            name="normal-incremental",
+            target="aarch64-apple-darwin",
+            profile="release",
+            cargo_arguments=("--bin", "normal"),
+            artifact="{target}/{profile}/normal",
+            macho_file_type=BENCHMARK.MH_EXECUTE,
+            mutation=BENCHMARK.SourceMutation(path="src/main.rs", append=b"\n// test\n"),
+            cold_max=None,
+            incremental_max=None,
+            deployment_target="11.0",
+            runtime=BENCHMARK.RuntimeCheck(arguments=(), output_mode="exit"),
+            stable_layout_cache_eligible=False,
+            incremental_cargo_max=1.0,
+            incremental_link_max=1.0,
+        )
+
+        result = BENCHMARK.comparison(runs, workload)
+
+        self.assertEqual(result["thresholds"]["incremental_cargo_max"], 1.0)
+        self.assertEqual(result["thresholds"]["incremental_link_max"], 1.0)
+        self.assertFalse(result["goals_met"])
+
+        runs[1]["incremental"]["elapsed_ns"] = 99
+        runs[1]["incremental_link"]["samples"][0]["elapsed_ns"] = 21
+
+        self.assertFalse(BENCHMARK.comparison(runs, workload)["goals_met"])
 
     def test_extracts_shell_quoted_final_linker_child(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
