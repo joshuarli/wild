@@ -64,7 +64,7 @@ pub(crate) const WRITE_VERIFY_ALLOCATIONS_ENV: &str = "WILD_VERIFY_ALLOCATIONS";
 /// A Cargo final link has hundreds of independent archive inputs, so it can amortize a wider
 /// Rayon pool than a short link. Keep the smaller pool for short Apple-Silicon links, whose
 /// scheduling cost otherwise dominates. Explicit `--threads` and jobserver limits retain their
-/// callers' requested parallelism.
+/// callers' requested parallelism, except for Cargo's zero-spare-token final-link case below.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const MACOS_AARCH64_AUTOMATIC_THREAD_LIMIT: NonZeroUsize = NonZeroUsize::new(8).unwrap();
 
@@ -433,8 +433,13 @@ impl CommonArgs {
                     tokens.push(acquired);
                 }
                 tracing::trace!(count = tokens.len(), "Acquired jobserver tokens");
-                // Our parent "holds" one jobserver token, add it.
-                NonZeroUsize::new(tokens.len() + 1).unwrap()
+                thread_count_from_jobserver(
+                    tokens.len(),
+                    env::var("CARGO_MAKEFLAGS").is_ok(),
+                    std::thread::available_parallelism()
+                        .unwrap_or(NonZeroUsize::new(1).unwrap()),
+                    self.inputs.len(),
+                )
             } else {
                 automatic_thread_count(
                     std::thread::available_parallelism().unwrap_or(NonZeroUsize::new(1).unwrap()),
@@ -560,6 +565,33 @@ fn automatic_thread_count(available_threads: NonZeroUsize, input_count: usize) -
         let _ = input_count;
         available_threads
     }
+}
+
+/// Converts nested-jobserver capacity into a Rayon pool size.
+///
+/// Cargo gives each `rustc` process its own implicit jobserver token, but its final linker child
+/// normally cannot acquire another one. On a large macOS ARM64 final link, treating that zero
+/// spare-token result as a one-thread limit makes the link much slower than ld64. Cargo's jobserver
+/// still constrains compiler processes; use the regular automatic linker pool for only this exact
+/// large-link case. Explicit `--threads`, non-Cargo jobservers, and Cargo invocations with one or
+/// more spare tokens continue to honour the jobserver count.
+fn thread_count_from_jobserver(
+    acquired_tokens: usize,
+    is_cargo_jobserver: bool,
+    host_parallelism: NonZeroUsize,
+    input_count: usize,
+) -> NonZeroUsize {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if is_cargo_jobserver
+        && acquired_tokens == 0
+        && input_count >= MACOS_AARCH64_LARGE_LINK_MIN_INPUTS
+    {
+        return automatic_thread_count(host_parallelism, input_count);
+    }
+
+    let _ = (is_cargo_jobserver, host_parallelism, input_count);
+    // Our parent holds one token, so each acquired token provides one additional worker.
+    NonZeroUsize::new(acquired_tokens + 1).unwrap()
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -1748,6 +1780,28 @@ mod tests {
         assert_eq!(
             automatic_thread_count(NonZeroUsize::new(2).unwrap(), 256).get(),
             2
+        );
+    }
+
+    #[test]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn cargo_zero_spare_jobserver_tokens_use_large_link_automatic_pool() {
+        let host_parallelism = NonZeroUsize::new(10).unwrap();
+        assert_eq!(
+            thread_count_from_jobserver(0, true, host_parallelism, 256),
+            NonZeroUsize::new(10).unwrap()
+        );
+        assert_eq!(
+            thread_count_from_jobserver(0, true, host_parallelism, 255),
+            NonZeroUsize::new(1).unwrap()
+        );
+        assert_eq!(
+            thread_count_from_jobserver(0, false, host_parallelism, 256),
+            NonZeroUsize::new(1).unwrap()
+        );
+        assert_eq!(
+            thread_count_from_jobserver(1, true, host_parallelism, 256),
+            NonZeroUsize::new(2).unwrap()
         );
     }
 }
