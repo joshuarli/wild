@@ -150,6 +150,7 @@ expensive for tuning. Treat it as a signoff gate, not an experiment loop. The no
 | Candidate queue | Give every source idea or option setting a stable ID, a hypothesis, a focused test, and a separate cache root. Build and test the candidates before any timing. | Safe to parallelize, subject to a disk budget. Source worktrees and `CARGO_TARGET_DIR`s go under `~/.cache/wild/variants/<id>/`; they must never share a target directory. | Discard failed or contract-changing candidates before they reach the timer. |
 | Capture one immutable changed link | Build Cargo once, apply the workload mutation, and retain the changed final-link argv, inputs, output contract, and checksums. | Serialized once per Cargo revision/toolchain under `~/.cache/wild/captures/<id>`. The verified capture is read-only. | The capture passes ARM64 header, strict codesign, and runtime validation before reuse. |
 | One batched direct screen | Put every surviving binary/configuration in one `cargo_direct_screen.py` command. It replays the immutable input with a short interleaved series and `--time=json` for Wild. | Compilation and analysis may run in parallel; same-host timing stays serial and round-robin with one Apple control. Do not run concurrent screens on the same host. Separate machines require their own capture, Apple control, and result file. | Promote only a repeatable direct-link win with no correctness or RSS regression. A batch without a clear winner gets a diagnostic/profile pass, not another full Cargo benchmark. |
+| Diagnostic attribution | Use the saved replay once to find the slow critical-path phase or thread imbalance before proposing the next structural change. This is a profiler run, never a timing result or promotion gate. | Keep any instrumented build and trace in `~/.cache/wild/variants/<id>/`, inspect the summary, then delete that exact variant root. Do not collect repeated traces to choose between sub-millisecond changes. | The next candidate names the measured phase or hot path it is meant to reduce. |
 | Full qualification | Run the command above once for the selected candidate. | Serialized; this is the sole source for Cargo-incremental and final direct-link claims. | Both requested median ratios are ≤1.0 with validation and RSS evidence. |
 
 This produces useful parallelism without corrupting measurements: expensive candidate compilation,
@@ -537,20 +538,28 @@ view for a saved Cargo replay before collecting a Perfetto trace or a sampled pr
 The `--time` flag only shows the course stages of the linker. To see what each thread is doing
 during each stage, we can capture a perfetto trace and view the results in the perfetto UI.
 
-Start by building with the `perfetto` feature enabled:
+Use Perfetto only after the bounded `--time=json` phase report cannot identify the next
+structural target. Build an instrumented binary in its own disposable cache root, then remove
+that root after inspection:
 
 ```sh
-cargo build --release --features perfetto
+profile_root="$HOME/.cache/wild/variants/perfetto-diagnostic"
+CARGO_TARGET_DIR="$profile_root/target" \
+  cargo build --profile dist --features perfetto
 ```
 
-Run the linker with `WILD_PERFETTO_OUT` set to some file. e.g.:
+Run one replay with `WILD_PERFETTO_OUT` set inside that root. e.g.:
 
 ```sh
-WILD_PERFETTO_OUT=$HOME/.cache/wild/profiles/wild.pftrace ./run-with wild
+WILD_PERFETTO_OUT="$profile_root/wild.pftrace" ./run-with "$profile_root/target/dist/wild"
 ```
 
-Open the [perfetto UI](https://ui.perfetto.dev/). Click "Open trace file" and select `tmp.pftrace`.
+Open the [perfetto UI](https://ui.perfetto.dev/). Click "Open trace file" and select `wild.pftrace`.
 Use the keys w, a, s, d to navigate (scroll and zoom).
+
+The trace records wall time across workers, so use it to find a bottleneck or imbalance, not to
+compare candidate speed. Delete the exact `"$profile_root"` directory after extracting that
+diagnosis; the ordinary direct screen remains the only timing authority.
 
 ### Samply
 
