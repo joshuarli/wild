@@ -128,18 +128,18 @@ cache sidecars nor use the cache-link target as a gate. The proc-macro dylib pro
 because the cache only supports executables. The native/C++ profile remains eligible: it changes a
 live fixed-width Rust data value while retaining the native static archive, so it verifies that an
 unchanged static archive does not block a safe cache baseline.
-The Cargo linker-stress profile is currently ineligible: changing a Rust codegen unit also changes
-LLVM-internal symbol disambiguators and relocation-table bytes, so the cache's fail-closed structural
-contract correctly falls back to a normal incremental link. Its benchmark therefore measures the
-ordinary Cargo incremental path against ld64.
+The Cargo linker-stress profile is eligible for the deliberately narrow Rustc-private extension:
+it accepts only terminal `.llvm.<decimal>` discriminator churn on private definitions and their
+undefined references, plus a reordering of otherwise identical relocation groups. Every ordinary
+symbol, section footprint, relocation payload, patch range, output nlist slot, code-signature page,
+and runtime check remains bound. Other Rust codegen changes remain a normal-link cache miss.
 
 The macOS incremental-link objective is more demanding than a normal-path comparison:
 on a matched baseline-to-changed Cargo topology, a persistent-cache candidate must produce a
 verified hit on every replay and have a median direct-link time at most `0.333×` Apple ld64's
 unchanged changed-link control. Five interleaved replays rank candidates; an 11-replay confirmation
-is required before promotion. The normal Cargo profile is a diagnostic fallback until the cache
-contract can prove its broader Rust symbol and relocation churn safe. Never relabel a normal-link
-result as progress toward the cache target.
+is required before promotion. A normal-link result is diagnostic context only; never relabel it as
+progress toward the cache target.
 
 Each workload's `incremental_mutation` is an exact append or exact one-occurrence replacement.
 Prefer a same-size replacement that changes a real emitted byte over a comment-only edit. For a
@@ -153,12 +153,10 @@ The active macOS optimization target is `~/d/cargo`, using
 [`benchmarks/cargo.benchmark.json`](benchmarks/cargo.benchmark.json). It changes one live Cargo
 source expression and builds the `linker-stress` profile: `opt-level = 3`, aborting panics,
 stripping, 16 codegen units, and no LTO. This intentionally keeps Rust compilation inexpensive
-enough that the ordinary changed-source final link remains visible. The profile is ineligible for
-the stable-layout cache because its changed codegen unit legitimately changes the internal
-symbol/relocation structure; this workflow measures the normal incremental path.
-Its paired direct capture is nevertheless the primary research control for extending the cache
-safely: it preserves the exact same `save-temps` compiler flags for baseline and changed objects,
-rather than comparing two incompatible Cargo target fingerprints.
+enough that the final link remains visible. Its paired direct capture is the primary cache control:
+it preserves the exact same `save-temps` compiler flags for baseline and changed objects, rather
+than comparing two incompatible Cargo target fingerprints. The persistent-cache result is the only
+promotion metric; the changed-source Cargo wall time is context only.
 
 The Cargo checkout pins `nightly-2026-07-24` because it has no `rust-toolchain.toml`. Apple samples
 omit all Wild arguments and therefore select vanilla Xcode ld64. Every Wild sample is required to
@@ -167,6 +165,31 @@ and the direct-link RSS measurement. The hard target is a `100%` verified cache-
 direct-link median at or below `0.333×` Apple ld64 on the matched paired-capture cache screen; cold
 builds, unrelated compile throughput, and an ordinary cache miss do not participate in that
 decision.
+
+### Full-image cache ceiling and the next architecture
+
+The verified Rustc-private cache hit measured `90.7 ms` against `171.5 ms` for Apple ld64
+(`0.529×`) on the paired Cargo capture. Its internal phase is `52.7 ms`: materializing the `29 MB`
+cache image costs about `24 ms`, publishing the fresh executable about `6 ms`, and replacing the
+next persistent sidecar about `8 ms`. `--no-fork` reaches only `89.1 ms` (`0.519×`). These are
+output-image transfers, not linker-layout work, so more thread or scheduling sweeps are not a
+credible route to the `≤0.333×` target.
+
+The next implementation is a per-cache-root, short-lived resident image service. The linker client
+must validate arguments and changed-object contracts exactly as today, then send the bounded patch
+set to a same-user Unix-socket service which keeps the current signed image and mutable input state
+resident. The service applies patches, rehashes only touched code-signature pages, atomically
+publishes the requested output, and acknowledges only after the existing header/codesign/runtime
+checks can succeed. It may persist its sidecars asynchronously; service loss is a cache miss and
+normal link, never stale output reuse. Different cache roots may run in parallel; requests for one
+root are serialized. Qualification requires a five-replay screen at `≤0.333×` followed by eleven
+interleaved confirmations, with the daemon warm-up and any restart recovery outside the timed
+replay.
+
+Goal prompt: make macOS ARM64 Wild incremental linking at least `3×` faster than Apple ld64 on the
+paired Cargo direct replay—`≤0.333×` median, `100%` verified cache hits, strict `codesign`, runtime
+smoke, bounded disk under `~/.cache/wild`, and no cold-build metric—by eliminating full executable
+materialization from the hot path while preserving fail-closed cache validation.
 
 ### One authoritative qualification run
 
