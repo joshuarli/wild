@@ -70,10 +70,9 @@ For repeatable source-build comparisons, use the standard-library Python runner 
 performance work uses only [`benchmarks/cargo.benchmark.json`](benchmarks/cargo.benchmark.json)
 against `~/d/cargo`; the checked-in `e` profiles are retained qualification fixtures, not routine
 iteration targets.
-It measures a fresh Cargo target, a Cargo incremental rebuild after a controlled source edit, and
-direct replays of that incremental final-link argv. Profiles with a cold Cargo goal additionally
-capture and replay the cold final link. This separates Rust/LTO rebuild time from the linker's cold
-and incremental targets. It records
+It establishes a Cargo baseline, applies one controlled source edit, and replays that incremental
+final-link argv directly. Cold Cargo or direct-link measurements are context-only when a legacy
+profile still records them; they are not a promotion target for the current macOS work. It records
 Apple-ld64/Wild linker-selection evidence and validates the resulting ARM64 Mach-O header, strict
 `codesign --verify --strict` evidence, and a checked-in workload runtime smoke check. Runtime
 checks execute with all `DYLD_*` environment overrides removed; a cache-hit record is emitted only
@@ -134,11 +133,11 @@ LLVM-internal symbol disambiguators and relocation-table bytes, so the cache's f
 contract correctly falls back to a normal incremental link. Its benchmark therefore measures the
 ordinary Cargo incremental path against ld64.
 
-The macOS incremental-link objective is more demanding than that normal-path qualification:
+The macOS incremental-link objective is more demanding than a normal-path comparison:
 on a matched baseline-to-changed Cargo topology, a persistent-cache candidate must produce a
 verified hit on every replay and have a median direct-link time at most `0.333×` Apple ld64's
 unchanged changed-link control. Five interleaved replays rank candidates; an 11-replay confirmation
-is required before promotion. The normal Cargo profile remains a `1.0×` parity gate until that cache
+is required before promotion. The normal Cargo profile is a diagnostic fallback until the cache
 contract can prove its broader Rust symbol and relocation churn safe. Never relabel a normal-link
 result as progress toward the cache target.
 
@@ -164,12 +163,10 @@ rather than comparing two incompatible Cargo target fingerprints.
 The Cargo checkout pins `nightly-2026-07-24` because it has no `rust-toolchain.toml`. Apple samples
 omit all Wild arguments and therefore select vanilla Xcode ld64. Every Wild sample is required to
 retain ARM64 header evidence, strict `codesign` evidence, the Cargo `--version` runtime smoke check,
-and the direct-link RSS measurement. Its qualification goals are explicitly the normal incremental
-Cargo median and the incremental direct-link median, each at or below `1.0×` Wild/ld64. Cold Cargo
-time is recorded as context only and cannot fail this Cargo-focused profile. The separate hard
-target is a `100%` verified cache-hit rate and a direct-link median at or below `0.333×` Apple ld64
-on the matched paired-capture cache screen; cold builds and unrelated compile throughput do not
-participate in that decision.
+and the direct-link RSS measurement. The hard target is a `100%` verified cache-hit rate and a
+direct-link median at or below `0.333×` Apple ld64 on the matched paired-capture cache screen; cold
+builds, unrelated compile throughput, and an ordinary cache miss do not participate in that
+decision.
 
 ### One authoritative qualification run
 

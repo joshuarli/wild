@@ -17,7 +17,6 @@
     "output": "exit"
   },
   "goals": {
-    "cold_wild_over_apple_max": 0.95,
-    "incremental_wild_over_apple_max": 0.70
+    "incremental_wild_over_apple_max": 0.333
   }
 }
