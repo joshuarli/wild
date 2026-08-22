@@ -159,6 +159,12 @@ hypothesis, direct-screen ratio, and disposition). It prevents rerunning Cargo m
 a non-winning scheduling tweak. Cap concurrent builds by available disk, and delete the exact
 `~/.cache/wild/variants/<id>` root as soon as that candidate is rejected.
 
+Treat an individual result JSON as a paired experiment, not an absolute stopwatch. CPU frequency,
+thermal state, and filesystem cache state can move raw medians substantially between screens. A
+candidate therefore must appear in the same round-robin screen as the accepted baseline; do not
+promote it by comparing medians from separate reports. Use five interleaved repetitions to rank a
+batch, then run one 11-repetition baseline-versus-winner confirmation before the full Cargo gate.
+
 `benchmarks/cargo_direct_capture.py` and `benchmarks/cargo_direct_screen.py` implement the capture
 and direct-screen stages. A capture records the clean Cargo revision, toolchain, complete direct
 command, every existing file argument's checksum, and the validated output contract. A screen
