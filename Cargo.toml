@@ -160,7 +160,11 @@ zerocopy = { version = "0.8.27", default-features = false, features = [
 zstd = { version = "0.13.0", default-features = false }
 
 [profile.release]
+opt-level = 3
+lto = "fat"
 codegen-units = 1
+panic = "abort"
+strip = true
 
 [profile.release-debug]
 inherits = "release"

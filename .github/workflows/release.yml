@@ -30,8 +30,6 @@ jobs:
         include:
           - runner: macos-26
             target: aarch64-apple-darwin
-            # Mach-O releases do not need ELF linker plugins or zstd debug-section compression.
-            # Keep fork enabled to preserve the normal process-isolation behavior.
             cargo_flags: --no-default-features --features fork
           - runner: ubuntu-latest
             target: x86_64-unknown-linux-gnu
@@ -42,15 +40,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+      - uses: laputa-systems/setup-rust@a7d09bfe692e431e6a98cd107ac2df77d47b5bba
 
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.runner }}-${{ matrix.target }}
-
-      - name: Build dist
-        run: >-
-          cargo build --locked --profile dist -p wild-linker --bin wild
-          --target "${{ matrix.target }}" ${{ matrix.cargo_flags }}
+      - name: Build release
+        run: cargo build --locked --profile dist -p wild-linker --bin wild --target "${{ matrix.target }}" ${{ matrix.cargo_flags }}
 
       - name: Package binary
         run: cp "target/${{ matrix.target }}/dist/wild" "wild-${{ matrix.target }}"
@@ -74,20 +67,10 @@ jobs:
           pattern: wild-*
           path: dist
           merge-multiple: true
-
       - name: Zip artifacts
-        run: |
-          for f in dist/*; do
-            zip -9 --junk-paths "$f.zip" "$f"
-          done
-
+        run: for f in dist/*; do zip -9 --junk-paths "$f.zip" "$f"; done
       - name: Create pre-release
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: release-${{ github.sha }}
-        run: >-
-          gh release create "$RELEASE_TAG" dist/*.zip
-          --repo "$GITHUB_REPOSITORY"
-          --prerelease
-          --target "$GITHUB_SHA"
-          --title "$RELEASE_TAG"
+        run: gh release create "$RELEASE_TAG" dist/*.zip --repo "$GITHUB_REPOSITORY" --prerelease --target "$GITHUB_SHA" --title "$RELEASE_TAG"
