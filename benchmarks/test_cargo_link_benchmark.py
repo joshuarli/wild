@@ -66,6 +66,61 @@ class CargoLinkBenchmarkTests(unittest.TestCase):
             self.assertEqual(environment["TMPDIR"], str(temporary_directory))
             self.assertTrue(temporary_directory.is_dir())
 
+    def test_benchmark_output_paths_must_be_cache_owned(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cache_root = root / "cache" / "wild"
+            owned = cache_root / "reports" / "result.json"
+
+            self.assertEqual(
+                BENCHMARK.require_benchmark_cache_path(owned, cache_root=cache_root),
+                owned.resolve(),
+            )
+            with self.assertRaisesRegex(ValueError, "cache-owned"):
+                BENCHMARK.require_benchmark_cache_path(
+                    root / "outside" / "result.json", cache_root=cache_root
+                )
+
+    def test_artifact_cleanup_is_opt_in_for_retention(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            cache_root = Path(temporary) / "cache" / "wild"
+            artifacts = cache_root / "artifacts"
+            artifacts.mkdir(parents=True)
+            (artifacts / "raw.log").write_text("benchmark output")
+
+            BENCHMARK.remove_benchmark_artifacts(
+                artifacts, keep_artifacts=False, cache_root=cache_root
+            )
+            self.assertFalse(artifacts.exists())
+
+            artifacts.mkdir()
+            BENCHMARK.remove_benchmark_artifacts(
+                artifacts, keep_artifacts=True, cache_root=cache_root
+            )
+            self.assertTrue(artifacts.exists())
+
+    def test_failed_direct_capture_removes_its_partial_cache_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cache_root = root / "cache" / "wild"
+            capture_root = cache_root / "captures" / "partial"
+
+            with patch.object(BENCHMARK, "default_benchmark_cache_root", return_value=cache_root):
+                with self.assertRaises(FileNotFoundError):
+                    BENCHMARK.capture_incremental_direct_inputs(
+                        source=root / "missing-source",
+                        capture_root=capture_root,
+                        command=[],
+                        workload=None,
+                        environment={},
+                        linker=BENCHMARK.Linker("apple-ld64", None),
+                        source_revision="revision",
+                        cargo_lock_sha256="lock",
+                        toolchain={},
+                    )
+
+            self.assertFalse(capture_root.exists())
+
     def test_parse_toolchain_channel(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "rust-toolchain.toml"

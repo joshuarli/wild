@@ -18,9 +18,10 @@ manifest and separate wall-time versus resource measurements, see
 values until durable capture inputs and complete measurements exist.
 
 For repeatable source-build comparisons, use the standard-library Python runner in
-[`benchmarks/cargo_link_benchmark.py`](benchmarks/cargo_link_benchmark.py) with a checked-in
-workload profile such as [`benchmarks/cargo.benchmark.json`](benchmarks/cargo.benchmark.json)
-or [`benchmarks/e.benchmark.json`](benchmarks/e.benchmark.json).
+[`benchmarks/cargo_link_benchmark.py`](benchmarks/cargo_link_benchmark.py). Current macOS
+performance work uses only [`benchmarks/cargo.benchmark.json`](benchmarks/cargo.benchmark.json)
+against `~/d/cargo`; the checked-in `e` profiles are retained qualification fixtures, not routine
+iteration targets.
 It measures a fresh Cargo target, a no-cache cold final-link replay, a Cargo incremental rebuild
 after a controlled source edit, and direct replays of that incremental final-link argv. This
 separates Rust/LTO rebuild time from the linker's cold and incremental targets. It records
@@ -29,10 +30,10 @@ Apple-ld64/Wild linker-selection evidence and validates the resulting ARM64 Mach
 checks execute with all `DYLD_*` environment overrides removed; a cache-hit record is emitted only
 after that artifact passes all three validations. It alternates Apple ld64 and Wild by sample to
 avoid link-order thermal or filesystem-cache bias, and reports every per-sample Wild/Apple ratio
-alongside its median. The runner copies the source checkout to a disposable sibling and never
-mutates it. Set `--scratch-root ~/.cache/wild/workspaces` to keep disposable copies and compiler
-temporaries outside the source tree; retain the default sibling placement only when a workload has
-relative dependencies on adjacent checkouts. Rustc deletes the final temporary codegen object
+alongside its median. The runner copies the source checkout to a disposable cache-owned workspace
+and never mutates it. It rejects generated paths outside `~/.cache/wild`; its default
+`--scratch-root` is `~/.cache/wild/workspaces`, and each run's compiler temporaries live beneath
+its own cache-owned artifact root. Rustc deletes the final temporary codegen object
 after ordinary links, so each
 unmeasured direct-link capture uses a separate disposable `-C save-temps` rebuild. The timed
 cold and changed-source Cargo builds share one target and run back-to-back before those capture
@@ -46,7 +47,8 @@ bytes, and observed transient-disk bytes for both cold and incremental direct re
 enforcement. Its default Wild path is `target/aarch64-apple-darwin/dist/wild`; do not use the
 unoptimized `ci` profile for a wall-time comparison. Successful runs retain only their JSON report
 by default; pass `--keep-artifacts` only when the raw Cargo logs or replay outputs are needed for
-diagnosis. Failed runs always preserve their artifacts.
+diagnosis. The same cleanup policy applies after a failure, so an interrupted or failed experiment
+does not silently consume the disk.
 
 Each executable workload manifest has a `runtime` object. Its `arguments` are passed to the produced
 ARM64 executable, `expected_exit` defaults to zero, and one of `stdout_contains` or
@@ -134,21 +136,28 @@ python3 benchmarks/cargo_link_benchmark.py \
 
 The successful runner keeps only this JSON result by default. It contains selected Wild phase
 records and validation evidence. `--keep-artifacts` is troubleshooting-only: it retains raw Cargo
-logs and replay outputs, which can consume hundreds of megabytes. A failed run retains its
-artifacts automatically for diagnosis.
+logs and replay outputs, which can consume hundreds of megabytes. Failed runs follow the same
+cleanup policy; add `--keep-artifacts` before a diagnostic run when those artifacts are needed.
 
-### Two-stage iteration methodology
+### Fast candidate funnel
 
 The qualification command runs several Cargo builds per linker because it measures Cargo wall time
 and creates fresh `save-temps` inputs for direct replay. That is correct for final evidence but too
-expensive for tuning. Future Cargo parity work should use two stages.
+expensive for tuning. Treat it as a signoff gate, not an experiment loop. The normal loop is:
 
 | Stage | Purpose | Parallelism and isolation | Promotion rule |
 | --- | --- | --- | --- |
-| Build and test variants | Compile candidate Wild binaries; run focused correctness tests and static analysis. | Safe to parallelize. Each variant gets its own `CARGO_TARGET_DIR` under `~/.cache/wild/variants/<id>`. These are not timing measurements. | A candidate compiles and passes focused tests before screening. |
-| Capture one immutable changed-link input | Build the Cargo baseline once, apply the workload mutation, and retain the changed final-link argv, inputs, output contract, and checksums. | Serialized once per Cargo revision/toolchain under `~/.cache/wild/captures/<id>`. The verified capture is read-only. | Capture passes ARM64 header, strict codesign, and runtime validation before reuse. |
-| Direct-link screening | Replay the immutable capture with Apple ld64 and each candidate, collecting a short interleaved series and `--time=json` for Wild. | Variant builds and analysis can run in parallel, but same-host timing replays stay serial and round-robin with an Apple control. Separate machines may screen in parallel only if each has its own Apple controls and result file. Every replay writes to `screen/<candidate>/<sample>`. | Promote only repeatable direct-link wins, e.g. Wild/Apple ≤0.97, with no RSS or correctness regression. |
-| Full qualification | Run the command above after one candidate wins direct screening. | Serialized; this is the sole source for Cargo-incremental and final direct-link claims. | Both requested median ratios are ≤1.0 with validation and RSS evidence. |
+| Candidate queue | Give every source idea or option setting a stable ID, a hypothesis, a focused test, and a separate cache root. Build and test the candidates before any timing. | Safe to parallelize, subject to a disk budget. Source worktrees and `CARGO_TARGET_DIR`s go under `~/.cache/wild/variants/<id>/`; they must never share a target directory. | Discard failed or contract-changing candidates before they reach the timer. |
+| Capture one immutable changed link | Build Cargo once, apply the workload mutation, and retain the changed final-link argv, inputs, output contract, and checksums. | Serialized once per Cargo revision/toolchain under `~/.cache/wild/captures/<id>`. The verified capture is read-only. | The capture passes ARM64 header, strict codesign, and runtime validation before reuse. |
+| One batched direct screen | Put every surviving binary/configuration in one `cargo_direct_screen.py` command. It replays the immutable input with a short interleaved series and `--time=json` for Wild. | Compilation and analysis may run in parallel; same-host timing stays serial and round-robin with one Apple control. Do not run concurrent screens on the same host. Separate machines require their own capture, Apple control, and result file. | Promote only a repeatable direct-link win with no correctness or RSS regression. A batch without a clear winner gets a diagnostic/profile pass, not another full Cargo benchmark. |
+| Full qualification | Run the command above once for the selected candidate. | Serialized; this is the sole source for Cargo-incremental and final direct-link claims. | Both requested median ratios are ≤1.0 with validation and RSS evidence. |
+
+This produces useful parallelism without corrupting measurements: expensive candidate compilation,
+focused tests, and offline analysis overlap; the short timing batch is the only serialized section.
+Keep a small candidate ledger beside the result JSON (candidate ID, binary hash, changed files,
+hypothesis, direct-screen ratio, and disposition). It prevents rerunning Cargo merely to rediscover
+a non-winning scheduling tweak. Cap concurrent builds by available disk, and delete the exact
+`~/.cache/wild/variants/<id>` root as soon as that candidate is rejected.
 
 `benchmarks/cargo_direct_capture.py` and `benchmarks/cargo_direct_screen.py` implement the capture
 and direct-screen stages. A capture records the clean Cargo revision, toolchain, complete direct
@@ -178,12 +187,14 @@ python3 benchmarks/cargo_direct_screen.py \
 ```
 
 The capture performs the three required Cargo builds once and retains its copied workspace and
-target tree so its direct inputs remain valid; it can therefore be substantial. The screen only
-creates disposable output artifacts and removes them on success, leaving its JSON result. After
-selecting a winner or invalidating the input revision, remove that exact `"$capture_root"`
-directory. Do not run two screens concurrently on the same Mac; instead, build and test variants
-in parallel, then put all surviving candidates in one round-robin screen with the shared Apple
-control. Use separate machines only when each has its own capture and Apple controls.
+target tree so its direct inputs remain valid; it can therefore be substantial. A failed partial
+capture is removed by default; `--keep-failed-capture` is the explicit diagnostic escape hatch.
+The screen removes disposable output artifacts on either success or failure unless
+`--keep-artifacts` is supplied, leaving its JSON result on success. After selecting a winner or
+invalidating the input revision, remove that exact `"$capture_root"` directory. Do not run two
+screens concurrently on the same Mac; instead, build and test variants in parallel, then put all
+surviving candidates in one round-robin screen with the shared Apple control. Use separate
+machines only when each has its own capture and Apple controls.
 
 The latest phase profile identifies input opening, layout, and output writing as the largest visible
 Wild direct-link phases. They are the first targets for a reusable-capture screen; do not repeatedly
@@ -193,10 +204,12 @@ pay for full Cargo capture builds to evaluate a tiny scheduling change.
 
 All workflow data belongs below `~/.cache/wild`: variant builds, workspace copies, compiler
 `TMPDIR`, captures, screen outputs, reports, and opt-in stable-layout sidecars. Never create
-`~/d/wild-*` or `~/d/.wild-*` benchmark trees. The runner removes copied workspaces and Cargo
-target trees for normal samples, removes successful-run raw artifacts unless `--keep-artifacts` is
-passed, and preserves failure artifacts only for inspection. After inspecting a failure or an
-explicitly retained capture, delete that exact cache-owned directory before the next large run.
+`~/d/wild-*` or `~/d/.wild-*` benchmark trees. The Python Cargo runner, direct screen, and failed
+capture path reject output roots outside this cache. They remove disposable run artifacts on both
+success and failure unless explicitly retained with `--keep-artifacts` or
+`--keep-failed-capture`; `--keep-workspaces` likewise retains only its cache-owned workspace
+copies. After inspecting an explicitly retained run or capture, delete that exact cache-owned
+directory before the next large run.
 
 Cache output is an optimization only: any unverified stable-layout-cache change must fall back to a
 normal link, and the benchmark treats that fallback as a failed cache measurement rather than a
@@ -206,6 +219,9 @@ so stale sidecars cannot be mixed into a result.
 ### Preparing the "run-with" files
 
 For benchmarking the linker, it's preferable to run just the linker, not the whole build process.
+
+Keep manual captures below `~/.cache/wild/manual-captures` as well. The Cargo capture/screen
+workflow above is the authoritative method for the current macOS Cargo target.
 
 The way to do that is by capturing the linker invocation so that it can be rerun. Wild has a
 built-in way to do that.
@@ -231,15 +247,15 @@ rustflags = ["-Clink-arg=--ld-path=wild"]
 
 * Make sure that you have a version of wild in your `$PATH` so that it will be used (try `which
   wild` to check)
-* Run `WILD_SAVE_BASE=/tmp/wild/ripgrep cargo build` in the crate's root directory (include
+* Run `WILD_SAVE_BASE=$HOME/.cache/wild/manual-captures/ripgrep cargo build` in the crate's root directory (include
   `RUSTFLAGS` as above if you have chosen that method)
-* You will get a few numbered subdirectories in `/tmp/wild/ripgrep` as part of the build process.
+* You will get a few numbered subdirectories in `$HOME/.cache/wild/manual-captures/ripgrep` as part of the build process.
     * Directories will be created for builds of build scripts, proc macros and crate binaries built
     * Usually the last numbered subdirectory will be the build of crate's binary (if a single binary
       is built)
-    * You can check what each file is linking using `tail -n 1 /tmp/wild/ripgrep/*/run-with`
+    * You can check what each file is linking using `tail -n 1 $HOME/.cache/wild/manual-captures/ripgrep/*/run-with`
     * In the case of ripgrep it is '6'
-* You can then run `/tmp/wild/ripgrep/6/run-with wild` and that will rerun the link with wild
+* You can then run `$HOME/.cache/wild/manual-captures/ripgrep/6/run-with wild` and that will rerun the link with wild
 
 When you run `run-with wild`, the linker may print warnings for unsupported flags. It's a good idea
 to edit the `run-with` script to change / delete these flags. This will make comparison with other
@@ -252,28 +268,28 @@ Let's benchmark the linking stage between `ld`, `mold` and `wild`, discarding th
 each to reduce the effects of cache warmup
 
 ```shell
-hyperfine --warmup 2 '/tmp/wild/ripgrep/6/run-with ld' '/tmp/wild/ripgrep/6/run-with mold' '/tmp/wild/ripgrep/6/run-with wild'
+hyperfine --warmup 2 "$HOME/.cache/wild/manual-captures/ripgrep/6/run-with ld" "$HOME/.cache/wild/manual-captures/ripgrep/6/run-with mold" "$HOME/.cache/wild/manual-captures/ripgrep/6/run-with wild"
 ```
 
 That should produce output similar to this (with different values):
 
 ```text
-Benchmark 1: /tmp/wild/ripgrep/6/run-with ld
+Benchmark 1: ~/.cache/wild/manual-captures/ripgrep/6/run-with ld
   Time (mean ± σ):     954.1 ms ±  13.6 ms    [User: 683.4 ms, System: 268.8 ms]
   Range (min … max):   920.6 ms … 970.7 ms    10 runs
  
-Benchmark 2: /tmp/wild/ripgrep/6/run-with mold
+Benchmark 2: ~/.cache/wild/manual-captures/ripgrep/6/run-with mold
   Time (mean ± σ):     146.1 ms ±   3.6 ms    [User: 52.0 ms, System: 2.4 ms]
   Range (min … max):   139.1 ms … 154.7 ms    19 runs
  
-Benchmark 3: /tmp/wild/ripgrep/6/run-with wild
+Benchmark 3: ~/.cache/wild/manual-captures/ripgrep/6/run-with wild
   Time (mean ± σ):      87.7 ms ±   2.8 ms    [User: 2.4 ms, System: 2.0 ms]
   Range (min … max):    81.5 ms …  92.5 ms    34 runs
  
 Summary
-  /tmp/wild/ripgrep/6/run-with wild ran
-    1.67 ± 0.07 times faster than /tmp/wild/ripgrep/6/run-with mold
-   10.88 ± 0.38 times faster than /tmp/wild/ripgrep/6/run-with ld
+  ~/.cache/wild/manual-captures/ripgrep/6/run-with wild ran
+    1.67 ± 0.07 times faster than ~/.cache/wild/manual-captures/ripgrep/6/run-with mold
+   10.88 ± 0.38 times faster than ~/.cache/wild/manual-captures/ripgrep/6/run-with ld
 ```
 
 ### Run benchmark with poop
@@ -285,13 +301,13 @@ Like hyperfine it takes a number of commands and runs each a number of times and
 about each tune.
 
 ```shell
-poop '/tmp/wild/ripgrep/6/run-with ld' '/tmp/wild/ripgrep/6/run-with mold' '/tmp/wild/ripgrep/6/run-with wild'
+poop "$HOME/.cache/wild/manual-captures/ripgrep/6/run-with ld" "$HOME/.cache/wild/manual-captures/ripgrep/6/run-with mold" "$HOME/.cache/wild/manual-captures/ripgrep/6/run-with wild"
 ```
 
 It should produce output similar to this (with different numbers!):
 
 ```text
-Benchmark 1 (5 runs): /tmp/wild/ripgrep/6/run-with ld
+Benchmark 1 (5 runs): ~/.cache/wild/manual-captures/ripgrep/6/run-with ld
   measurement          mean ± σ            min … max           outliers         delta
   wall_time          1.18s  ±  335ms     926ms … 1.68s           0 ( 0%)        0%
   peak_rss            288MB ±  276KB     287MB …  288MB          1 (20%)        0%
@@ -301,7 +317,7 @@ Benchmark 1 (5 runs): /tmp/wild/ripgrep/6/run-with ld
   cache_misses       41.9M  ± 2.52M     40.3M  … 46.3M           0 ( 0%)        0%
   branch_misses      9.77M  ±  223K     9.62M  … 10.2M           0 ( 0%)        0%
 
-Benchmark 2 (31 runs): /tmp/wild/ripgrep/6/run-with mold
+Benchmark 2 (31 runs): ~/.cache/wild/manual-captures/ripgrep/6/run-with mold
   measurement          mean ± σ            min … max           outliers         delta
   wall_time           165ms ± 27.2ms     149ms …  280ms          2 ( 6%)        ⚡- 86.0% ±  9.9%
   peak_rss           7.84MB ± 96.3KB    7.60MB … 8.00MB         11 (35%)        ⚡- 97.3% ±  0.0%
@@ -311,7 +327,7 @@ Benchmark 2 (31 runs): /tmp/wild/ripgrep/6/run-with mold
   cache_misses       21.6M  ±  461K     21.3M  … 23.6M           3 (10%)        ⚡- 48.4% ±  2.3%
   branch_misses      7.17M  ± 37.7K     7.07M  … 7.25M           1 ( 3%)        ⚡- 26.6% ±  0.8%
 
-Benchmark 3 (56 runs): /tmp/wild/ripgrep/6/run-with wild
+Benchmark 3 (56 runs): ~/.cache/wild/manual-captures/ripgrep/6/run-with wild
   measurement          mean ± σ            min … max           outliers         delta
   wall_time          89.1ms ± 3.14ms    83.0ms … 96.6ms          0 ( 0%)        ⚡- 92.4% ±  7.0%
   peak_rss           3.82MB ± 50.7KB    3.80MB … 3.93MB         10 (18%)        ⚡- 98.7% ±  0.0%
@@ -330,7 +346,7 @@ NOTE: `poop` uses the first command as the reference the others are compared aga
 on wild, you might want to re-order the commands and invoke `poop` thus:
 
 ```text
-poop '/tmp/wild/ripgrep/6/run-with wild' '/tmp/wild/ripgrep/6/run-with mold' '/tmp/wild/ripgrep/6/run-with ld'
+poop "$HOME/.cache/wild/manual-captures/ripgrep/6/run-with wild" "$HOME/.cache/wild/manual-captures/ripgrep/6/run-with mold" "$HOME/.cache/wild/manual-captures/ripgrep/6/run-with ld"
 ```
 
 ### Comparisons
@@ -383,7 +399,7 @@ sudo mount -t tmpfs none /benchmark
 Then when running the benchmark, set the output file to be on this filesystem. e.g.:
 
 ```sh
-OUT=/benchmark/out hyperfine --warmup 2 '/tmp/wild/ripgrep/6/run-with ld' '/tmp/wild/ripgrep/6/run-with mold' '/tmp/wild/ripgrep/6/run-with wild'
+OUT=/benchmark/out hyperfine --warmup 2 "$HOME/.cache/wild/manual-captures/ripgrep/6/run-with ld" "$HOME/.cache/wild/manual-captures/ripgrep/6/run-with mold" "$HOME/.cache/wild/manual-captures/ripgrep/6/run-with wild"
 ```
 
 ### Watch out for thermal throttling
@@ -425,15 +441,15 @@ repo. You'll need to have already built wild with `cargo build --release`.
 To build rustc just cd into the rust repo root and run:
 
 ```sh
-PATH="$WILD_REPO_PATH/target/release:$PATH" WILD_SAVE_BASE=/tmp/rustc-link ./x build rustc
+PATH="$WILD_REPO_PATH/target/release:$PATH" WILD_SAVE_BASE="$HOME/.cache/wild/manual-captures/rustc-link" ./x build rustc
 ```
 
 For more information about building rustc
 see [building instructions on the rustc-dev-guide](https://rustc-dev-guide.rust-lang.org/building/how-to-build-and-run.html).
-You should now have a few subdirectories under `/tmp/rustc-link`. You can identify which one is
+You should now have a few subdirectories under `$HOME/.cache/wild/manual-captures/rustc-link`. You can identify which one is
 `rustc_driver` by looking at the last line of the `run-with` script in each directory.
 
-If the directory `/tmp/rustc-link` didn't get created, then most likely wild wasn't used to link.
+If the directory `$HOME/.cache/wild/manual-captures/rustc-link` didn't get created, then most likely wild wasn't used to link.
 
 ### Other tools
 
@@ -449,7 +465,7 @@ To figure out where wild is spending time, the first option is to run with `--ti
 recommended to combine this with `--no-fork`. For example:
 
 ```
-~/tmp/rustc-link/0/run-with target/release/wild --strip-debug --time --no-fork
+$HOME/.cache/wild/manual-captures/rustc-link/0/run-with target/release/wild --strip-debug --time --no-fork
 ┌───    3.84 Open input files
 ├───    7.45 Split archives
 ├───    9.59 Parse input files
@@ -524,7 +540,7 @@ cargo build --release --features perfetto
 Run the linker with `WILD_PERFETTO_OUT` set to some file. e.g.:
 
 ```sh
-WILD_PERFETTO_OUT=$HOME/tmp/tmp.pftrace ./run-with wild
+WILD_PERFETTO_OUT=$HOME/.cache/wild/profiles/wild.pftrace ./run-with wild
 ```
 
 Open the [perfetto UI](https://ui.perfetto.dev/). Click "Open trace file" and select `tmp.pftrace`.
@@ -543,7 +559,7 @@ cargo build --profile opt-debug
 ```
 
 ```sh
-~/tmp/rustc-link/0/run-with samply record target/opt-debug/wild --strip-debug
+$HOME/.cache/wild/manual-captures/rustc-link/0/run-with samply record target/opt-debug/wild --strip-debug
 ```
 
 The result will look something [like this](https://share.firefox.dev/4eORM7r). This is using the
@@ -568,7 +584,7 @@ cargo build --profile opt-debug --features dhat
 Then run the linker on some input. e.g:
 
 ```sh
-~/tmp/rustc-link/0/run-with target/opt-debug/wild --no-fork
+$HOME/.cache/wild/manual-captures/rustc-link/0/run-with target/opt-debug/wild --no-fork
 ```
 
 This should print some stats on exit. e.g.:
@@ -593,6 +609,6 @@ names of the directories are the names of the benchmarks.
 
 ```sh
 cargo run --bin benchmark-runner -- \
-    bench --config benchmarks/ryzen-9955hx.toml --save ~/save linker1 linker2 linker3
+    bench --config benchmarks/ryzen-9955hx.toml --save "$HOME/.cache/wild/saves" linker1 linker2 linker3
 cargo run --bin benchmark-runner -- report
 ```

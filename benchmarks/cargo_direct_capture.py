@@ -37,6 +37,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Cargo executable to invoke as +<workload toolchain>; defaults to cargo on PATH",
     )
     parser.add_argument("--allow-network", action="store_true", help="Do not pass Cargo --offline")
+    parser.add_argument(
+        "--keep-failed-capture",
+        action="store_true",
+        help="Retain a failed partial capture for diagnosis; it is otherwise removed",
+    )
     return parser.parse_args(argv)
 
 
@@ -81,6 +86,7 @@ def main(argv: list[str]) -> int:
             "clang": run_checked([str(clang), "--version"]).splitlines()[0],
             "sdkroot": sdk,
         },
+        keep_failed_capture=args.keep_failed_capture,
     )
     print(json.dumps(manifest, indent=2, sort_keys=True))
     return 0

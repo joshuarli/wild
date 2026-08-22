@@ -1117,6 +1117,7 @@ def capture_incremental_direct_inputs(
     source_revision: str,
     cargo_lock_sha256: str,
     toolchain: dict[str, str],
+    keep_failed_capture: bool = False,
 ) -> dict[str, Any]:
     """Creates one reusable, verified changed-source direct-link capture.
 
@@ -1125,25 +1126,29 @@ def capture_incremental_direct_inputs(
     for fast candidate screening. The capture owns its workspace and target tree until its caller
     explicitly deletes `capture_root`.
     """
-    if capture_root.exists() and any(capture_root.iterdir()):
+    capture_root = require_benchmark_cache_path(capture_root)
+    if capture_root.exists():
         raise FileExistsError(f"Refusing to mix a direct capture with existing state: {capture_root}")
-    capture_root.mkdir(parents=True, exist_ok=True)
+    capture_root.mkdir(parents=True)
     environment = dict(environment)
-    temporary_directory = capture_root / "tmp"
-    temporary_directory.mkdir(exist_ok=False)
-    environment["TMPDIR"] = str(temporary_directory)
-    workspace = copy_workspace_to_scratch(source, capture_root)
-    target_dir = capture_root / "target"
-    logs_dir = capture_root / "logs"
-    logs_dir.mkdir(exist_ok=False)
-    mutation_path = workspace / workload.mutation.path
-    before = mutation_path.read_bytes()
-    before_hash = hashlib.sha256(before).hexdigest()
-    baseline_log = logs_dir / "baseline.log"
-    incremental_log = logs_dir / "incremental.log"
-    capture_log = logs_dir / "incremental-direct-capture.log"
-
+    mutation_path: Path | None = None
+    before: bytes | None = None
+    before_hash: str | None = None
+    succeeded = False
     try:
+        temporary_directory = capture_root / "tmp"
+        temporary_directory.mkdir(exist_ok=False)
+        environment["TMPDIR"] = str(temporary_directory)
+        workspace = copy_workspace_to_scratch(source, capture_root)
+        target_dir = capture_root / "target"
+        logs_dir = capture_root / "logs"
+        logs_dir.mkdir(exist_ok=False)
+        mutation_path = workspace / workload.mutation.path
+        before = mutation_path.read_bytes()
+        before_hash = hashlib.sha256(before).hexdigest()
+        baseline_log = logs_dir / "baseline.log"
+        incremental_log = logs_dir / "incremental.log"
+        capture_log = logs_dir / "incremental-direct-capture.log"
         run_cargo_build(
             command,
             workspace=workspace,
@@ -1247,10 +1252,22 @@ def capture_incremental_direct_inputs(
         # The command, validation evidence, and input manifest survive in `manifest.json`; raw
         # Cargo logs are not needed to replay a successful capture and consume substantial space.
         shutil.rmtree(logs_dir, ignore_errors=True)
+        succeeded = True
         return manifest
     finally:
-        if mutation_path.exists() and mutation_path.read_bytes() != before:
-            restore_source(mutation_path, before, before_hash)
+        try:
+            if (
+                mutation_path is not None
+                and before is not None
+                and before_hash is not None
+                and mutation_path.exists()
+                and mutation_path.read_bytes() != before
+            ):
+                restore_source(mutation_path, before, before_hash)
+        finally:
+            remove_benchmark_artifacts(
+                capture_root, keep_artifacts=succeeded or keep_failed_capture
+            )
 
 
 def median_ns(samples: list[int]) -> int:
@@ -2041,6 +2058,28 @@ def default_wild_path() -> Path:
     return Path(__file__).resolve().parents[1] / "target/aarch64-apple-darwin/dist/wild"
 
 
+def default_benchmark_cache_root() -> Path:
+    """Returns the single host-local root allowed to hold benchmark output."""
+    return Path.home() / ".cache" / "wild"
+
+
+def require_benchmark_cache_path(path: Path, *, cache_root: Path | None = None) -> Path:
+    """Resolves an output path and rejects benchmark state outside the cache contract."""
+    resolved = path.resolve()
+    allowed_root = (cache_root or default_benchmark_cache_root()).resolve()
+    if not resolved.is_relative_to(allowed_root):
+        raise ValueError(f"Benchmark output must be cache-owned under {allowed_root}: {resolved}")
+    return resolved
+
+
+def remove_benchmark_artifacts(
+    path: Path, *, keep_artifacts: bool, cache_root: Path | None = None
+) -> None:
+    """Removes a cache-owned run root unless the caller explicitly requested retention."""
+    if not keep_artifacts:
+        shutil.rmtree(require_benchmark_cache_path(path, cache_root=cache_root), ignore_errors=True)
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True, help="Checked-in workload JSON profile")
@@ -2056,8 +2095,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--scratch-root",
         type=Path,
         help=(
-            "Root for disposable workspace copies and compiler temporaries. The default is a "
-            "sibling of --workspace, which preserves relative external path dependencies."
+            "Cache-owned root for disposable workspace copies. Defaults to "
+            "~/.cache/wild/workspaces."
         ),
     )
     parser.add_argument(
@@ -2079,11 +2118,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Separate direct-link resource replays after each cold and changed-source Cargo capture",
     )
     parser.add_argument("--allow-network", action="store_true", help="Do not pass Cargo --offline")
-    parser.add_argument("--keep-workspaces", action="store_true")
+    parser.add_argument(
+        "--keep-workspaces",
+        action="store_true",
+        help="Retain copied cache-owned workspaces for diagnosis; remove them manually afterward",
+    )
     parser.add_argument(
         "--keep-artifacts",
         action="store_true",
-        help="Retain successful-run logs and replay output; failures always retain them",
+        help="Retain logs and replay output for diagnosis; artifacts are otherwise removed on success or failure",
     )
     parser.add_argument(
         "--wild-timing-json",
@@ -2111,8 +2154,10 @@ def main(argv: list[str]) -> int:
     workspace = args.workspace.resolve()
     workload = load_workload(args.config.resolve())
     wild = args.wild.resolve()
-    output = args.output.resolve()
-    scratch_root = args.scratch_root.resolve() if args.scratch_root is not None else None
+    output = require_benchmark_cache_path(args.output)
+    scratch_root = require_benchmark_cache_path(
+        args.scratch_root or default_benchmark_cache_root() / "workspaces"
+    )
     if output.exists():
         raise FileExistsError(f"Refusing to overwrite benchmark result: {output}")
     if not wild.is_file():
@@ -2138,22 +2183,31 @@ def main(argv: list[str]) -> int:
     if result_root.exists():
         raise FileExistsError(f"Refusing to overwrite benchmark artifacts: {result_root}")
     result_root.mkdir(parents=True)
-    temporary_directory = scratch_root / "tmp" if scratch_root is not None else None
+    # Keep compiler temporary files in this run's result root, rather than a shared scratch
+    # directory. Independent variant builds can therefore use separate cache roots safely.
+    temporary_directory = result_root / "tmp"
     wild_incremental_cache_root: Path | None = None
-    if args.wild_incremental_cache is not None:
-        wild_incremental_cache_root = args.wild_incremental_cache.resolve()
-        if wild_incremental_cache_root.exists():
-            if any(wild_incremental_cache_root.iterdir()):
-                raise FileExistsError(
-                    "Refusing to mix benchmark cache state with an existing directory: "
-                    f"{wild_incremental_cache_root}"
-                )
-        else:
-            wild_incremental_cache_root.mkdir(parents=True)
+    try:
+        if args.wild_incremental_cache is not None:
+            wild_incremental_cache_root = require_benchmark_cache_path(args.wild_incremental_cache)
+            if wild_incremental_cache_root.exists():
+                if any(wild_incremental_cache_root.iterdir()):
+                    raise FileExistsError(
+                        "Refusing to mix benchmark cache state with an existing directory: "
+                        f"{wild_incremental_cache_root}"
+                    )
+            else:
+                wild_incremental_cache_root.mkdir(parents=True)
+    except BaseException:
+        if wild_incremental_cache_root is not None:
+            remove_benchmark_artifacts(
+                wild_incremental_cache_root, keep_artifacts=args.keep_artifacts
+            )
+        remove_benchmark_artifacts(result_root, keep_artifacts=args.keep_artifacts)
+        raise
 
     linkers = [Linker("apple-ld64", None), Linker("wild", wild)]
     runs: list[dict[str, Any]] = []
-    succeeded = False
     try:
         # Interleave and alternate linker order so build-cache warmth, thermal drift, and unrelated
         # host load do not systematically favour whichever linker happens to run first or last.
@@ -2230,7 +2284,7 @@ def main(argv: list[str]) -> int:
                 "resource_link_repetitions": args.resource_link_repetitions,
                 "offline": not args.allow_network,
                 "wild_timing_json": args.wild_timing_json,
-                "scratch_root": str(scratch_root) if scratch_root is not None else None,
+                "scratch_root": str(scratch_root),
                 "wild_incremental_cache_root": (
                     str(wild_incremental_cache_root)
                     if wild_incremental_cache_root is not None
@@ -2261,15 +2315,16 @@ def main(argv: list[str]) -> int:
         }
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
-        succeeded = True
         print(json.dumps(summary, indent=2, sort_keys=True))
         return 1 if args.enforce_goals and not summary["goals_met"] else 0
     finally:
-        # A report has all success evidence, while the raw Cargo logs are hundreds of megabytes.
-        # Retain those logs after failure for diagnosis, or when the caller explicitly requests
-        # them; otherwise remove all replay outputs after writing the result JSON.
-        if succeeded and not args.keep_artifacts:
-            shutil.rmtree(result_root, ignore_errors=True)
+        # The JSON report records success evidence. Raw Cargo logs and replay outputs can be
+        # hundreds of megabytes, so preserve them only on the caller's explicit request.
+        if wild_incremental_cache_root is not None:
+            remove_benchmark_artifacts(
+                wild_incremental_cache_root, keep_artifacts=args.keep_artifacts
+            )
+        remove_benchmark_artifacts(result_root, keep_artifacts=args.keep_artifacts)
 
 
 if __name__ == "__main__":

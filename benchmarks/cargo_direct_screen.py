@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import shutil
 import statistics
 import subprocess
 import sys
@@ -16,7 +15,9 @@ from cargo_link_benchmark_impl import DIRECT_CAPTURE_SCHEMA_VERSION
 from cargo_link_benchmark_impl import Linker
 from cargo_link_benchmark_impl import RuntimeCheck
 from cargo_link_benchmark_impl import direct_capture_replay_command
+from cargo_link_benchmark_impl import remove_benchmark_artifacts
 from cargo_link_benchmark_impl import replay_final_link
+from cargo_link_benchmark_impl import require_benchmark_cache_path
 from cargo_link_benchmark_impl import sha256_file
 from cargo_link_benchmark_impl import verify_direct_capture_input_records
 from cargo_link_benchmark_impl import with_wild_timing_json
@@ -100,7 +101,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="Separate non-timing resource samples per linker",
     )
     parser.add_argument("--no-wild-timing-json", action="store_true")
-    parser.add_argument("--keep-artifacts", action="store_true")
+    parser.add_argument(
+        "--keep-artifacts",
+        action="store_true",
+        help="Retain replay output and logs for diagnosis; otherwise remove them on success or failure",
+    )
     return parser.parse_args(argv)
 
 
@@ -181,7 +186,7 @@ def main(argv: list[str]) -> int:
     args = parse_args(argv)
     if args.repetitions < 1 or args.resource_repetitions < 1:
         raise ValueError("--repetitions and --resource-repetitions must be positive")
-    output = args.output.resolve()
+    output = require_benchmark_cache_path(args.output)
     if output.exists():
         raise FileExistsError(f"refusing to overwrite screen result: {output}")
     screen_root = output.with_suffix("").with_name(f"{output.stem}-artifacts")
@@ -214,11 +219,14 @@ def main(argv: list[str]) -> int:
     linkers = [Linker("apple-ld64", None), *candidates]
     screen_root.mkdir(parents=True)
     temporary_directory = screen_root / "tmp"
-    temporary_directory.mkdir(exist_ok=False)
+    try:
+        temporary_directory.mkdir(exist_ok=False)
+    except BaseException:
+        remove_benchmark_artifacts(screen_root, keep_artifacts=args.keep_artifacts)
+        raise
     environment["TMPDIR"] = str(temporary_directory)
     samples: dict[str, list[dict[str, Any]]] = {linker.name: [] for linker in linkers}
     resource_samples: dict[str, list[dict[str, Any]]] = {linker.name: [] for linker in linkers}
-    succeeded = False
     try:
         # Rotate the full linker order, including Apple, so systematic thermal drift cannot always
         # favour the same position. Each call owns its own output path and never mutates capture.
@@ -288,12 +296,10 @@ def main(argv: list[str]) -> int:
         }
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        succeeded = True
         print(json.dumps(result["comparison"], indent=2, sort_keys=True))
         return 0
     finally:
-        if succeeded and not args.keep_artifacts:
-            shutil.rmtree(screen_root, ignore_errors=True)
+        remove_benchmark_artifacts(screen_root, keep_artifacts=args.keep_artifacts)
 
 
 if __name__ == "__main__":
