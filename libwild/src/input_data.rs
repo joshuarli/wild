@@ -568,40 +568,37 @@ fn process_archive<'data, P: Platform, F: FileSystem>(
 ) -> Result<LoadedFileState<'data, P, F::Input>> {
     let archive_data = input_ref.data();
     let parent_file = input_ref.file;
-    let mut members = Vec::new();
-
-    for entry in ArchiveIterator::from_archive_bytes(archive_data)? {
-        let entry = entry?;
-        match entry {
-            ArchiveEntry::Regular(archive_entry) => {
-                let start_offset = archive_entry.data_offset;
-                let end_offset = archive_entry.data_offset + archive_entry.entry_data.len();
-                let member_data = &archive_data[start_offset..end_offset];
-                let kind = FileKind::identify_bytes(member_data).with_context(|| {
-                    format!(
-                        "Failed process input `{}` in archive `{}`",
-                        archive_entry.ident.as_path().display(),
-                        parent_file.filename.display()
-                    )
-                })?;
-                members.push((start_offset, end_offset, archive_entry.ident, kind));
-            }
+    // Decoding archive headers is ordered, but identifying and parsing each member is independent.
+    // Keep the ordered vector so the indexed Rayon collection preserves member order for symbol
+    // resolution, while avoiding a sequential type-identification pass through large Rust rlibs.
+    let members = ArchiveIterator::from_archive_bytes(archive_data)?
+        .map(|entry| match entry? {
+            ArchiveEntry::Regular(archive_entry) => Ok(archive_entry),
             ArchiveEntry::Thin(_) => unreachable!(),
-        }
-    }
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     let outputs = members
         .into_par_iter()
-        .map(|(start_offset, end_offset, ident, kind)| {
+        .map(|archive_entry| {
+            let start_offset = archive_entry.data_offset;
+            let end_offset = archive_entry.data_offset + archive_entry.entry_data.len();
             let member_ref = InputRef {
                 file: parent_file,
                 data: &archive_data[start_offset..end_offset],
                 entry: Some(EntryMeta {
-                    identifier: ident,
+                    identifier: archive_entry.ident,
                     start_offset,
                     end_offset,
                 }),
             };
+            let kind = FileKind::identify_bytes(member_ref.data).with_context(|| {
+                format!(
+                    "Failed process input `{}` in archive `{}`",
+                    archive_entry.ident.as_path().display(),
+                    parent_file.filename.display()
+                )
+            })?;
             state.process_input(member_ref, file, kind)
         })
         .collect::<Result<Vec<_>>>()?;
