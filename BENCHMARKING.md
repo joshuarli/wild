@@ -17,6 +17,54 @@ manifest and separate wall-time versus resource measurements, see
 [`benchmarks/macos-arm64.md`](benchmarks/macos-arm64.md). It intentionally records no benchmark
 values until durable capture inputs and complete measurements exist.
 
+## Native Alpine Linux ARM64 Cargo comparison
+
+The Linux counterpart deliberately measures a separate native ELF contract, rather than trying to
+reuse the macOS Mach-O and `codesign` runner. It uses `clang` with `lld` as its reference linker,
+then replaces only Clang's final `ld.lld` child with Wild. An unmeasured setup copies Cargo,
+creates one target, applies the controlled source edit, and captures that real incremental final
+link under `-C save-temps`. The reported experiment is only five interleaved replays of the same
+captured final-link inputs. Every replay checks an ELF64 little-endian `EM_AARCH64` output and runs
+`cargo --version` after removing `LD_*` and `DYLD_*` loader overrides. The workload enables Cargo's
+supported `all-static` feature because the native `aarch64-unknown-linux-musl` toolchain must link
+a complete static curl/OpenSSL/libgit2 closure. GNU `time -v` supplies separate peak-RSS and CPU
+evidence.
+
+This is a native `linux/arm64` Alpine, `all-static` Cargo comparison, not a claim that its absolute
+wall times or feature set are comparable with macOS. Run it only on a Docker engine that reports
+native `aarch64`/`arm64`; do not benchmark through QEMU emulation. The container source mounts are read-only. Its only durable
+state is a bind mount at `~/.cache/wild/linux-aarch64-cargo` for the Cargo registry, Git database,
+Wild build, disposable workspaces, and retained JSON reports. The container itself is removed
+after every run and the runner removes its raw logs, targets, link outputs, and compiler
+temporaries on both success and failure. Docker's regular BuildKit image-layer cache holds the
+pinned Alpine toolchain; it does not create a benchmark checkout or target directory under
+`~/d`.
+
+```sh
+cache_root="$HOME/.cache/wild/linux-aarch64-cargo"
+mkdir -p "$cache_root"
+
+docker buildx build --platform linux/arm64 --load \
+  --tag wild-bench-alpine-arm64:local \
+  --file benchmarks/docker/alpine-aarch64/Dockerfile \
+  benchmarks/docker/alpine-aarch64
+
+docker run --rm --platform linux/arm64 \
+  --mount type=bind,source="$PWD",target=/work/wild,readonly \
+  --mount type=bind,source="$HOME/d/cargo",target=/work/cargo,readonly \
+  --mount type=bind,source="$cache_root",target=/cache \
+  wild-bench-alpine-arm64:local \
+  /work/wild/benchmarks/docker/alpine-aarch64/run-cargo-benchmark.sh
+```
+
+The first invocation downloads Rust/Cargo dependencies into that cache mount before unmeasured
+capture setup. Later invocations reuse them, and every timed replay is independent of Cargo and
+offline. The default is five interleaved final-link replays per linker; set
+`WILD_LINUX_LINK_REPETITIONS` or `WILD_LINUX_RESOURCE_LINK_REPETITIONS` on `docker run` only for a
+bounded diagnostic screen. Results are written under `$cache_root/benchmarks/`. Pass
+`--enforce-goals` to the wrapper only when using the checked-in `1.0x` direct-link gate as a
+qualification run.
+
 For repeatable source-build comparisons, use the standard-library Python runner in
 [`benchmarks/cargo_link_benchmark.py`](benchmarks/cargo_link_benchmark.py). Current macOS
 performance work uses only [`benchmarks/cargo.benchmark.json`](benchmarks/cargo.benchmark.json)

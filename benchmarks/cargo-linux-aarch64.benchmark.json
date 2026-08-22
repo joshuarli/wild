@@ -1,0 +1,21 @@
+{
+  "schema_version": "cargo-linux-link-workload/v1",
+  "name": "cargo",
+  "toolchain": "nightly-2026-07-24",
+  "target": "aarch64-unknown-linux-musl",
+  "profile": "linker-stress",
+  "cargo_arguments": ["--bin", "cargo", "--features", "all-static"],
+  "artifact": "{target}/{profile}/cargo",
+  "incremental_mutation": {
+    "path": "src/bin/cargo/commands/search.rs",
+    "replace_before": "min(100, limit",
+    "replace_after": "min(101, limit"
+  },
+  "runtime": {
+    "arguments": ["--version"],
+    "stdout_contains": "cargo "
+  },
+  "goals": {
+    "incremental_link_wild_over_clang_max": 1.0
+  }
+}
