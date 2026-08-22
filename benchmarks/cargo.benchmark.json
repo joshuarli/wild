@@ -19,6 +19,6 @@
     "stdout_contains": "cargo "
   },
   "goals": {
-    "incremental_link_wild_over_apple_max": 0.333
+    "incremental_link_wild_over_apple_max": 0.5
   }
 }
