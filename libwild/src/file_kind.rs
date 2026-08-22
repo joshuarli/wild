@@ -3,14 +3,12 @@
 use crate::bail;
 use crate::elf;
 use crate::ensure;
+use crate::error::Context as _;
 use crate::error::Result;
-use object::Endian;
-use object::Endianness;
 use object::LittleEndian;
 use object::macho;
 use object::read::elf::FileHeader;
 use object::read::elf::SectionHeader;
-use object::read::macho::MachHeader;
 use zerocopy::IntoBytes;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -92,19 +90,20 @@ impl FileKind {
 }
 
 fn determine_macho_kind(bytes: &[u8]) -> Result<FileKind> {
-    let header = macho::MachHeader64::<object::Endianness>::parse(bytes, 0)?;
+    if bytes.starts_with(&macho::MH_MAGIC_64.to_be_bytes()) {
+        bail!("Only little endian is currently supported");
+    }
+
+    let header = bytes.get(..16).context("Invalid Mach-O file")?;
+    let cputype = u32::from_le_bytes(header[4..8].try_into().unwrap());
+    let filetype = macho::FileType(u32::from_le_bytes(header[12..16].try_into().unwrap()));
 
     ensure!(
-        header.endian()?.is_little_endian(),
-        "Only little endian is currently supported"
-    );
-
-    ensure!(
-        header.cputype(Endianness::Little) == macho::CPU_TYPE_ARM64,
+        cputype == macho::CPU_TYPE_ARM64.0,
         "Only ARM64 is currently supported"
     );
 
-    match header.filetype(Endianness::Little) {
+    match filetype {
         macho::MH_OBJECT => Ok(FileKind::MachOObject),
         macho::MH_DYLIB => Ok(FileKind::MachODylib),
         other => bail!("Unsupported MachO input file type {other:?}"),
@@ -136,6 +135,48 @@ fn is_gcc_bitcode(data: &[u8], header: &crate::elf::FileHeader64) -> Option<bool
     const MAX_SCAN: usize = 200;
     let strings = data.get(start_offset + START..start_offset + (START + MAX_SCAN).min(len))?;
     Some(memchr::memmem::find(strings, b"\0.gnu.lto_.").is_some())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn macho_header(cputype: u32, filetype: u32) -> [u8; 16] {
+        let mut header = [0; 16];
+        header[..4].copy_from_slice(&macho::MH_MAGIC_64.to_le_bytes());
+        header[4..8].copy_from_slice(&cputype.to_le_bytes());
+        header[12..16].copy_from_slice(&filetype.to_le_bytes());
+        header
+    }
+
+    #[test]
+    fn identifies_little_endian_arm64_macho_headers() {
+        assert_eq!(
+            FileKind::identify_bytes(&macho_header(
+                macho::CPU_TYPE_ARM64.0,
+                macho::MH_OBJECT.0,
+            ))
+                .unwrap(),
+            FileKind::MachOObject
+        );
+        assert_eq!(
+            FileKind::identify_bytes(&macho_header(
+                macho::CPU_TYPE_ARM64.0,
+                macho::MH_DYLIB.0,
+            ))
+                .unwrap(),
+            FileKind::MachODylib
+        );
+    }
+
+    #[test]
+    fn rejects_incompatible_macho_headers() {
+        assert!(FileKind::identify_bytes(&macho_header(7, macho::MH_OBJECT.0)).is_err());
+
+        let mut big_endian = macho_header(macho::CPU_TYPE_ARM64.0, macho::MH_OBJECT.0);
+        big_endian[..4].copy_from_slice(&macho::MH_MAGIC_64.to_be_bytes());
+        assert!(FileKind::identify_bytes(&big_endian).is_err());
+    }
 }
 
 impl std::fmt::Display for FileKind {
