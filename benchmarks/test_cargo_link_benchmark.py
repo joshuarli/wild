@@ -125,11 +125,17 @@ class CargoLinkBenchmarkTests(unittest.TestCase):
             SCREEN.parse_candidate_environment("groups-96=WILD_FILES_PER_GROUP=96"),
             ("groups-96", "WILD_FILES_PER_GROUP", "96"),
         )
+        self.assertEqual(
+            SCREEN.parse_candidate_argument("threads-8=--threads=8"),
+            ("threads-8", "--threads=8"),
+        )
         for value in ("../escape=/tmp/wild", "nested/name=/tmp/wild", "candidate=relative/wild"):
             with self.assertRaisesRegex(argparse.ArgumentTypeError, "candidate"):
                 SCREEN.parse_candidate(value)
         with self.assertRaisesRegex(argparse.ArgumentTypeError, "WILD_"):
             SCREEN.parse_candidate_environment("groups-96=PATH=/bin")
+        with self.assertRaisesRegex(argparse.ArgumentTypeError, "long linker"):
+            SCREEN.parse_candidate_argument("threads-8=-threads=8")
 
     def test_linker_selection_accepts_xcode_response_file_diagnostic(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

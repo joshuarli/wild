@@ -54,6 +54,17 @@ def parse_candidate_environment(value: str) -> tuple[str, str, str]:
     return name, key, setting
 
 
+def parse_candidate_argument(value: str) -> tuple[str, str]:
+    name, separator, argument = value.partition("=")
+    if not separator or not name or not argument:
+        raise argparse.ArgumentTypeError("--candidate-arg must be NAME=--linker-option")
+    if not argument.startswith("--"):
+        raise argparse.ArgumentTypeError("candidate arguments must be long linker options")
+    # Reuse the candidate-label validation without treating the option as a path.
+    parse_candidate(f"{name}=/candidate")
+    return name, argument
+
+
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--capture", type=Path, required=True, help="manifest.json from cargo_direct_capture")
@@ -71,6 +82,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=[],
         metavar="NAME=WILD_KEY=VALUE",
         help="Set one Wild-only environment option for a named candidate; repeatable",
+    )
+    parser.add_argument(
+        "--candidate-arg",
+        type=parse_candidate_argument,
+        action="append",
+        default=[],
+        metavar="NAME=--linker-option",
+        help="Append one long Wild linker option for a named candidate; repeatable",
     )
     parser.add_argument("--output", type=Path, required=True, help="JSON screen result path")
     parser.add_argument("--repetitions", type=int, default=5, help="Interleaved timing samples per linker")
@@ -181,12 +200,17 @@ def main(argv: list[str]) -> int:
         seen_names.add(name)
         candidates.append(Linker(name, resolved))
     candidate_environments: dict[str, dict[str, str]] = {candidate.name: {} for candidate in candidates}
+    candidate_arguments: dict[str, list[str]] = {candidate.name: [] for candidate in candidates}
     for name, key, value in args.candidate_env:
         if name not in candidate_environments:
             raise ValueError(f"candidate environment references unknown candidate: {name}")
         if key in candidate_environments[name]:
             raise ValueError(f"duplicate candidate environment setting: {name}={key}")
         candidate_environments[name][key] = value
+    for name, argument in args.candidate_arg:
+        if name not in candidate_arguments:
+            raise ValueError(f"candidate argument references unknown candidate: {name}")
+        candidate_arguments[name].append(argument)
     linkers = [Linker("apple-ld64", None), *candidates]
     screen_root.mkdir(parents=True)
     temporary_directory = screen_root / "tmp"
@@ -202,6 +226,7 @@ def main(argv: list[str]) -> int:
             offset = repetition % len(linkers)
             for linker in [*linkers[offset:], *linkers[:offset]]:
                 replay_command = direct_capture_replay_command(command, linker)
+                replay_command.extend(candidate_arguments.get(linker.name, []))
                 if linker.path is not None and not args.no_wild_timing_json:
                     replay_command = with_wild_timing_json(replay_command, linker)
                 linker_environment = dict(environment)
@@ -220,6 +245,7 @@ def main(argv: list[str]) -> int:
                 )
         for linker in linkers:
             replay_command = direct_capture_replay_command(command, linker)
+            replay_command.extend(candidate_arguments.get(linker.name, []))
             linker_environment = dict(environment)
             linker_environment.update(candidate_environments.get(linker.name, {}))
             resource_samples[linker.name] = replay_final_link(
@@ -252,6 +278,7 @@ def main(argv: list[str]) -> int:
                         "path": str(candidate.path),
                         "sha256": sha256_file(candidate.path),
                         "environment": candidate_environments[candidate.name],
+                        "arguments": candidate_arguments[candidate.name],
                         "median_ns": median_ns(samples[candidate.name]),
                         "wild_over_apple": median_ns(samples[candidate.name]) / apple_median,
                     }

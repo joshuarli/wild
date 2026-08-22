@@ -171,6 +171,8 @@ python3 benchmarks/cargo_direct_screen.py \
   --candidate current="$cargo_target/aarch64-apple-darwin/dist/wild" \
   --candidate groups-96="$cargo_target/aarch64-apple-darwin/dist/wild" \
   --candidate-env groups-96=WILD_FILES_PER_GROUP=96 \
+  --candidate threads-8="$cargo_target/aarch64-apple-darwin/dist/wild" \
+  --candidate-arg threads-8=--threads=8 \
   --repetitions 5 \
   --output "$cache_root/benchmarks/cargo-direct-screen-$(date +%F).json"
 ```
