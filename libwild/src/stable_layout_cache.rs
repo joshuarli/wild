@@ -40,6 +40,9 @@ use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::OnceLock;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::time::SystemTime;
 
@@ -408,6 +411,60 @@ enum PreparedOutput {
     Cloned(PathBuf),
 }
 
+/// A cache service owns at most one current image. Keeping the image in the service removes the
+/// repeated full-image read/allocation from consecutive links while the normal disk sidecars
+/// remain the recovery source if that service exits.
+struct ResidentImage {
+    cache_image: PathBuf,
+    state: ImageState,
+    bytes: Vec<u8>,
+}
+
+static RESIDENT_IMAGE_CACHE_ENABLED: AtomicBool = AtomicBool::new(false);
+static RESIDENT_IMAGE: OnceLock<Mutex<Option<ResidentImage>>> = OnceLock::new();
+
+pub(crate) fn enable_resident_image_cache() {
+    RESIDENT_IMAGE_CACHE_ENABLED.store(true, Ordering::Relaxed);
+}
+
+fn resident_image_cache_enabled() -> bool {
+    RESIDENT_IMAGE_CACHE_ENABLED.load(Ordering::Relaxed)
+}
+
+fn resident_image_state(cache_image: &Path) -> Option<ImageState> {
+    resident_image_cache_enabled().then(|| {
+        RESIDENT_IMAGE
+            .get_or_init(|| Mutex::new(None))
+            .lock()
+            .ok()?
+            .as_ref()
+            .filter(|image| image.cache_image == cache_image)
+            .map(|image| image.state.clone())
+    })?
+}
+
+fn take_resident_image(cache_image: &Path, state: &ImageState) -> Option<Vec<u8>> {
+    resident_image_cache_enabled().then(|| {
+        let mut resident = RESIDENT_IMAGE.get_or_init(|| Mutex::new(None)).lock().ok()?;
+        (resident.as_ref().is_some_and(|image| {
+            image.cache_image == cache_image && image.state == *state
+        }))
+        .then(|| resident.take().expect("resident image was checked").bytes)
+    })?
+}
+
+fn store_resident_image(cache_image: PathBuf, state: ImageState, bytes: Vec<u8>) {
+    if resident_image_cache_enabled() {
+        if let Ok(mut resident) = RESIDENT_IMAGE.get_or_init(|| Mutex::new(None)).lock() {
+            *resident = Some(ResidentImage {
+                cache_image,
+                state,
+                bytes,
+            });
+        }
+    }
+}
+
 impl MutableOutput {
     fn bytes(&self) -> &[u8] {
         match self {
@@ -533,19 +590,24 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
     if !arguments_match {
         return cache_miss("normalized argument digest differs");
     }
-    let state_bytes = {
-        timing_phase!("Mach-O stable-layout cache: read image state");
-        let Ok(bytes) = fs::read(cache_state_path(cache_dir, args)) else {
-            return cache_miss("image state is absent");
-        };
-        bytes
-    };
-    let mut state = {
-        timing_phase!("Mach-O stable-layout cache: decode image state");
-        let Ok(state) = ImageState::decode(&state_bytes) else {
-            return cache_miss("image state is corrupt or incompatible");
-        };
+    let cache_image = cache_image_path(cache_dir, args);
+    let mut state = if let Some(state) = resident_image_state(&cache_image) {
         state
+    } else {
+        let state_bytes = {
+            timing_phase!("Mach-O stable-layout cache: read image state");
+            let Ok(bytes) = fs::read(cache_state_path(cache_dir, args)) else {
+                return cache_miss("image state is absent");
+            };
+            bytes
+        };
+        {
+            timing_phase!("Mach-O stable-layout cache: decode image state");
+            let Ok(state) = ImageState::decode(&state_bytes) else {
+                return cache_miss("image state is corrupt or incompatible");
+            };
+            state
+        }
     };
     let state_matches_manifest = {
         timing_phase!("Mach-O stable-layout cache: verify image state");
@@ -560,7 +622,6 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
     // replay. Cargo can remove or replace that pathname before invoking us; treating it as an
     // input used to force two full-image reads on the hot path. The image is cache-owned and
     // guarded by its device/inode/ctime identity before and after the APFS clone below.
-    let cache_image = cache_image_path(cache_dir, args);
     let cache_image_metadata = {
         timing_phase!("Mach-O stable-layout cache: verify cache image identity");
         input_file_metadata(&cache_image.to_string_lossy())
@@ -714,12 +775,14 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
     let mut output = {
         timing_phase!("Mach-O stable-layout cache: materialize cache-owned image");
         #[cfg(target_os = "macos")]
-        let output = fs::read(&cache_image)
-            .ok()
+        let output = take_resident_image(&cache_image, &state)
             .map(MutableOutput::InMemory)
+            .or_else(|| fs::read(&cache_image).ok().map(MutableOutput::InMemory))
             .or_else(|| clone_baseline_image(cache_dir, args));
         #[cfg(not(target_os = "macos"))]
-        let output = fs::read(&cache_image).ok().map(MutableOutput::InMemory);
+        let output = take_resident_image(&cache_image, &state)
+            .map(MutableOutput::InMemory)
+            .or_else(|| fs::read(&cache_image).ok().map(MutableOutput::InMemory));
         let Some(output) = output else {
             return cache_miss("owned baseline image is absent");
         };
@@ -896,29 +959,51 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
     state.output_len = output_len;
     // The direct object is the one patched input, but equal-content rlibs can move between
     // rustc's per-link temporary directories. Retain every current physical identity so the
-    // metadata race guard checks the paths that produced this image on the next cache hit.
-    state.inputs = current_inputs;
-    // Publish the owned image before its matching mutable state. An interrupted update can leave
-    // an image and state with different digests, which is deliberately a cache miss rather than
-    // a potentially stale patch source. The structural manifest is immutable on cache hits.
-    {
-        timing_phase!("Mach-O stable-layout cache: atomically update sidecars");
-        let image_result = match &output {
-            PreparedOutput::InMemory(bytes) => write_cache_image_atomic(cache_dir, args, bytes),
-            #[cfg(target_os = "macos")]
-            PreparedOutput::Cloned(_) => clone_cache_image_atomic(cache_dir, args),
-        };
-        if image_result.is_err() {
-            return cache_miss("atomic baseline-image replacement failed");
-        }
-        let image_path = cache_image_path(cache_dir, args);
-        if !set_cache_image_token(&image_path, state.cache_image_token)
-            || cache_image_token(&image_path) != Some(state.cache_image_token)
+    // metadata race guard checks the paths that produced this image on the next cache hit. Keep
+    // the initial image/state pair until the bounded patch group is full: successive one-object
+    // edits can patch directly from that immutable baseline, avoiding a second full-image write
+    // on the hot path. A full group checkpoints the current image so the next edit starts a new
+    // bounded lineage rather than accumulating an unbounded patch set.
+    let resident_state = ImageState {
+        inputs: current_inputs
+            .into_iter()
+            .map(|mut input| {
+                input.direct_object_bytes = None;
+                input
+            })
+            .collect(),
+        ..state.clone()
+    };
+    if changed.len() == MAX_CHANGED_DIRECT_OBJECTS {
+        state = resident_state.clone();
+        // Publish the owned image before its matching mutable state. An interrupted update can
+        // leave an image and state with different digests, which is deliberately a cache miss
+        // rather than a potentially stale patch source. The structural manifest is immutable on
+        // cache hits.
         {
-            return cache_miss("published baseline image token is unavailable");
+            timing_phase!("Mach-O stable-layout cache: atomically update sidecars");
+            let image_result = match &output {
+                PreparedOutput::InMemory(bytes) => write_cache_image_atomic(cache_dir, args, bytes),
+                #[cfg(target_os = "macos")]
+                PreparedOutput::Cloned(_) => clone_cache_image_atomic(cache_dir, args),
+            };
+            if image_result.is_err() {
+                return cache_miss("atomic baseline-image replacement failed");
+            }
+            let image_path = cache_image_path(cache_dir, args);
+            if !set_cache_image_token(&image_path, state.cache_image_token)
+                || cache_image_token(&image_path) != Some(state.cache_image_token)
+            {
+                return cache_miss("published baseline image token is unavailable");
+            }
+            if write_image_state_atomic(cache_dir, args, &state).is_err() {
+                return cache_miss("image state replacement failed");
+            }
         }
-        if write_image_state_atomic(cache_dir, args, &state).is_err() {
-            return cache_miss("image state replacement failed");
+    }
+    if resident_image_cache_enabled() {
+        if let PreparedOutput::InMemory(bytes) = output {
+            store_resident_image(cache_image, resident_state, bytes);
         }
     }
     eprintln!(

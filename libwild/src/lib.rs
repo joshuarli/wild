@@ -77,6 +77,8 @@ pub(crate) mod sframe;
 pub(crate) mod sharding;
 pub(crate) mod string_merging;
 pub(crate) mod stable_layout_cache;
+#[cfg(target_os = "macos")]
+pub mod stable_layout_cache_service;
 #[cfg(all(feature = "fork", unix))]
 pub(crate) mod subprocess;
 #[cfg(not(all(feature = "fork", unix)))]
@@ -159,11 +161,49 @@ pub fn run(mut args: Args) -> error::Result {
 /// A cache hit only patches a verified owned output image, so it has no work that benefits from a
 /// worker pool. Avoiding that fixed setup cost is material for the intentionally small
 /// changed-object links this path targets. All misses proceed through the ordinary linker.
-pub(crate) fn try_apply_macho_stable_layout_cache(args: &Args) -> bool {
+pub fn try_apply_macho_stable_layout_cache(args: &Args) -> bool {
     match args {
         Args::MachO(macho_args) => stable_layout_cache::try_apply(macho_args),
         Args::Coff(_) | Args::Elf(_) | Args::Wasm(_) => false,
     }
+}
+
+/// Attempts the cache service when it was explicitly requested, otherwise uses the ordinary
+/// on-disk cache. The service is a performance layer only: a failed connection leaves the normal
+/// cache path as the conservative fallback.
+pub fn try_apply_macho_stable_layout_cache_preflight(
+    args: &Args,
+    command_line: &[String],
+    version: &str,
+) -> bool {
+    #[cfg(target_os = "macos")]
+    if stable_layout_cache_service::requested() {
+        if let Args::MachO(macho_args) = args {
+            if let Some(hit) = stable_layout_cache_service::try_apply(macho_args, command_line, version) {
+                if hit {
+                    eprintln!(
+                        "wild: Mach-O stable-layout cache hit: {}",
+                        macho_args.output().display()
+                    );
+                }
+                if std::env::var_os("WILD_MACHO_INCREMENTAL_CACHE_DIAGNOSTICS").is_some() {
+                    eprintln!("wild: Mach-O cache service {}", if hit { "hit" } else { "miss" });
+                }
+                return hit;
+            }
+            if std::env::var_os("WILD_MACHO_INCREMENTAL_CACHE_DIAGNOSTICS").is_some() {
+                eprintln!("wild: Mach-O cache service unavailable");
+            }
+        }
+    }
+    try_apply_macho_stable_layout_cache(args)
+}
+
+/// A cache hit has no layout workers or tracing work. Attempt it before the regular fork/tracing
+/// setup when the caller did not request observable phase timing; profiled invocations retain the
+/// existing setup so `--time=json` keeps its complete cache phase record.
+pub fn should_preflight_macho_stable_layout_cache(args: &Args) -> bool {
+    args.common().time_phase_options.is_none()
 }
 
 /// Sets up whatever tracing, if any, is indicated by the supplied arguments. This can only be

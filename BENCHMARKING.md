@@ -166,25 +166,33 @@ direct-link median at or below `0.333×` Apple ld64 on the matched paired-captur
 builds, unrelated compile throughput, and an ordinary cache miss do not participate in that
 decision.
 
-### Full-image cache ceiling and the next architecture
+### Full-image cache ceiling and resident-service status
 
-The verified Rustc-private cache hit measured `90.7 ms` against `171.5 ms` for Apple ld64
-(`0.529×`) on the paired Cargo capture. Its internal phase is `52.7 ms`: materializing the `29 MB`
-cache image costs about `24 ms`, publishing the fresh executable about `6 ms`, and replacing the
-next persistent sidecar about `8 ms`. `--no-fork` reaches only `89.1 ms` (`0.519×`). These are
-output-image transfers, not linker-layout work, so more thread or scheduling sweeps are not a
-credible route to the `≤0.333×` target.
+The first verified Rustc-private cache hit measured `90.7 ms` against `171.5 ms` for Apple ld64
+(`0.529×`) on the paired Cargo capture. Eliminating the per-hit sidecar checkpoint improved the
+ordinary cache path to `82.1 ms` against `173.3 ms` (`0.473×`): it retains its immutable baseline
+until all 16 bounded direct-object changes need a rebase. This preserves a normal-link recovery
+path while removing an unnecessary second 29 MB write from ordinary one-object iterations.
 
-The next implementation is a per-cache-root, short-lived resident image service. The linker client
-must validate arguments and changed-object contracts exactly as today, then send the bounded patch
-set to a same-user Unix-socket service which keeps the current signed image and mutable input state
-resident. The service applies patches, rehashes only touched code-signature pages, atomically
-publishes the requested output, and acknowledges only after the existing header/codesign/runtime
-checks can succeed. It may persist its sidecars asynchronously; service loss is a cache miss and
-normal link, never stale output reuse. Different cache roots may run in parallel; requests for one
-root are serialized. Qualification requires a five-replay screen at `≤0.333×` followed by eleven
-interleaved confirmations, with the daemon warm-up and any restart recovery outside the timed
-replay.
+The experimental macOS-only resident service, enabled with
+`WILD_MACHO_INCREMENTAL_CACHE_SERVICE=1`, attempts to keep one validated current image and its
+mutable input state in a same-user Unix-socket process. Set
+`WILD_MACHO_INCREMENTAL_CACHE_SERVICE_DIR=$HOME/.cache/wild/services` when a long cache-root path
+would exceed the macOS socket-path limit. It is intentionally opt-in: a missing, stale, or failed
+service request falls through to the ordinary cache/normal-link recovery path. The socket and its
+short-lived process live below `~/.cache/wild`; different cache roots use distinct hashed sockets
+and requests for one service are serialized.
+
+On a five-replay paired screen whose follow-on replays refresh metadata on one already-changed
+Rustc codegen object, that service measured `67.94 ms` against `173.36 ms` for Apple ld64
+(`0.392×`). Every timed result had the normal cache-hit marker plus strict `codesign` and Cargo
+runtime validation. This is promising but not a promotion: it remains above the `≤0.333×` target,
+and a full 11-replay confirmation is required only after a candidate reaches that gate.
+
+The remaining work is service engineering, not layout scheduling: keep the service reliably warm
+across real Cargo invocations, remove duplicate client/server argument work and request transport
+cost, and reduce the fresh 29 MB executable publication cost. Do not claim a win from cold builds,
+or from a daemon warm-up/restart outside a timed direct replay.
 
 Goal prompt: make macOS ARM64 Wild incremental linking at least `3×` faster than Apple ld64 on the
 paired Cargo direct replay—`≤0.333×` median, `100%` verified cache hits, strict `codesign`, runtime
@@ -309,6 +317,22 @@ python3 benchmarks/cargo_direct_screen.py \
   --stable-layout-cache \
   --repetitions 5 \
   --output "$cache_root/benchmarks/cargo-direct-cache-screen-$(date +%F).json"
+```
+
+For the experimental resident service, give the service a short socket directory inside the cache
+root. The screen's follow-on samples refresh metadata on one verified changed object so every timed
+request represents a new bounded incremental input event; its separate resource replay restores the
+ordinary disk baseline and disables the service.
+
+```sh
+python3 benchmarks/cargo_direct_screen.py \
+  --capture "$capture_root/manifest.json" \
+  --candidate resident-cache="$cargo_target/aarch64-apple-darwin/dist/wild" \
+  --candidate-env resident-cache=WILD_MACHO_INCREMENTAL_CACHE_SERVICE=1 \
+  --candidate-env resident-cache=WILD_MACHO_INCREMENTAL_CACHE_SERVICE_DIR="$cache_root/services" \
+  --stable-layout-cache \
+  --repetitions 5 \
+  --output "$cache_root/benchmarks/cargo-resident-cache-screen-$(date +%F).json"
 ```
 
 Use this cache mode only for a topology whose current cache implementation can prove safe. A

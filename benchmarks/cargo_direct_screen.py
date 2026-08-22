@@ -326,6 +326,16 @@ def main(argv: list[str]) -> int:
                     "baseline_output_snapshot": baseline_output_snapshot,
                     "changed_output": changed_output,
                     "baseline_setup": baseline_setup,
+                    "resident_service": (
+                        cache_environment.get("WILD_MACHO_INCREMENTAL_CACHE_SERVICE") is not None
+                    ),
+                    "resident_service_ready": False,
+                    "resident_changed_input": next(
+                        Path(current["path"])
+                        for baseline, current in zip(baseline_input_records, input_records)
+                        if baseline["path"].endswith(".o")
+                        and baseline["sha256"] != current["sha256"]
+                    ),
                 }
         # Rotate the full linker order, including Apple, so systematic thermal drift cannot always
         # favour the same position. Each call owns its own output path and never mutates capture.
@@ -334,6 +344,23 @@ def main(argv: list[str]) -> int:
             for linker in [*linkers[offset:], *linkers[:offset]]:
                 cache_context = cache_contexts.get(linker.name)
                 if cache_context is not None:
+                    def prepare_cache_replay(context: dict[str, Any] = cache_context) -> None:
+                        if context["resident_service"]:
+                            if context["resident_service_ready"]:
+                                # Model a new incremental codegen object without changing this
+                                # paired capture's bytes: its fresh metadata makes the resident
+                                # cache validate and patch the same bounded object again.
+                                context["resident_changed_input"].touch()
+                            context["resident_service_ready"] = True
+                            return
+                        restore_cached_direct_baseline(
+                            baseline_output=context["baseline_output"],
+                            baseline_output_snapshot=context["baseline_output_snapshot"],
+                            cache_dir=context["cache_root"],
+                            cache_snapshot=context["cache_snapshot"],
+                            stale_published_output=context["changed_output"],
+                        )
+
                     samples[linker.name].extend(
                         replay_final_link(
                             command=cache_context["command"],
@@ -345,13 +372,7 @@ def main(argv: list[str]) -> int:
                             runtime=runtime,
                             runtime_cwd=runtime_cwd,
                             fixed_output=cache_context["changed_output"],
-                            prepare_replay=lambda context=cache_context: restore_cached_direct_baseline(
-                                baseline_output=context["baseline_output"],
-                                baseline_output_snapshot=context["baseline_output_snapshot"],
-                                cache_dir=context["cache_root"],
-                                cache_snapshot=context["cache_snapshot"],
-                                stale_published_output=context["changed_output"],
-                            ),
+                            prepare_replay=prepare_cache_replay,
                             require_stable_layout_cache_hit=True,
                         )
                     )
@@ -377,9 +398,22 @@ def main(argv: list[str]) -> int:
         for linker in linkers:
             cache_context = cache_contexts.get(linker.name)
             if cache_context is not None:
+                def prepare_resource_cache_replay(context: dict[str, Any] = cache_context) -> None:
+                    restore_cached_direct_baseline(
+                        baseline_output=context["baseline_output"],
+                        baseline_output_snapshot=context["baseline_output_snapshot"],
+                        cache_dir=context["cache_root"],
+                        cache_snapshot=context["cache_snapshot"],
+                        stale_published_output=context["changed_output"],
+                    )
+
+                resource_environment = dict(cache_context["environment"])
+                if cache_context["resident_service"]:
+                    resource_environment.pop("WILD_MACHO_INCREMENTAL_CACHE_SERVICE", None)
+                    resource_environment.pop("WILD_MACHO_INCREMENTAL_CACHE_SERVICE_DIR", None)
                 resource_samples[linker.name] = replay_final_link(
                     command=cache_context["command"],
-                    environment=cache_context["environment"],
+                    environment=resource_environment,
                     output_dir=screen_root / linker.name / "resources",
                     linker=linker,
                     repetitions=args.resource_repetitions,
@@ -387,13 +421,7 @@ def main(argv: list[str]) -> int:
                     runtime=runtime,
                     runtime_cwd=runtime_cwd,
                     fixed_output=cache_context["changed_output"],
-                    prepare_replay=lambda context=cache_context: restore_cached_direct_baseline(
-                        baseline_output=context["baseline_output"],
-                        baseline_output_snapshot=context["baseline_output_snapshot"],
-                        cache_dir=context["cache_root"],
-                        cache_snapshot=context["cache_snapshot"],
-                        stale_published_output=context["changed_output"],
-                    ),
+                    prepare_replay=prepare_resource_cache_replay,
                     require_stable_layout_cache_hit=True,
                     measure_resources=True,
                 )
