@@ -163,8 +163,9 @@ zstd = { version = "0.13.0", default-features = false }
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-panic = "abort"
 strip = true
+# Keep Cargo's default `panic = "unwind"`: `panic = "abort"` regresses the macOS Cargo
+# direct-link screen measured in BENCHMARKING.md.
 
 [profile.release-debug]
 inherits = "release"
