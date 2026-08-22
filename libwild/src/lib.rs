@@ -174,12 +174,11 @@ pub fn try_apply_macho_stable_layout_cache(args: &Args) -> bool {
 pub fn try_apply_macho_stable_layout_cache_preflight(
     args: &Args,
     command_line: &[String],
-    version: &str,
 ) -> bool {
     #[cfg(target_os = "macos")]
     if stable_layout_cache_service::requested() {
         if let Args::MachO(macho_args) = args {
-            if let Some(hit) = stable_layout_cache_service::try_apply(macho_args, command_line, version) {
+            if let Some(hit) = stable_layout_cache_service::try_apply(macho_args, command_line) {
                 if hit {
                     eprintln!(
                         "wild: Mach-O stable-layout cache hit: {}",
@@ -197,6 +196,23 @@ pub fn try_apply_macho_stable_layout_cache_preflight(
         }
     }
     try_apply_macho_stable_layout_cache(args)
+}
+
+/// On an opt-in resident-service hit, parsing the huge final-link argv in both short-lived client
+/// and service is wasted work. Probe the service directly from raw argv before normal parsing;
+/// every non-hit returns `None` or `Some(false)` so the regular parser remains authoritative.
+pub fn try_apply_macho_stable_layout_cache_from_command_line(
+    command_line: &[String],
+) -> Option<bool> {
+    #[cfg(target_os = "macos")]
+    if stable_layout_cache_service::requested()
+        && !command_line
+            .iter()
+            .any(|argument| argument == "--time" || argument.starts_with("--time="))
+    {
+        return stable_layout_cache_service::try_apply_command_line(command_line);
+    }
+    None
 }
 
 /// A cache hit has no layout workers or tracing work. Attempt it before the regular fork/tracing

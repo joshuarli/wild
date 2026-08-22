@@ -2044,8 +2044,8 @@ fn input_metadata_snapshots_match(args: &MachOArgs, inputs: &[InputDigest]) -> b
         && args
             .common()
             .inputs
-            .iter()
-            .zip(inputs)
+            .par_iter()
+            .zip(inputs.par_iter())
             .all(|(input, snapshot)| {
                 let Some(path) = cache_hit_input_path(args, input, snapshot) else {
                     return false;

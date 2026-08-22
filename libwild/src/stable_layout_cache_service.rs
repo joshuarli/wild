@@ -12,6 +12,7 @@ use std::fs;
 use std::io;
 use std::io::Read as _;
 use std::io::Write as _;
+use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::UnixListener;
 use std::os::unix::net::UnixStream;
@@ -25,8 +26,9 @@ use std::time::Instant;
 const ENABLE_ENV: &str = "WILD_MACHO_INCREMENTAL_CACHE_SERVICE";
 const SERVICE_DIRECTORY_ENV: &str = "WILD_MACHO_INCREMENTAL_CACHE_SERVICE_DIR";
 const DIAGNOSTICS_ENV: &str = "WILD_MACHO_INCREMENTAL_CACHE_DIAGNOSTICS";
+const TIMING_ENV: &str = "WILD_MACHO_INCREMENTAL_CACHE_SERVICE_TIMING";
 const DAEMON_ARGUMENT: &str = "--wild-macho-cache-service";
-const REQUEST_MAGIC: &[u8] = b"WILD-MACHO-CACHE-SERVICE-1\0";
+const REQUEST_MAGIC: &[u8] = b"WILD-MACHO-CACHE-SERVICE-3\0";
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const MAX_ARGUMENTS: usize = 100_000;
 const STARTUP_RETRIES: usize = 100;
@@ -39,23 +41,42 @@ pub(crate) fn requested() -> bool {
 pub(crate) fn try_apply(
     args: &MachOArgs,
     command_line: &[String],
-    version: &str,
 ) -> Option<bool> {
     let cache_dir = args.incremental_cache.as_deref()?;
-    try_apply_for_cache_dir(cache_dir, command_line, version)
+    try_apply_for_cache_dir(cache_dir, command_line)
 }
 
-fn try_apply_for_cache_dir(cache_dir: &Path, command_line: &[String], version: &str) -> Option<bool> {
+/// Locates the explicit cache directory without paying for the complete client-side linker
+/// parser. The service parses and validates the exact argv before it can report a hit; malformed
+/// or unsupported invocations simply take the ordinary linker path in the caller.
+pub(crate) fn try_apply_command_line(command_line: &[String]) -> Option<bool> {
+    let cache_dir = command_line
+        .windows(2)
+        .find(|arguments| arguments[0] == "-incremental_cache")
+        .map(|arguments| Path::new(&arguments[1]))?;
+    try_apply_for_cache_dir(cache_dir, command_line)
+}
+
+fn try_apply_for_cache_dir(cache_dir: &Path, command_line: &[String]) -> Option<bool> {
+    let request_started = Instant::now();
     let socket = socket_path(cache_dir)?;
     let mut stream = connect_or_start(cache_dir, &socket).ok()?;
     let current_dir = env::current_dir().ok()?;
-    write_request(&mut stream, &current_dir, command_line, version).ok()?;
-    let mut response = [0_u8; 1];
-    stream.read_exact(&mut response).ok()?;
-    Some(response[0] == 1)
+    write_request(&mut stream, &current_dir, command_line).ok()?;
+    let response = read_response(&mut stream).ok()?;
+    if env::var_os(TIMING_ENV).is_some() {
+        eprintln!(
+            "wild: Mach-O cache service timing: client_ns={} server_ns={} parse_ns={} apply_ns={}",
+            request_started.elapsed().as_nanos(),
+            response.server_ns,
+            response.parse_ns,
+            response.apply_ns,
+        );
+    }
+    Some(response.hit)
 }
 
-pub fn run(cache_dir: PathBuf) -> crate::error::Result {
+pub fn run(cache_dir: PathBuf, version: &'static str) -> crate::error::Result {
     let Some(socket) = socket_path(&cache_dir) else {
         return Ok(());
     };
@@ -73,42 +94,115 @@ pub fn run(cache_dir: PathBuf) -> crate::error::Result {
     let _ = listener.set_nonblocking(true);
     stable_layout_cache::enable_resident_image_cache();
 
-    let mut last_request = Instant::now();
     loop {
+        if !wait_for_request(&listener)? {
+            return Ok(());
+        }
         match listener.accept() {
             Ok((mut stream, _)) => {
-                let hit = match read_request(&mut stream) {
-                    Ok(request) => match apply_request(request) {
-                        Ok(hit) => hit,
+                // macOS propagates the listener's nonblocking flag to accepted Unix streams.
+                // Keep the listener nonblocking for the readiness/accept race, but a complete
+                // request is a short bounded frame and must wait for its remaining bytes.
+                let _ = stream.set_nonblocking(false);
+                let request_started = Instant::now();
+                let mut response = match read_request(&mut stream) {
+                    Ok(request) => match apply_request(request, version) {
+                        Ok(response) => response,
                         Err(error) => {
                             if env::var_os(DIAGNOSTICS_ENV).is_some() {
                                 eprintln!("wild: Mach-O cache service request failed: {error:?}");
                             }
-                            false
+                            Response::miss()
                         }
                     },
-                    Err(_) => false,
+                    Err(error) => {
+                        if env::var_os(DIAGNOSTICS_ENV).is_some() {
+                            eprintln!("wild: Mach-O cache service request decode failed: {error}");
+                        }
+                        Response::miss()
+                    }
                 };
-                let _ = stream.write_all(&[u8::from(hit)]);
-                last_request = Instant::now();
+                response.server_ns = request_started.elapsed().as_nanos();
+                let _ = write_response(&mut stream, &response);
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                if last_request.elapsed() >= IDLE_TIMEOUT {
-                    return Ok(());
-                }
-                thread::sleep(Duration::from_millis(20));
+                // A peer can disconnect while the socket is marked readable. Wait for the next
+                // event rather than adding a fixed sleep to every short-lived linker request.
             }
-            // A peer can disappear immediately after a successful reply. Treat any listener
-            // error as transient until the same idle boundary rather than dropping the resident
-            // image and leaving a stale pathname for the next linker process.
-            Err(_) => {
-                if last_request.elapsed() >= IDLE_TIMEOUT {
-                    return Ok(());
-                }
-                thread::sleep(Duration::from_millis(20));
-            }
+            // Treat a transient listener error as an empty readiness event. A later poll either
+            // accepts the next request or expires the bounded idle lifetime and cleans the socket.
+            Err(_) => {}
         }
     }
+}
+
+/// Blocks until a client connects or the service has been idle long enough to clean itself up.
+///
+/// The listener stays nonblocking after readiness because an unrelated peer may disconnect before
+/// `accept`. `poll` avoids the former 20 ms sleep between checks, which was visible in each tiny
+/// incremental link's wall time.
+fn wait_for_request(listener: &UnixListener) -> io::Result<bool> {
+    let timeout = i32::try_from(IDLE_TIMEOUT.as_millis()).expect("idle timeout fits poll");
+    let mut descriptor = libc::pollfd {
+        fd: listener.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        let ready = unsafe { libc::poll(&raw mut descriptor, 1, timeout) };
+        if ready > 0 {
+            return Ok(true);
+        }
+        if ready == 0 {
+            return Ok(false);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+struct Response {
+    hit: bool,
+    server_ns: u128,
+    parse_ns: u128,
+    apply_ns: u128,
+}
+
+impl Response {
+    fn miss() -> Self {
+        Self {
+            hit: false,
+            server_ns: 0,
+            parse_ns: 0,
+            apply_ns: 0,
+        }
+    }
+}
+
+fn write_response(stream: &mut UnixStream, response: &Response) -> io::Result<()> {
+    stream.write_all(&[u8::from(response.hit)])?;
+    stream.write_all(&response.server_ns.to_le_bytes())?;
+    stream.write_all(&response.parse_ns.to_le_bytes())?;
+    stream.write_all(&response.apply_ns.to_le_bytes())
+}
+
+fn read_response(stream: &mut UnixStream) -> io::Result<Response> {
+    let mut hit = [0_u8; 1];
+    let mut server_ns = [0_u8; size_of::<u128>()];
+    let mut parse_ns = [0_u8; size_of::<u128>()];
+    let mut apply_ns = [0_u8; size_of::<u128>()];
+    stream.read_exact(&mut hit)?;
+    stream.read_exact(&mut server_ns)?;
+    stream.read_exact(&mut parse_ns)?;
+    stream.read_exact(&mut apply_ns)?;
+    Ok(Response {
+        hit: hit[0] == 1,
+        server_ns: u128::from_le_bytes(server_ns),
+        parse_ns: u128::from_le_bytes(parse_ns),
+        apply_ns: u128::from_le_bytes(apply_ns),
+    })
 }
 
 fn socket_path(cache_dir: &Path) -> Option<PathBuf> {
@@ -161,11 +255,9 @@ fn write_request(
     stream: &mut UnixStream,
     current_dir: &Path,
     command_line: &[String],
-    version: &str,
 ) -> io::Result<()> {
     stream.write_all(REQUEST_MAGIC)?;
     write_string(stream, &current_dir.to_string_lossy())?;
-    write_string(stream, version)?;
     write_u32(stream, u32::try_from(command_line.len()).map_err(frame_too_large)?)?;
     for argument in command_line {
         write_string(stream, argument)?;
@@ -175,7 +267,6 @@ fn write_request(
 
 struct Request {
     current_dir: PathBuf,
-    version: String,
     command_line: Vec<String>,
 }
 
@@ -186,7 +277,6 @@ fn read_request(stream: &mut UnixStream) -> io::Result<Request> {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "wrong cache service request"));
     }
     let current_dir = PathBuf::from(read_string(stream)?);
-    let version = read_string(stream)?;
     let count = usize::try_from(read_u32(stream)?).map_err(frame_too_large)?;
     if count > MAX_ARGUMENTS {
         return Err(frame_too_large(count));
@@ -197,21 +287,28 @@ fn read_request(stream: &mut UnixStream) -> io::Result<Request> {
     }
     Ok(Request {
         current_dir,
-        version,
         command_line,
     })
 }
 
-fn apply_request(request: Request) -> crate::error::Result<bool> {
+fn apply_request(request: Request, version: &str) -> crate::error::Result<Response> {
+    let request_started = Instant::now();
     env::set_current_dir(request.current_dir)?;
     let arguments = || request.command_line.iter().map(String::as_str);
     let mut args = Args::new(arguments)?;
-    args.set_version(&request.version);
+    args.set_version(version);
     args.parse(arguments)?;
     let Args::MachO(args) = args else {
-        return Ok(false);
+        return Ok(Response::miss());
     };
-    Ok(stable_layout_cache::try_apply(&args))
+    let parsed = request_started.elapsed();
+    let hit = stable_layout_cache::try_apply(&args);
+    Ok(Response {
+        hit,
+        server_ns: 0,
+        parse_ns: parsed.as_nanos(),
+        apply_ns: request_started.elapsed().as_nanos() - parsed.as_nanos(),
+    })
 }
 
 fn write_u32(stream: &mut UnixStream, value: u32) -> io::Result<()> {

@@ -26,7 +26,18 @@ fn run() -> libwild::error::Result {
             .get(2)
             .map(std::path::PathBuf::from)
             .ok_or_else(|| libwild::error::Error::with_message("cache service requires a cache directory"))?;
-        return libwild::stable_layout_cache_service::run(cache_dir);
+        return libwild::stable_layout_cache_service::run(cache_dir, VERSION);
+    }
+
+    let service_attempt = libwild::try_apply_macho_stable_layout_cache_from_command_line(&command_line);
+    if service_attempt == Some(true) {
+        let output = command_line
+            .windows(2)
+            .find(|arguments| arguments[0] == "-o")
+            .map(|arguments| arguments[1].as_str())
+            .unwrap_or("<unknown output>");
+        eprintln!("wild: Mach-O stable-layout cache hit: {output}");
+        return Ok(());
     }
 
     libwild::init_timing()?;
@@ -36,8 +47,9 @@ fn run() -> libwild::error::Result {
     args.set_version(VERSION);
     args.parse(arguments)?;
 
-    if libwild::should_preflight_macho_stable_layout_cache(&args)
-        && libwild::try_apply_macho_stable_layout_cache_preflight(&args, &command_line, VERSION)
+    if service_attempt.is_none()
+        && libwild::should_preflight_macho_stable_layout_cache(&args)
+        && libwild::try_apply_macho_stable_layout_cache_preflight(&args, &command_line)
     {
         return Ok(());
     }

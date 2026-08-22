@@ -136,10 +136,11 @@ and runtime check remains bound. Other Rust codegen changes remain a normal-link
 
 The macOS incremental-link objective is more demanding than a normal-path comparison:
 on a matched baseline-to-changed Cargo topology, a persistent-cache candidate must produce a
-verified hit on every replay and have a median direct-link time at most `0.5×` Apple ld64's
+verified hit on every replay and have a median direct-link time at most `0.333×` Apple ld64's
 unchanged changed-link control. Five interleaved replays rank candidates; an 11-replay confirmation
-is required before promotion. A normal-link result is diagnostic context only; never relabel it as
-progress toward the cache target.
+is required before promotion. The workload's `0.5×` setting remains the minimum regression gate;
+the `0.333×` direct screen is the current promotion target. A normal-link result is diagnostic
+context only; never relabel it as progress toward the cache target.
 
 Each workload's `incremental_mutation` is an exact append or exact one-occurrence replacement.
 Prefer a same-size replacement that changes a real emitted byte over a comment-only edit. For a
@@ -161,9 +162,9 @@ promotion metric; the changed-source Cargo wall time is context only.
 The Cargo checkout pins `nightly-2026-07-24` because it has no `rust-toolchain.toml`. Apple samples
 omit all Wild arguments and therefore select vanilla Xcode ld64. Every Wild sample is required to
 retain ARM64 header evidence, strict `codesign` evidence, the Cargo `--version` runtime smoke check,
-and the direct-link RSS measurement. The hard target is a `100%` verified cache-hit rate and a
-direct-link median at or below `0.5×` Apple ld64 on the matched paired-capture cache screen; cold
-builds, unrelated compile throughput, and an ordinary cache miss do not participate in that
+and the direct-link RSS measurement. The promotion target is a `100%` verified cache-hit rate and
+a direct-link median at or below `0.333×` Apple ld64 on the matched paired-capture cache screen;
+cold builds, unrelated compile throughput, and an ordinary cache miss do not participate in that
 decision.
 
 ### Full-image cache ceiling and resident-service status
@@ -175,30 +176,32 @@ until all 16 bounded direct-object changes need a rebase. This preserves a norma
 path while removing an unnecessary second 29 MB write from ordinary one-object iterations.
 
 The experimental macOS-only resident service, enabled with
-`WILD_MACHO_INCREMENTAL_CACHE_SERVICE=1`, attempts to keep one validated current image and its
-mutable input state in a same-user Unix-socket process. Set
+`WILD_MACHO_INCREMENTAL_CACHE_SERVICE=1`, keeps one validated current image and mutable input
+state in a same-user Unix-socket process. Set
 `WILD_MACHO_INCREMENTAL_CACHE_SERVICE_DIR=$HOME/.cache/wild/services` when a long cache-root path
-would exceed the macOS socket-path limit. It is intentionally opt-in: a missing, stale, or failed
-service request falls through to the ordinary cache/normal-link recovery path. The socket and its
-short-lived process live below `~/.cache/wild`; different cache roots use distinct hashed sockets
-and requests for one service are serialized.
+would exceed the macOS socket-path limit. A native macOS client built from
+`wild/src/bin/macho-cache-client.c` submits raw linker argv without starting the Rust linker on a
+hit. The resident Rust service remains authoritative: it parses, validates, patches, signs, and
+publishes the output; every miss `exec`s the configured Wild binary. The listener uses event-driven
+readiness, then switches accepted streams back to blocking mode so a partially written request is
+never mistaken for a cache miss. A missing, stale, or failed service request falls through to the
+ordinary cache/normal-link recovery path. The socket and short-lived process live below
+`~/.cache/wild`; different cache roots use distinct hashed sockets and the direct screen removes
+its exact completed-screen socket.
 
-On a five-replay paired screen whose follow-on replays refresh metadata on one already-changed
-Rustc codegen object, that service measured `67.94 ms` against `173.36 ms` for Apple ld64
-(`0.392×`). The committed candidate's 11-replay confirmation measured `73.92 ms` against
-`173.32 ms` (`0.426×`, 2.34× faster). Every timed result had the normal cache-hit marker plus
-strict `codesign` and Cargo runtime validation. This qualifies the current `≤0.5×` direct-link
-goal; `≤0.333×` remains the stretch target.
+The thin client plus resident service confirmed `54.77 ms` against `172.15 ms` for Apple ld64 on
+the 11-replay paired Cargo screen (`0.318×`, `3.14×` faster). Every timed result had the normal
+cache-hit marker plus strict `codesign` and Cargo runtime validation. This clears the `≤0.333×`
+promotion target without a cold-build metric.
 
-The remaining work is service engineering, not layout scheduling: keep the service reliably warm
-across real Cargo invocations, remove duplicate client/server argument work and request transport
-cost, and reduce the fresh 29 MB executable publication cost. Do not claim a win from cold builds,
-or from a daemon warm-up/restart outside a timed direct replay.
+The next work is to preserve that margin under broader incremental topologies and reduce the
+remaining fresh executable publication cost. Do not claim a win from cold builds or from daemon
+warm-up/restart outside a timed direct replay.
 
-Goal prompt: make macOS ARM64 Wild incremental linking at least `2×` faster than Apple ld64 on the
-paired Cargo direct replay—`≤0.5×` median, `100%` verified cache hits, strict `codesign`, runtime
-smoke, bounded disk under `~/.cache/wild`, and no cold-build metric—then pursue a `3×` stretch
-(`≤0.333×`) by eliminating full executable materialization from the hot path while preserving
+Goal prompt: make macOS ARM64 Wild incremental linking consistently `≥3×` faster than Apple ld64
+on qualified Cargo direct replays—`≤0.333×` median, `100%` verified cache hits, strict `codesign`,
+runtime smoke, bounded disk under `~/.cache/wild`, and no cold-build metric—then pursue `4×`
+(`≤0.25×`) by reducing safe output publication and process-launch overhead without weakening
 fail-closed cache validation.
 
 ### One authoritative qualification run
@@ -321,17 +324,21 @@ python3 benchmarks/cargo_direct_screen.py \
   --output "$cache_root/benchmarks/cargo-direct-cache-screen-$(date +%F).json"
 ```
 
-For the experimental resident service, give the service a short socket directory inside the cache
-root. The screen's follow-on samples refresh metadata on one verified changed object so every timed
-request represents a new bounded incremental input event; its separate resource replay restores the
-ordinary disk baseline and disables the service.
+For the experimental resident service, build the thin macOS client into the cache root and give the
+service a short socket directory there. The screen's follow-on samples refresh metadata on one
+verified changed object so every timed request represents a new bounded incremental input event;
+its separate resource replay restores the ordinary disk baseline and disables the service.
 
 ```sh
+cache_client="$cache_root/wild-macho-cache-client"
+cc -O2 -Wall -Wextra -Werror wild/src/bin/macho-cache-client.c -o "$cache_client"
+
 python3 benchmarks/cargo_direct_screen.py \
   --capture "$capture_root/manifest.json" \
-  --candidate resident-cache="$cargo_target/aarch64-apple-darwin/dist/wild" \
+  --candidate resident-cache="$cache_client" \
   --candidate-env resident-cache=WILD_MACHO_INCREMENTAL_CACHE_SERVICE=1 \
   --candidate-env resident-cache=WILD_MACHO_INCREMENTAL_CACHE_SERVICE_DIR="$cache_root/services" \
+  --candidate-env resident-cache=WILD_MACHO_INCREMENTAL_CACHE_SERVICE_SERVER="$cargo_target/aarch64-apple-darwin/dist/wild" \
   --stable-layout-cache \
   --repetitions 5 \
   --output "$cache_root/benchmarks/cargo-resident-cache-screen-$(date +%F).json"
