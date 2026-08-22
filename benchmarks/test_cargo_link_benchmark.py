@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import importlib.util
 import tempfile
@@ -17,6 +18,13 @@ assert SPEC and SPEC.loader
 BENCHMARK = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = BENCHMARK
 SPEC.loader.exec_module(BENCHMARK)
+
+SCREEN_MODULE_PATH = Path(__file__).with_name("cargo_direct_screen.py")
+SCREEN_SPEC = importlib.util.spec_from_file_location("cargo_direct_screen", SCREEN_MODULE_PATH)
+assert SCREEN_SPEC and SCREEN_SPEC.loader
+SCREEN = importlib.util.module_from_spec(SCREEN_SPEC)
+sys.modules[SCREEN_SPEC.name] = SCREEN
+SCREEN_SPEC.loader.exec_module(SCREEN)
 
 
 class CargoLinkBenchmarkTests(unittest.TestCase):
@@ -63,6 +71,65 @@ class CargoLinkBenchmarkTests(unittest.TestCase):
             path = Path(temporary) / "rust-toolchain.toml"
             path.write_text('[toolchain]\nchannel = "nightly-2026-07-24"\n')
             self.assertEqual(BENCHMARK.parse_toolchain_channel(path), "nightly-2026-07-24")
+
+    def test_direct_capture_records_and_verifies_linker_file_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "cargo"
+            first_input = root / "first.o"
+            second_input = root / "libsecond.rlib"
+            first_input.write_bytes(b"first input")
+            second_input.write_bytes(b"second input")
+            command = [
+                "/usr/bin/ld",
+                "-o",
+                str(output),
+                str(first_input),
+                "-framework",
+                "Foundation",
+                str(second_input),
+            ]
+
+            records = BENCHMARK.direct_capture_input_records(command)
+
+            self.assertEqual(
+                [record["path"] for record in records],
+                [str(first_input.resolve()), str(second_input.resolve())],
+            )
+            BENCHMARK.verify_direct_capture_input_records(records)
+            second_input.write_bytes(b"altered data")
+            with self.assertRaisesRegex(ValueError, "digest changed"):
+                BENCHMARK.verify_direct_capture_input_records(records)
+
+    def test_direct_capture_replaces_only_the_linker_executable_for_a_candidate(self) -> None:
+        command = ["/usr/bin/ld", "-o", "/tmp/cargo", "/tmp/input.o"]
+
+        replay = BENCHMARK.direct_capture_replay_command(
+            command, BENCHMARK.Linker("candidate", Path("/tmp/wild-candidate"))
+        )
+
+        self.assertEqual(replay, ["/tmp/wild-candidate", "-o", "/tmp/cargo", "/tmp/input.o"])
+        self.assertEqual(
+            BENCHMARK.direct_capture_replay_command(
+                command, BENCHMARK.Linker("apple-ld64", None)
+            ),
+            command,
+        )
+
+    def test_direct_screen_candidates_are_cache_path_safe_and_support_wild_settings(self) -> None:
+        self.assertEqual(
+            SCREEN.parse_candidate("groups-96=/tmp/wild"),
+            ("groups-96", Path("/tmp/wild")),
+        )
+        self.assertEqual(
+            SCREEN.parse_candidate_environment("groups-96=WILD_FILES_PER_GROUP=96"),
+            ("groups-96", "WILD_FILES_PER_GROUP", "96"),
+        )
+        for value in ("../escape=/tmp/wild", "nested/name=/tmp/wild", "candidate=relative/wild"):
+            with self.assertRaisesRegex(argparse.ArgumentTypeError, "candidate"):
+                SCREEN.parse_candidate(value)
+        with self.assertRaisesRegex(argparse.ArgumentTypeError, "WILD_"):
+            SCREEN.parse_candidate_environment("groups-96=PATH=/bin")
 
     def test_linker_selection_accepts_xcode_response_file_diagnostic(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -524,6 +591,12 @@ class CargoLinkBenchmarkTests(unittest.TestCase):
         )
         self.assertEqual(
             BENCHMARK.resource_replay_command(command, BENCHMARK.Linker("wild", Path("/tmp/wild"))),
+            [*command, "--no-fork"],
+        )
+        self.assertEqual(
+            BENCHMARK.resource_replay_command(
+                command, BENCHMARK.Linker("groups-96", Path("/tmp/wild"))
+            ),
             [*command, "--no-fork"],
         )
 

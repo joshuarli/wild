@@ -44,6 +44,7 @@ from typing import Callable
 
 
 SCHEMA_VERSION = "cargo-link-build-benchmark/v3"
+DIRECT_CAPTURE_SCHEMA_VERSION = "cargo-incremental-direct-capture/v1"
 MACHO_64_MAGIC = 0xFEEDFACF
 CPU_TYPE_ARM64 = 0x0100000C
 MH_EXECUTE = 2
@@ -281,6 +282,74 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def direct_capture_input_records(command: list[str]) -> list[dict[str, Any]]:
+    """Records every distinct existing file argument of a captured direct linker command.
+
+    The linker executable and the published output are deliberately excluded: a screen replaces
+    both. Every remaining file argument is an immutable input contract for the reusable capture.
+    """
+    try:
+        output_index = command.index("-o") + 1
+        output = Path(command[output_index])
+    except (ValueError, IndexError) as error:
+        raise ValueError("Direct capture command must contain an output after -o") from error
+
+    records: list[dict[str, Any]] = []
+    recorded_paths: set[Path] = set()
+    for index, argument in enumerate(command):
+        if index in {0, output_index}:
+            continue
+        candidate = Path(argument)
+        if candidate == output or not candidate.is_file():
+            continue
+        resolved = candidate.resolve()
+        if resolved in recorded_paths:
+            continue
+        recorded_paths.add(resolved)
+        stat = resolved.stat()
+        records.append(
+            {
+                "path": str(resolved),
+                "size_bytes": stat.st_size,
+                "sha256": sha256_file(resolved),
+            }
+        )
+    if not records:
+        raise ValueError("Direct capture command has no existing file inputs")
+    return records
+
+
+def verify_direct_capture_input_records(records: list[dict[str, Any]]) -> None:
+    """Rejects a screen whose previously captured direct-link inputs have changed."""
+    if not records:
+        raise ValueError("Direct capture manifest has no input records")
+    for record in records:
+        path = record.get("path")
+        expected_size = record.get("size_bytes")
+        expected_digest = record.get("sha256")
+        if (
+            not isinstance(path, str)
+            or not isinstance(expected_size, int)
+            or isinstance(expected_size, bool)
+            or not isinstance(expected_digest, str)
+        ):
+            raise ValueError("Invalid direct capture input record")
+        candidate = Path(path)
+        if not candidate.is_file():
+            raise ValueError(f"Direct capture input is missing: {candidate}")
+        if candidate.stat().st_size != expected_size:
+            raise ValueError(f"Direct capture input size changed: {candidate}")
+        if sha256_file(candidate) != expected_digest:
+            raise ValueError(f"Direct capture input digest changed: {candidate}")
+
+
+def direct_capture_replay_command(command: list[str], linker: Linker) -> list[str]:
+    """Selects Apple ld64 or a candidate binary without changing the captured argv."""
+    if not command:
+        raise ValueError("Direct capture command is empty")
+    return list(command) if linker.path is None else [str(linker.path), *command[1:]]
 
 
 def parse_toolchain_channel(rust_toolchain: Path) -> str:
@@ -951,7 +1020,7 @@ def incremental_cache_path(command: list[str]) -> Path | None:
 
 def resource_replay_command(command: list[str], linker: Linker) -> list[str]:
     """Uses Wild's foreground linker process for comparable child-RSS measurements."""
-    return [*command, "--no-fork"] if linker.name == "wild" else list(command)
+    return [*command, "--no-fork"] if linker.path is not None else list(command)
 
 
 def wild_timing_phases(log_path: Path, output: Path) -> list[dict[str, Any]]:
@@ -1035,6 +1104,153 @@ def restore_source(path: Path, before: bytes, before_hash: str) -> str:
     if restored_hash != before_hash:
         raise RuntimeError(f"Failed to restore benchmark mutation in {path}")
     return restored_hash
+
+
+def capture_incremental_direct_inputs(
+    *,
+    source: Path,
+    capture_root: Path,
+    command: list[str],
+    workload: Workload,
+    environment: dict[str, str],
+    linker: Linker,
+    source_revision: str,
+    cargo_lock_sha256: str,
+    toolchain: dict[str, str],
+) -> dict[str, Any]:
+    """Creates one reusable, verified changed-source direct-link capture.
+
+    This is intentionally not a Cargo timing measurement. It performs the minimum baseline,
+    changed-source, and `save-temps` builds necessary to retain one exact final linker input set
+    for fast candidate screening. The capture owns its workspace and target tree until its caller
+    explicitly deletes `capture_root`.
+    """
+    if capture_root.exists() and any(capture_root.iterdir()):
+        raise FileExistsError(f"Refusing to mix a direct capture with existing state: {capture_root}")
+    capture_root.mkdir(parents=True, exist_ok=True)
+    environment = dict(environment)
+    temporary_directory = capture_root / "tmp"
+    temporary_directory.mkdir(exist_ok=False)
+    environment["TMPDIR"] = str(temporary_directory)
+    workspace = copy_workspace_to_scratch(source, capture_root)
+    target_dir = capture_root / "target"
+    logs_dir = capture_root / "logs"
+    logs_dir.mkdir(exist_ok=False)
+    mutation_path = workspace / workload.mutation.path
+    before = mutation_path.read_bytes()
+    before_hash = hashlib.sha256(before).hexdigest()
+    baseline_log = logs_dir / "baseline.log"
+    incremental_log = logs_dir / "incremental.log"
+    capture_log = logs_dir / "incremental-direct-capture.log"
+
+    try:
+        run_cargo_build(
+            command,
+            workspace=workspace,
+            environment=environment,
+            target_dir=target_dir,
+            log_path=baseline_log,
+        )
+        mutation_before, mutation_after = mutate_incremental_source(mutation_path, workload.mutation)
+        assert mutation_before == before_hash
+        run_cargo_build(
+            command,
+            workspace=workspace,
+            environment=environment,
+            target_dir=target_dir,
+            log_path=incremental_log,
+        )
+        incremental_output = primary_artifact_path(target_dir, workload, incremental_log, linker)
+        incremental_artifact = validate_artifact(
+            incremental_output,
+            workload.macho_file_type,
+            workload.runtime,
+            cwd=workspace,
+            environment=environment,
+        )
+        incremental_selection = linker_selection_evidence(incremental_log, linker)
+
+        capture_before, capture_after = append_capture_marker(
+            mutation_path, b"\n// wild benchmark reusable direct capture marker\n"
+        )
+        assert capture_before == mutation_after
+        capture_environment = dict(environment)
+        capture_environment["RUSTFLAGS"] = (
+            capture_environment.get("RUSTFLAGS", "") + " -C save-temps"
+        ).lstrip()
+        run_cargo_build(
+            command,
+            workspace=workspace,
+            environment=capture_environment,
+            target_dir=target_dir,
+            log_path=capture_log,
+        )
+        capture_output = primary_artifact_path(target_dir, workload, capture_log, linker)
+        direct_command = final_link_command(capture_log, linker, output=capture_output)
+        capture_artifact = validate_artifact(
+            capture_output,
+            workload.macho_file_type,
+            workload.runtime,
+            cwd=workspace,
+            environment=capture_environment,
+        )
+        input_records = direct_capture_input_records(direct_command)
+        restored_hash = restore_source(mutation_path, before, before_hash)
+        if any(Path(record["path"]).is_relative_to(temporary_directory) for record in input_records):
+            raise RuntimeError("Direct capture depends on a compiler temporary outside its target tree")
+        shutil.rmtree(temporary_directory)
+        verify_direct_capture_input_records(input_records)
+        manifest = {
+            "schema_version": DIRECT_CAPTURE_SCHEMA_VERSION,
+            "capture_root": str(capture_root),
+            "source": {
+                "workspace": str(source),
+                "git_revision": source_revision,
+                "cargo_lock_sha256": cargo_lock_sha256,
+            },
+            "toolchain": toolchain,
+            "workload": {
+                "name": workload.name,
+                "target": workload.target,
+                "profile": workload.profile,
+                "cargo_arguments": list(workload.cargo_arguments),
+                "mutation_path": workload.mutation.path,
+                "macho_file_type": workload.macho_file_type,
+                "runtime": asdict(workload.runtime) if workload.runtime is not None else None,
+            },
+            "capture": {
+                "workspace": str(workspace),
+                "target_dir": str(target_dir),
+                "direct_command": direct_command,
+                "direct_output": str(capture_output),
+                "input_records": input_records,
+                "incremental_selection_evidence": incremental_selection,
+                "incremental_artifact": incremental_artifact,
+                "capture_artifact": capture_artifact,
+                "mutation": {
+                    "before_sha256": mutation_before,
+                    "after_sha256": mutation_after,
+                    "capture_before_sha256": capture_before,
+                    "capture_after_sha256": capture_after,
+                    "restored_sha256": restored_hash,
+                },
+                "environment": {
+                    key: environment[key]
+                    for key in ("SDKROOT", "MACOSX_DEPLOYMENT_TARGET", "PATH")
+                    if key in environment
+                },
+            },
+        }
+        (capture_root / "manifest.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        # The command, validation evidence, and input manifest survive in `manifest.json`; raw
+        # Cargo logs are not needed to replay a successful capture and consume substantial space.
+        shutil.rmtree(logs_dir, ignore_errors=True)
+        return manifest
+    finally:
+        if mutation_path.exists() and mutation_path.read_bytes() != before:
+            restore_source(mutation_path, before, before_hash)
 
 
 def median_ns(samples: list[int]) -> int:

@@ -150,11 +150,38 @@ expensive for tuning. Future Cargo parity work should use two stages.
 | Direct-link screening | Replay the immutable capture with Apple ld64 and each candidate, collecting a short interleaved series and `--time=json` for Wild. | Variant builds and analysis can run in parallel, but same-host timing replays stay serial and round-robin with an Apple control. Separate machines may screen in parallel only if each has its own Apple controls and result file. Every replay writes to `screen/<candidate>/<sample>`. | Promote only repeatable direct-link wins, e.g. Wild/Apple ≤0.97, with no RSS or correctness regression. |
 | Full qualification | Run the command above after one candidate wins direct screening. | Serialized; this is the sole source for Cargo-incremental and final direct-link claims. | Both requested median ratios are ≤1.0 with validation and RSS evidence. |
 
-The capture-and-screen helper described above is the next benchmark-runner capability to add. It
-must write a manifest with the Cargo revision, toolchain, complete direct command, input checksums,
-output contract, and capture owner; it must never silently reuse a stale capture. Until that helper
-exists, use a one-pair `cargo_link_benchmark.py` run with `--wild-timing-json` as the screen, then
-delete its artifacts after reading the JSON.
+`benchmarks/cargo_direct_capture.py` and `benchmarks/cargo_direct_screen.py` implement the capture
+and direct-screen stages. A capture records the clean Cargo revision, toolchain, complete direct
+command, every existing file argument's checksum, and the validated output contract. A screen
+rehashes those inputs before it starts, so it refuses to silently reuse a stale target tree.
+
+```sh
+cache_root="$HOME/.cache/wild"
+capture_root="$cache_root/captures/cargo-$(git -C "$HOME/d/cargo" rev-parse --short HEAD)"
+cargo_target="$cache_root/wild-build"
+
+python3 benchmarks/cargo_direct_capture.py \
+  --config benchmarks/cargo.benchmark.json \
+  --workspace "$HOME/d/cargo" \
+  --cargo /opt/homebrew/opt/rustup/bin/cargo \
+  --capture-root "$capture_root"
+
+python3 benchmarks/cargo_direct_screen.py \
+  --capture "$capture_root/manifest.json" \
+  --candidate current="$cargo_target/aarch64-apple-darwin/dist/wild" \
+  --candidate groups-96="$cargo_target/aarch64-apple-darwin/dist/wild" \
+  --candidate-env groups-96=WILD_FILES_PER_GROUP=96 \
+  --repetitions 5 \
+  --output "$cache_root/benchmarks/cargo-direct-screen-$(date +%F).json"
+```
+
+The capture performs the three required Cargo builds once and retains its copied workspace and
+target tree so its direct inputs remain valid; it can therefore be substantial. The screen only
+creates disposable output artifacts and removes them on success, leaving its JSON result. After
+selecting a winner or invalidating the input revision, remove that exact `"$capture_root"`
+directory. Do not run two screens concurrently on the same Mac; instead, build and test variants
+in parallel, then put all surviving candidates in one round-robin screen with the shared Apple
+control. Use separate machines only when each has its own capture and Apple controls.
 
 The latest phase profile identifies input opening, layout, and output writing as the largest visible
 Wild direct-link phases. They are the first targets for a reusable-capture screen; do not repeatedly
