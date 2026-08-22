@@ -1133,6 +1133,49 @@ def restore_source(path: Path, before: bytes, before_hash: str) -> str:
     return restored_hash
 
 
+def prune_direct_capture_target(
+    *,
+    target_dir: Path,
+    input_records: list[dict[str, Any]],
+    direct_outputs: list[Path],
+) -> None:
+    """Retains only replay inputs and output paths in a successful direct-capture target.
+
+    `-C save-temps` leaves LLVM bitcode and intermediate object files that the direct screen never
+    reads. Keeping them turns a reusable input capture into a multi-gigabyte accidental cache.
+    Every retained path is first resolved and constrained to this capture-owned target directory;
+    files outside it (for example SDK inputs) are never candidates for deletion.
+    """
+    target_dir = require_benchmark_cache_path(target_dir)
+    if not target_dir.is_dir():
+        raise RuntimeError(f"Direct capture target directory is missing: {target_dir}")
+    retained: set[Path] = set()
+    for record in input_records:
+        path = record.get("path")
+        if isinstance(path, str):
+            candidate = Path(path).resolve()
+            if candidate.is_relative_to(target_dir):
+                retained.add(candidate)
+    for output in direct_outputs:
+        candidate = output.resolve()
+        if candidate.is_relative_to(target_dir):
+            retained.add(candidate)
+    if not retained:
+        raise RuntimeError("Direct capture has no target-owned inputs to retain")
+
+    for candidate in target_dir.rglob("*"):
+        if candidate.is_dir() or candidate.resolve() in retained:
+            continue
+        if candidate.is_file() or candidate.is_symlink():
+            candidate.unlink()
+    for candidate in sorted(target_dir.rglob("*"), key=lambda path: len(path.parts), reverse=True):
+        if candidate.is_dir():
+            try:
+                candidate.rmdir()
+            except OSError:
+                pass
+
+
 def capture_incremental_direct_inputs(
     *,
     source: Path,
@@ -1226,6 +1269,13 @@ def capture_incremental_direct_inputs(
         ):
             raise RuntimeError("Direct capture depends on a compiler temporary outside its target tree")
         shutil.rmtree(temporary_directory)
+        verify_direct_capture_input_records(baseline_input_records)
+        verify_direct_capture_input_records(input_records)
+        prune_direct_capture_target(
+            target_dir=target_dir,
+            input_records=captured_records,
+            direct_outputs=[baseline_output, incremental_output],
+        )
         verify_direct_capture_input_records(baseline_input_records)
         verify_direct_capture_input_records(input_records)
         manifest = {

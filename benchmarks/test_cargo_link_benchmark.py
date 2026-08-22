@@ -164,6 +164,7 @@ class CargoLinkBenchmarkTests(unittest.TestCase):
                 (target_dir / "output").write_bytes(b"executable")
                 input_name = "baseline.o" if log_path.name == "baseline.log" else "changed.o"
                 (target_dir / input_name).write_bytes(input_name.encode("utf-8"))
+                (target_dir / f"{input_name}.bc").write_bytes(b"unused compiler intermediate")
                 log_path.write_text(input_name)
                 return 0, 1
 
@@ -222,6 +223,11 @@ class CargoLinkBenchmarkTests(unittest.TestCase):
             self.assertEqual(capture["direct_command"][-1].split("/")[-1], "changed.o")
             self.assertTrue(capture["mutation"]["uses_rustc_save_temps"])
             self.assertEqual(source_file.read_bytes(), original_source)
+            self.assertTrue((capture_root / "target" / "baseline.o").is_file())
+            self.assertTrue((capture_root / "target" / "changed.o").is_file())
+            self.assertTrue((capture_root / "target" / "output").is_file())
+            self.assertFalse((capture_root / "target" / "baseline.o.bc").exists())
+            self.assertFalse((capture_root / "target" / "changed.o.bc").exists())
             self.assertFalse((capture_root / "tmp").exists())
             self.assertFalse((capture_root / "logs").exists())
 

@@ -266,7 +266,9 @@ successor, both with `-C save-temps`. It retains both immutable direct commands 
 in the same manifest, so persistent-cache work never compares artifacts generated with different
 Rustflags fingerprints. The ordinary direct screen continues to use the changed command. The
 capture retains its copied workspace and target tree so those direct inputs remain valid; it can
-therefore be substantial. A failed partial capture is removed by default;
+therefore be substantial. After verifying both input sets, it prunes the target tree to only the
+paired direct inputs and output paths; discarded `save-temps` bitcode and logs do not accumulate.
+A failed partial capture is removed by default;
 `--keep-failed-capture` is the explicit diagnostic escape hatch.
 The screen removes disposable output artifacts on either success or failure unless
 `--keep-artifacts` is supplied, leaving its JSON result on success. After selecting a winner or
