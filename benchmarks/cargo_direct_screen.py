@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import shutil
 import statistics
 import subprocess
@@ -29,6 +31,23 @@ from cargo_link_benchmark_impl import with_wild_timing_json
 
 
 SCREEN_SCHEMA_VERSION = "cargo-incremental-direct-screen/v1"
+RESIDENT_SERVICE_ENV = "WILD_MACHO_INCREMENTAL_CACHE_SERVICE"
+RESIDENT_SERVICE_DIRECTORY_ENV = "WILD_MACHO_INCREMENTAL_CACHE_SERVICE_DIR"
+
+
+def remove_resident_service_sockets(cache_contexts: dict[str, dict[str, Any]]) -> None:
+    """Removes only the completed screen's deterministic same-user service sockets."""
+    for context in cache_contexts.values():
+        if not context.get("resident_service"):
+            continue
+        cache_root = Path(context["cache_root"])
+        service_directory = Path(
+            context["environment"].get(RESIDENT_SERVICE_DIRECTORY_ENV, str(cache_root))
+        )
+        key = hashlib.sha256(os.fsencode(cache_root)).hexdigest()[:16]
+        socket = service_directory / f"macho-{key}.sock"
+        if socket.is_socket():
+            socket.unlink()
 
 
 def parse_candidate(value: str) -> tuple[str, Path]:
@@ -327,7 +346,7 @@ def main(argv: list[str]) -> int:
                     "changed_output": changed_output,
                     "baseline_setup": baseline_setup,
                     "resident_service": (
-                        cache_environment.get("WILD_MACHO_INCREMENTAL_CACHE_SERVICE") is not None
+                        cache_environment.get(RESIDENT_SERVICE_ENV) is not None
                     ),
                     "resident_service_ready": False,
                     "resident_changed_input": next(
@@ -409,8 +428,8 @@ def main(argv: list[str]) -> int:
 
                 resource_environment = dict(cache_context["environment"])
                 if cache_context["resident_service"]:
-                    resource_environment.pop("WILD_MACHO_INCREMENTAL_CACHE_SERVICE", None)
-                    resource_environment.pop("WILD_MACHO_INCREMENTAL_CACHE_SERVICE_DIR", None)
+                    resource_environment.pop(RESIDENT_SERVICE_ENV, None)
+                    resource_environment.pop(RESIDENT_SERVICE_DIRECTORY_ENV, None)
                 resource_samples[linker.name] = replay_final_link(
                     command=cache_context["command"],
                     environment=resource_environment,
@@ -483,6 +502,7 @@ def main(argv: list[str]) -> int:
         print(json.dumps(result["comparison"], indent=2, sort_keys=True))
         return 0
     finally:
+        remove_resident_service_sockets(cache_contexts)
         remove_benchmark_artifacts(screen_root, keep_artifacts=args.keep_artifacts)
 
 

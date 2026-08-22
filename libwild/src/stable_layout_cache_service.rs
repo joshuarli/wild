@@ -6,6 +6,7 @@
 use crate::Args;
 use crate::stable_layout_cache;
 use crate::args::macho::MachOArgs;
+use sha2::Digest as _;
 use std::env;
 use std::fs;
 use std::io;
@@ -115,8 +116,13 @@ fn socket_path(cache_dir: &Path) -> Option<PathBuf> {
         .map(PathBuf::from)
         .unwrap_or_else(|| cache_dir.to_path_buf());
     fs::create_dir_all(&service_directory).ok()?;
-    let cache_key = blake3::hash(cache_dir.as_os_str().as_encoded_bytes()).to_hex();
-    let path = service_directory.join(format!("macho-{}.sock", &cache_key[..16]));
+    let cache_key = sha2::Sha256::digest(cache_dir.as_os_str().as_encoded_bytes());
+    let cache_key = u64::from_be_bytes(
+        cache_key[..8]
+            .try_into()
+            .expect("SHA-256 prefix has exactly eight bytes"),
+    );
+    let path = service_directory.join(format!("macho-{cache_key:016x}.sock"));
     (path.as_os_str().as_encoded_bytes().len() < 100).then_some(path)
 }
 
