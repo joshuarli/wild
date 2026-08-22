@@ -571,6 +571,14 @@ impl FileSystem for OsFileSystem {
 
 fn default_file_write_mode_for_file(file: &std::fs::File) -> FileWriteMode {
     cfg_select! {
+        target_os = "macos" => {
+            // On Apple Silicon, the final Cargo link writes many disjoint output ranges. Building
+            // them in memory and issuing one sequential write is faster than dirtying an output
+            // mapping, without raising the measured peak RSS. `--mmap-output-file` remains the
+            // explicit opt-in for callers whose storage benefits from a mapped output.
+            let _ = file;
+            FileWriteMode::BufferThenWrite
+        }
         any(target_os = "android", target_os = "linux") => {
             match nix::sys::statfs::fstatfs(file)
                 .map(|stat| stat.filesystem_type())
@@ -589,6 +597,20 @@ fn default_file_write_mode_for_file(file: &std::fs::File) -> FileWriteMode {
             let _ = file;
             FileWriteMode::Mmap
         }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn macos_defaults_to_buffered_output() {
+        let file = File::open("/dev/null").unwrap();
+        assert!(matches!(
+            default_file_write_mode_for_file(&file),
+            FileWriteMode::BufferThenWrite
+        ));
     }
 }
 

@@ -14,15 +14,46 @@ use anyhow::anyhow;
 use crossbeam_queue::ArrayQueue;
 use std::fmt::Display;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 use std::time::Duration;
 use std::time::Instant;
 use tracing::field::Visit;
 
 const PERFETTO_ENV_VAR: &str = "WILD_PERFETTO_OUT";
+const TIMING_OUTPUT_UNSET: u8 = 0;
+const TIMING_OUTPUT_TEXT: u8 = 1;
+const TIMING_OUTPUT_JSON: u8 = 2;
+
+/// The opt-in phase output used by `timing_guard!`. An unset value deliberately preserves normal
+/// tracing spans for logging subscribers; only JSON can omit individual span callsites.
+static TIMING_OUTPUT: AtomicU8 = AtomicU8::new(TIMING_OUTPUT_UNSET);
+
+/// Perfetto consumes the complete span tree, including phases that JSON intentionally omits.
+static PERFETTO_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Retains a conditionally-created timing guard behind a concrete `Drop` implementation.
+/// `Linker` type-erases its long-lived link and shutdown guards as `dyn Drop`, while `Option<T>`
+/// itself cannot be used for that trait object.
+#[doc(hidden)]
+pub struct TimingGuard<T>(Option<T>);
+
+impl<T> TimingGuard<T> {
+    #[doc(hidden)]
+    pub fn new(inner: Option<T>) -> Self {
+        Self(inner)
+    }
+}
+
+impl<T> Drop for TimingGuard<T> {
+    fn drop(&mut self) {}
+}
 
 pub fn setup() -> Result {
     if perfetto_output_file().is_some() {
+        PERFETTO_ENABLED.store(true, Ordering::Relaxed);
         perfetto_recorder::start().map_err(
             |_: perfetto_recorder::TracingDisabledAtBuildTime| {
                 anyhow!(
@@ -36,8 +67,34 @@ pub fn setup() -> Result {
 
 #[macro_export]
 macro_rules! timing_guard {
-    ($($args:tt)*) => {
-        (tracing::info_span!($($args)*).entered(), perfetto_recorder::start_span!($($args)*))
+    ($name:literal $($args:tt)*) => {
+        if $crate::timing::should_start_timing_span($name) {
+            (
+                $crate::timing::TimingGuard::new(Some(
+                    tracing::info_span!($name $($args)*).entered(),
+                )),
+                $crate::timing::TimingGuard::new(Some(perfetto_recorder::start_span!($name $($args)*))),
+            )
+        } else {
+            (
+                $crate::timing::TimingGuard::new(None),
+                $crate::timing::TimingGuard::new(None),
+            )
+        }
+    };
+    ($name:expr, $($args:tt)*) => {
+        (
+            $crate::timing::TimingGuard::new(Some(
+                tracing::info_span!($name, $($args)*).entered(),
+            )),
+            $crate::timing::TimingGuard::new(Some(perfetto_recorder::start_span!($name, $($args)*))),
+        )
+    };
+    ($name:expr) => {
+        (
+            $crate::timing::TimingGuard::new(Some(tracing::info_span!($name).entered())),
+            $crate::timing::TimingGuard::new(Some(perfetto_recorder::start_span!($name))),
+        )
     };
 }
 
@@ -110,6 +167,15 @@ where
 {
     fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
         Some(tracing::level_filters::LevelFilter::INFO)
+    }
+
+    fn enabled(
+        &self,
+        metadata: &tracing::Metadata<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) -> bool {
+        *metadata.level() <= tracing::Level::INFO
+            && should_collect_timing_span(self.output, metadata.name())
     }
 
     fn on_new_span(
@@ -243,7 +309,15 @@ pub(crate) fn init_tracing(
     };
 
     let subscriber = tracing_subscriber::Registry::default().with(layer);
-    tracing::subscriber::set_global_default(subscriber).map_err(|_| AlreadyInitialised)
+    tracing::subscriber::set_global_default(subscriber).map_err(|_| AlreadyInitialised)?;
+    TIMING_OUTPUT.store(
+        match options.output {
+            TimingOutput::Text => TIMING_OUTPUT_TEXT,
+            TimingOutput::Json => TIMING_OUTPUT_JSON,
+        },
+        Ordering::Relaxed,
+    );
+    Ok(())
 }
 
 /// Whether `--time=json` emits this completed phase.
@@ -289,6 +363,40 @@ fn should_emit_json_phase(name: &str) -> bool {
             | "Mach-O stable-layout cache: atomically replace output"
             | "Mach-O stable-layout cache: atomically update sidecars"
     )
+}
+
+/// JSON timing is a deliberately bounded benchmark interface. Rejecting an inner span before the
+/// subscriber allocates its timing state keeps per-atom tracing from perturbing the short links
+/// that this output mode measures. Text timing remains the exhaustive interactive trace.
+fn should_collect_timing_span(output: TimingOutput, name: &str) -> bool {
+    match output {
+        TimingOutput::Text => true,
+        TimingOutput::Json => should_emit_json_phase(name),
+    }
+}
+
+/// Avoid constructing a tracing span when JSON will not retain it. Normal logging keeps the
+/// complete span tree, and Perfetto still receives every phase independently of JSON selection.
+#[doc(hidden)]
+pub fn should_start_timing_span(name: &str) -> bool {
+    let output = match TIMING_OUTPUT.load(Ordering::Relaxed) {
+        TIMING_OUTPUT_TEXT => TimingOutput::Text,
+        TIMING_OUTPUT_JSON => TimingOutput::Json,
+        TIMING_OUTPUT_UNSET | _ => return true,
+    };
+    should_start_timing_span_for_output(
+        output,
+        PERFETTO_ENABLED.load(Ordering::Relaxed),
+        name,
+    )
+}
+
+fn should_start_timing_span_for_output(
+    output: TimingOutput,
+    perfetto_enabled: bool,
+    name: &str,
+) -> bool {
+    perfetto_enabled || should_collect_timing_span(output, name)
 }
 
 /// Writes one selected `--time=json` record. The field names and their order are part of the
@@ -452,6 +560,39 @@ mod tests {
         ));
         assert!(!should_emit_json_phase("Record Mach-O live atom"));
         assert!(!should_emit_json_phase("Write object"));
+    }
+
+    #[test]
+    fn json_timing_skips_nonreporting_spans_before_collecting_them() {
+        assert!(should_collect_timing_span(TimingOutput::Json, "Link"));
+        assert!(!should_collect_timing_span(
+            TimingOutput::Json,
+            "Record Mach-O live atom"
+        ));
+        assert!(should_collect_timing_span(
+            TimingOutput::Text,
+            "Record Mach-O live atom"
+        ));
+    }
+
+    #[test]
+    fn json_timing_does_not_create_unreported_spans() {
+        assert!(should_start_timing_span_for_output(
+            TimingOutput::Json,
+            false,
+            "Link"
+        ));
+        assert!(!should_start_timing_span_for_output(
+            TimingOutput::Json,
+            false,
+            "Record Mach-O live atom"
+        ));
+        // Perfetto remains exhaustive even when JSON phase reporting is deliberately bounded.
+        assert!(should_start_timing_span_for_output(
+            TimingOutput::Json,
+            true,
+            "Record Mach-O live atom"
+        ));
     }
 }
 

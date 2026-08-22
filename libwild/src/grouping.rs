@@ -23,6 +23,15 @@ use crate::timing_phase;
 use crate::verbose_timing_phase;
 use std::fmt::Display;
 
+/// Large Apple-Silicon archive links benefit from a smaller upper bound than the FileId
+/// representation allows. Symbol-based grouping still determines the final group size for small
+/// files.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const DEFAULT_MAX_FILES_PER_GROUP: usize = 128;
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+const DEFAULT_MAX_FILES_PER_GROUP: usize = MAX_FILES_PER_GROUP as usize;
+
 #[derive(Debug)]
 pub(crate) enum Group<'data, P: Platform> {
     Prelude(Prelude<'data, P>),
@@ -278,9 +287,7 @@ fn determine_max_files_per_group(args: &impl platform::Args) -> usize {
         return v as usize;
     }
 
-    // We may eventually find that a lower value based on the number of threads is better, but for
-    // now, if files are small, we allow lots of them in a single group.
-    crate::input_data::MAX_FILES_PER_GROUP as usize
+    DEFAULT_MAX_FILES_PER_GROUP
 }
 
 /// Compute the total number of symbols in the supplied objects.
@@ -470,5 +477,17 @@ impl<'db, 'data, P: Platform> std::fmt::Display for SequencedInput<'db, 'data, P
             #[cfg(all(feature = "plugins", unix))]
             SequencedInput::LtoInput(o) => std::fmt::Display::fmt(o, f),
         }
+    }
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn macos_arm64_defaults_to_128_files_per_group() {
+        let args = crate::args::macho::MachOArgs::default();
+
+        assert_eq!(determine_max_files_per_group(&args), 128);
     }
 }

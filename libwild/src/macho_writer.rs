@@ -164,13 +164,22 @@ pub(crate) fn write<'data, A: Arch<Platform = MachO>>(
     layout: &MachOLayout<'data>,
 ) -> Result {
     timing_phase!("Write data to file");
-    let exports_trie = {
-        timing_phase!("Build Mach-O exports trie");
-        build_exports_trie(layout)?
-    };
-    let (mut section_buffers, mut padding) =
-        split_output_into_sections(layout, &mut sized_output.out);
-    padding.fill_zero();
+    // Building the exports trie only reads the completed layout. Prepare the independent output
+    // slices and zero their padding concurrently so the first object-copy worker need not wait
+    // for both setup tasks in sequence.
+    let (exports_trie, mut section_buffers) = rayon::join(
+        || {
+            timing_phase!("Build Mach-O exports trie");
+            build_exports_trie(layout)
+        },
+        || {
+            let (section_buffers, mut padding) =
+                split_output_into_sections(layout, &mut sized_output.out);
+            padding.fill_zero();
+            section_buffers
+        },
+    );
+    let exports_trie = exports_trie?;
 
     {
         timing_phase!("Copy Mach-O object data");
@@ -2469,17 +2478,32 @@ fn chained_fixups(
         });
     }
 
-    for fixup in local_rebase_fixups(layout, output)? {
+    // These scans all read the completed layout and input mappings, but produce independent
+    // collections. Run them concurrently while the writer pool is otherwise idle; applying the
+    // results below retains the existing deterministic category order in each output segment.
+    let (local_rebases, (direct_dynamic_binds, local_got_rebases)) = rayon::join(
+        || local_rebase_fixups(layout, output),
+        || {
+            rayon::join(
+                || direct_dynamic_data_bind_fixups(layout),
+                || local_got_rebase_fixups(layout, eh_frame_personality_rebases),
+            )
+        },
+    );
+    let local_rebases = local_rebases?;
+    for fixup in local_rebases {
         let (segment_index, _) = segment_for_address(layout, fixup.address, GOT_ENTRY_SIZE)?;
         fixups_by_segment[segment_index].push(fixup);
     }
 
-    for fixup in direct_dynamic_data_bind_fixups(layout)? {
+    let direct_dynamic_binds = direct_dynamic_binds?;
+    for fixup in direct_dynamic_binds {
         let (segment_index, _) = segment_for_address(layout, fixup.address, GOT_ENTRY_SIZE)?;
         fixups_by_segment[segment_index].push(fixup);
     }
 
-    for fixup in local_got_rebase_fixups(layout, eh_frame_personality_rebases)? {
+    let local_got_rebases = local_got_rebases?;
+    for fixup in local_got_rebases {
         let (segment_index, _) = segment_for_address(layout, fixup.address, GOT_ENTRY_SIZE)?;
         fixups_by_segment[segment_index].push(fixup);
     }

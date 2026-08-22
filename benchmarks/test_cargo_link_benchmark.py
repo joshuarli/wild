@@ -26,6 +26,38 @@ class CargoLinkBenchmarkTests(unittest.TestCase):
             "aarch64-apple-darwin/dist/wild",
         )
 
+    def test_copy_workspace_can_use_a_configured_scratch_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            (source / "Cargo.toml").write_text("[package]\nname = 'fixture'\n")
+            (source / ".git").mkdir()
+            (source / "target").mkdir()
+            scratch_root = root / "scratch"
+
+            copied = BENCHMARK.copy_workspace_to_scratch(source, scratch_root)
+
+            self.assertTrue(copied.is_relative_to(scratch_root))
+            self.assertEqual((copied / "Cargo.toml").read_text(), "[package]\nname = 'fixture'\n")
+            self.assertFalse((copied / ".git").exists())
+            self.assertFalse((copied / "target").exists())
+
+    def test_sanitized_environment_uses_configured_temporary_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            temporary_directory = Path(temporary) / "compiler-tmp"
+
+            environment = BENCHMARK.sanitized_environment(
+                clang=Path("/tmp/clang"),
+                sdk="/tmp/sdk",
+                wild=None,
+                deployment_target="15.0",
+                temporary_directory=temporary_directory,
+            )
+
+            self.assertEqual(environment["TMPDIR"], str(temporary_directory))
+            self.assertTrue(temporary_directory.is_dir())
+
     def test_parse_toolchain_channel(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "rust-toolchain.toml"
@@ -578,12 +610,31 @@ class CargoLinkBenchmarkTests(unittest.TestCase):
                 "/tmp/repository",
                 "--output",
                 "/tmp/result.json",
+                "--scratch-root",
+                "/tmp/benchmark-scratch",
                 "--cargo",
                 "/opt/homebrew/opt/rustup/bin/cargo",
             ]
         )
         self.assertEqual(args.cargo, Path("/opt/homebrew/opt/rustup/bin/cargo"))
         self.assertEqual(args.repetitions, 5)
+        self.assertEqual(args.scratch_root, Path("/tmp/benchmark-scratch"))
+        self.assertFalse(args.keep_artifacts)
+
+    def test_artifact_retention_is_opt_in(self) -> None:
+        args = BENCHMARK.parse_args(
+            [
+                "--config",
+                "workload.json",
+                "--workspace",
+                "/tmp/repository",
+                "--output",
+                "/tmp/result.json",
+                "--keep-artifacts",
+            ]
+        )
+
+        self.assertTrue(args.keep_artifacts)
 
     def test_macho_header_rejects_wrong_architecture(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

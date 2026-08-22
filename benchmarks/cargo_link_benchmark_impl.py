@@ -10,10 +10,12 @@ captures a no-cache cold final-link replay, so Rust/LTO work never obscures the 
 directory. By default it does not claim that Wild implements incremental linking; the explicit
 `--wild-incremental-cache` mode instead measures Wild's separately verified stable-layout cache.
 
-The benchmark never mutates the supplied checkout. Each sample copies it to a temporary sibling
-directory, so relative path dependencies outside the source tree retain their relationship. A
-fresh target directory is used for each linker/sample, but cold and incremental builds for that
-sample share it. This is a cold-Cargo-target benchmark, not an attempt to flush the OS file cache.
+The benchmark never mutates the supplied checkout. Each sample normally copies it to a temporary
+sibling directory, so relative path dependencies outside the source tree retain their relationship.
+`--scratch-root` instead places disposable copies and compiler temporaries under a caller-selected
+root. A fresh target directory is used for each linker/sample, but cold and incremental builds for
+that sample share it. This is a cold-Cargo-target benchmark, not an attempt to flush the OS file
+cache.
 """
 
 from __future__ import annotations
@@ -416,9 +418,11 @@ def clean_git_revision(workspace: Path) -> str:
     return run_checked(["git", "-C", str(workspace), "rev-parse", "HEAD"]).strip()
 
 
-def copy_workspace_to_sibling(source: Path) -> Path:
-    """Copies source to a sibling, preserving relative external path dependencies."""
-    copied = Path(tempfile.mkdtemp(prefix=".wild-cargo-link-benchmark-", dir=source.parent))
+def copy_workspace_to_scratch(source: Path, scratch_root: Path | None = None) -> Path:
+    """Copies a source checkout to scratch, preserving sibling placement unless configured."""
+    destination_root = source.parent if scratch_root is None else scratch_root
+    destination_root.mkdir(parents=True, exist_ok=True)
+    copied = Path(tempfile.mkdtemp(prefix=".wild-cargo-link-benchmark-", dir=destination_root))
     for entry in source.iterdir():
         if entry.name in {".git", "target"}:
             continue
@@ -436,6 +440,7 @@ def sanitized_environment(
     sdk: str,
     wild: Path | None,
     deployment_target: str,
+    temporary_directory: Path | None = None,
 ) -> dict[str, str]:
     """Builds a deterministic Cargo environment with no inherited linker/wrapper override.
 
@@ -455,6 +460,9 @@ def sanitized_environment(
             "CARGO_INCREMENTAL": "1",
         }
     )
+    if temporary_directory is not None:
+        temporary_directory.mkdir(parents=True, exist_ok=True)
+        environment["TMPDIR"] = str(temporary_directory)
     flags = [f"-C linker={clang}", "-C link-arg=-v"]
     if wild is not None:
         flags.insert(1, f"-C link-arg=--ld-path={wild}")
@@ -1269,6 +1277,7 @@ def run_sample(
     *,
     source: Path,
     result_root: Path,
+    scratch_root: Path | None,
     cargo: Path,
     channel: str,
     command: list[str],
@@ -1282,7 +1291,7 @@ def run_sample(
     wild_timing_json: bool,
     wild_incremental_cache_root: Path | None,
 ) -> dict[str, Any]:
-    workspace = copy_workspace_to_sibling(source)
+    workspace = copy_workspace_to_scratch(source, scratch_root)
     target_dir = result_root / "targets" / f"{linker.name}-{sample_index}"
     logs_dir = result_root / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
@@ -1383,6 +1392,12 @@ def run_sample(
         # the measured cold -> incremental sequence free of an extra capture rebuild while still
         # preserving command-equivalent Cargo timings.
         restore_source(mutation_path, before, before_hash)
+        # The measured Cargo targets have yielded their timing and validation evidence. Each
+        # `save-temps` capture below owns the inputs for its own direct replay, so retaining this
+        # target would only multiply the runner's temporary disk peak.
+        shutil.rmtree(target_dir, ignore_errors=True)
+        if cache_setup_target is not None:
+            shutil.rmtree(cache_setup_target, ignore_errors=True)
         cold_link_capture_target = target_dir / "cold-link-capture"
         cold_link_capture_log = logs_dir / f"{linker.name}-{sample_index}-cold-link-capture.log"
         cold_link_capture_environment = dict(environment)
@@ -1434,6 +1449,9 @@ def run_sample(
             "samples": cold_link,
             "resource_samples": cold_link_resources,
         }
+        # Cold direct replays are complete. Their measurements and logs are retained under
+        # `logs_dir`, whereas this Cargo target exists only to supply now-consumed linker inputs.
+        shutil.rmtree(cold_link_capture_target, ignore_errors=True)
         # The incremental direct-link capture below needs the changed source again. The final
         # restore in the `finally` path still guarantees that the disposable workspace is clean.
         mutate_incremental_source(mutation_path, workload.mutation)
@@ -1819,6 +1837,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--output", type=Path, required=True, help="JSON result path")
     parser.add_argument(
+        "--scratch-root",
+        type=Path,
+        help=(
+            "Root for disposable workspace copies and compiler temporaries. The default is a "
+            "sibling of --workspace, which preserves relative external path dependencies."
+        ),
+    )
+    parser.add_argument(
         "--repetitions",
         type=int,
         default=5,
@@ -1838,6 +1864,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--allow-network", action="store_true", help="Do not pass Cargo --offline")
     parser.add_argument("--keep-workspaces", action="store_true")
+    parser.add_argument(
+        "--keep-artifacts",
+        action="store_true",
+        help="Retain successful-run logs and replay output; failures always retain them",
+    )
     parser.add_argument(
         "--wild-timing-json",
         action="store_true",
@@ -1865,6 +1896,7 @@ def main(argv: list[str]) -> int:
     workload = load_workload(args.config.resolve())
     wild = args.wild.resolve()
     output = args.output.resolve()
+    scratch_root = args.scratch_root.resolve() if args.scratch_root is not None else None
     if output.exists():
         raise FileExistsError(f"Refusing to overwrite benchmark result: {output}")
     if not wild.is_file():
@@ -1890,6 +1922,7 @@ def main(argv: list[str]) -> int:
     if result_root.exists():
         raise FileExistsError(f"Refusing to overwrite benchmark artifacts: {result_root}")
     result_root.mkdir(parents=True)
+    temporary_directory = scratch_root / "tmp" if scratch_root is not None else None
     wild_incremental_cache_root: Path | None = None
     if args.wild_incremental_cache is not None:
         wild_incremental_cache_root = args.wild_incremental_cache.resolve()
@@ -1904,6 +1937,7 @@ def main(argv: list[str]) -> int:
 
     linkers = [Linker("apple-ld64", None), Linker("wild", wild)]
     runs: list[dict[str, Any]] = []
+    succeeded = False
     try:
         # Interleave and alternate linker order so build-cache warmth, thermal drift, and unrelated
         # host load do not systematically favour whichever linker happens to run first or last.
@@ -1916,11 +1950,13 @@ def main(argv: list[str]) -> int:
                     sdk=sdk,
                     wild=linker.path,
                     deployment_target=workload.deployment_target,
+                    temporary_directory=temporary_directory,
                 )
                 runs.append(
                     run_sample(
                         source=workspace,
                         result_root=result_root,
+                        scratch_root=scratch_root,
                         cargo=cargo_path,
                         channel=channel,
                         command=command,
@@ -1978,6 +2014,7 @@ def main(argv: list[str]) -> int:
                 "resource_link_repetitions": args.resource_link_repetitions,
                 "offline": not args.allow_network,
                 "wild_timing_json": args.wild_timing_json,
+                "scratch_root": str(scratch_root) if scratch_root is not None else None,
                 "wild_incremental_cache_root": (
                     str(wild_incremental_cache_root)
                     if wild_incremental_cache_root is not None
@@ -2000,18 +2037,23 @@ def main(argv: list[str]) -> int:
                     f"{RESOURCE_DISK_SAMPLE_INTERVAL_SECONDS * 1000:g} ms; peak transient bytes "
                     "exclude both prepared and published steady-state bytes"
                 ),
-                "result_artifacts": str(result_root),
+                "result_artifacts": str(result_root) if args.keep_artifacts else None,
+                "artifacts_retained": args.keep_artifacts,
             },
             "runs": runs,
             "comparison": summary,
         }
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+        succeeded = True
         print(json.dumps(summary, indent=2, sort_keys=True))
         return 1 if args.enforce_goals and not summary["goals_met"] else 0
     finally:
-        # Keep logs and JSON-ready data even on a later sample failure; caller can inspect them.
-        pass
+        # A report has all success evidence, while the raw Cargo logs are hundreds of megabytes.
+        # Retain those logs after failure for diagnosis, or when the caller explicitly requests
+        # them; otherwise remove all replay outputs after writing the result JSON.
+        if succeeded and not args.keep_artifacts:
+            shutil.rmtree(result_root, ignore_errors=True)
 
 
 if __name__ == "__main__":

@@ -30,7 +30,10 @@ checks execute with all `DYLD_*` environment overrides removed; a cache-hit reco
 after that artifact passes all three validations. It alternates Apple ld64 and Wild by sample to
 avoid link-order thermal or filesystem-cache bias, and reports every per-sample Wild/Apple ratio
 alongside its median. The runner copies the source checkout to a disposable sibling and never
-mutates it. Rustc deletes the final temporary codegen object after ordinary links, so each
+mutates it. Set `--scratch-root ~/.cache/wild/workspaces` to keep disposable copies and compiler
+temporaries outside the source tree; retain the default sibling placement only when a workload has
+relative dependencies on adjacent checkouts. Rustc deletes the final temporary codegen object
+after ordinary links, so each
 unmeasured direct-link capture uses a separate disposable `-C save-temps` rebuild. The timed
 cold and changed-source Cargo builds share one target and run back-to-back before those capture
 rebuilds. With
@@ -41,7 +44,9 @@ that emits no records. The separate resource batch records peak RSS, CPU, final-
 bytes, and observed transient-disk bytes for both cold and incremental direct replays. See
 `python3 benchmarks/cargo_link_benchmark.py --help` for the required result path and opt-in goal
 enforcement. Its default Wild path is `target/aarch64-apple-darwin/dist/wild`; do not use the
-unoptimized `ci` profile for a wall-time comparison.
+unoptimized `ci` profile for a wall-time comparison. Successful runs retain only their JSON report
+by default; pass `--keep-artifacts` only when the raw Cargo logs or replay outputs are needed for
+diagnosis. Failed runs always preserve their artifacts.
 
 Each executable workload manifest has a `runtime` object. Its `arguments` are passed to the produced
 ARM64 executable, `expected_exit` defaults to zero, and one of `stdout_contains` or
@@ -84,74 +89,90 @@ stable-layout linker fast path, prefer a fixed-width code immediate rather than 
 changing merged-string content may legitimately change output layout even when the source edit is
 the same size.
 
-For the current fast-iteration workload, build the optimized linker and run `e` as follows:
+## macOS Cargo parity iteration
+
+The active macOS optimization target is `~/d/cargo`, using
+[`benchmarks/cargo.benchmark.json`](benchmarks/cargo.benchmark.json). It changes one live Cargo
+source expression and builds the `linker-stress` profile: `opt-level = 3`, aborting panics,
+stripping, 16 codegen units, and no LTO. This intentionally keeps Rust compilation inexpensive
+enough that the ordinary changed-source final link remains visible. The profile is ineligible for
+the stable-layout cache because its changed codegen unit legitimately changes the internal
+symbol/relocation structure; this workflow measures the normal incremental path.
+
+The Cargo checkout pins `nightly-2026-07-24` because it has no `rust-toolchain.toml`. Apple samples
+omit all Wild arguments and therefore select vanilla Xcode ld64. Every Wild sample is required to
+retain ARM64 header evidence, strict `codesign` evidence, the Cargo `--version` runtime smoke check,
+and the direct-link RSS measurement.
+
+### One authoritative qualification run
+
+Use this only to qualify a promoted candidate, not to screen every idea. It is deliberately
+serialized and interleaves Apple and Wild. Parallel wall-time measurements on the same Mac compete
+for CPU, APFS cache, memory pressure, and thermals, so they cannot provide a fair comparison.
 
 ```sh
-/opt/homebrew/opt/rustup/bin/cargo +nightly-2026-07-24 \
-  build --release -p wild-linker --bin wild
-python3 benchmarks/cargo_link_benchmark.py \
-  --config benchmarks/e.benchmark.json \
-  --workspace ~/d/e \
-  --cargo /opt/homebrew/opt/rustup/bin/cargo \
-  --output ~/d/wild-benchmark-data/e-$(date +%F).json
-```
+cache_root="$HOME/.cache/wild"
+cargo_target="$cache_root/wild-build"
 
-For the full Cargo linker-stress workload, build Wild with the same optimized ARM64 profile used by the
-release artifacts, then let the runner build `~/d/cargo` with alternating vanilla Apple ld64 and
-explicit `target/aarch64-apple-darwin/dist/wild` samples:
-
-```sh
-/opt/homebrew/opt/rustup/bin/cargo +nightly-2026-07-24 \
+CARGO_TARGET_DIR="$cargo_target" \
+  /opt/homebrew/opt/rustup/bin/cargo +nightly-2026-07-24 \
   build --locked --profile dist --target aarch64-apple-darwin -p wild-linker --bin wild \
   --no-default-features --features fork
+
 python3 benchmarks/cargo_link_benchmark.py \
   --config benchmarks/cargo.benchmark.json \
-  --workspace ~/d/cargo \
+  --workspace "$HOME/d/cargo" \
   --cargo /opt/homebrew/opt/rustup/bin/cargo \
-  --wild target/aarch64-apple-darwin/dist/wild \
+  --wild "$cargo_target/aarch64-apple-darwin/dist/wild" \
+  --scratch-root "$cache_root/workspaces" \
+  --repetitions 5 \
+  --link-repetitions 5 \
+  --resource-link-repetitions 1 \
   --wild-timing-json \
-  --output ~/d/wild-benchmark-data/cargo-$(date +%F).json
+  --output "$cache_root/benchmarks/cargo-qualified-$(date +%F).json"
 ```
 
-The Cargo profile pins `nightly-2026-07-24` because the Cargo checkout does not carry a
-`rust-toolchain.toml`. The Apple samples omit Wild's linker flags entirely, so they use the host's
-vanilla macOS ld64 through Xcode Clang. The Cargo benchmark uses the separate `linker-stress`
-profile inherited from `release`: it keeps `opt-level = 3`, aborting panics, and stripping, but
-uses 16 codegen units and no LTO so rustc stays faster while the native linker receives more
-optimized object inputs. Cargo's original `release` profile remains unchanged for its production-
-like fat-LTO baseline.
+The successful runner keeps only this JSON result by default. It contains selected Wild phase
+records and validation evidence. `--keep-artifacts` is troubleshooting-only: it retains raw Cargo
+logs and replay outputs, which can consume hundreds of megabytes. A failed run retains its
+artifacts automatically for diagnosis.
 
-To measure Wild's opt-in stable-layout incremental path, supply a new, empty cache directory.
-The runner still measures cold Wild without the cache so the cold comparison stays comparable; for
-each cache-eligible workload it then creates an unmeasured cache baseline and requires a verified
-cache hit for each changed-source Wild Cargo/direct-link sample. Ineligible workload profiles run
-normally even when this option is supplied, so the same matrix invocation can still record their
-direct-link resource metrics. The direct baseline is replayed once after Cargo's capture before it
-is snapshotted: a Cargo profile may run a post-link transform such as `strip = true`, so the
-cache-owned raw signed Mach-O must never be paired with that transformed artifact. Every hit still
-passes the ARM64 header, strict signature, and runtime checks. The Apple ld64 run is unchanged.
+### Two-stage iteration methodology
 
-```sh
-python3 benchmarks/cargo_link_benchmark.py \
-  --config benchmarks/e.benchmark.json \
-  --workspace ~/d/e \
-  --cargo /opt/homebrew/opt/rustup/bin/cargo \
-  --wild-incremental-cache /tmp/wild-e-incremental-cache \
-  --output ~/d/wild-benchmark-data/e-cache-$(date +%F).json \
-  --enforce-goals
-```
+The qualification command runs several Cargo builds per linker because it measures Cargo wall time
+and creates fresh `save-temps` inputs for direct replay. That is correct for final evidence but too
+expensive for tuning. Future Cargo parity work should use two stages.
 
-The cache directory must be empty and its path must not contain whitespace; this prevents stale
-sidecars from being mixed into a result. Cache output is an optimisation only: any unverified
-change must fall back to a normal link, and the benchmark treats that fallback as a failed cache
-measurement rather than a fast sample.
+| Stage | Purpose | Parallelism and isolation | Promotion rule |
+| --- | --- | --- | --- |
+| Build and test variants | Compile candidate Wild binaries; run focused correctness tests and static analysis. | Safe to parallelize. Each variant gets its own `CARGO_TARGET_DIR` under `~/.cache/wild/variants/<id>`. These are not timing measurements. | A candidate compiles and passes focused tests before screening. |
+| Capture one immutable changed-link input | Build the Cargo baseline once, apply the workload mutation, and retain the changed final-link argv, inputs, output contract, and checksums. | Serialized once per Cargo revision/toolchain under `~/.cache/wild/captures/<id>`. The verified capture is read-only. | Capture passes ARM64 header, strict codesign, and runtime validation before reuse. |
+| Direct-link screening | Replay the immutable capture with Apple ld64 and each candidate, collecting a short interleaved series and `--time=json` for Wild. | Variant builds and analysis can run in parallel, but same-host timing replays stay serial and round-robin with an Apple control. Separate machines may screen in parallel only if each has its own Apple controls and result file. Every replay writes to `screen/<candidate>/<sample>`. | Promote only repeatable direct-link wins, e.g. Wild/Apple ≤0.97, with no RSS or correctness regression. |
+| Full qualification | Run the command above after one candidate wins direct screening. | Serialized; this is the sole source for Cargo-incremental and final direct-link claims. | Both requested median ratios are ≤1.0 with validation and RSS evidence. |
 
-Use `--enforce-goals` only in a gating job: it requires Wild's fresh-Cargo wall time to be at most
-0.95× Apple ld64 and, for cache-eligible workloads, its direct changed-source final link to be at
-most 0.70× Apple ld64. These are the per-workload hard limits. The matrix signoff separately
-requires the 0.85× cold-direct, 0.60× incremental-direct, and 0.75× peak-RSS medians documented in
-[`goal.md`](goal.md); the runner reports each of those direct and resource ratios without
-conflating compiler/LTO work with the linker's own target.
+The capture-and-screen helper described above is the next benchmark-runner capability to add. It
+must write a manifest with the Cargo revision, toolchain, complete direct command, input checksums,
+output contract, and capture owner; it must never silently reuse a stale capture. Until that helper
+exists, use a one-pair `cargo_link_benchmark.py` run with `--wild-timing-json` as the screen, then
+delete its artifacts after reading the JSON.
+
+The latest phase profile identifies input opening, layout, and output writing as the largest visible
+Wild direct-link phases. They are the first targets for a reusable-capture screen; do not repeatedly
+pay for full Cargo capture builds to evaluate a tiny scheduling change.
+
+### Disk and cleanup contract
+
+All workflow data belongs below `~/.cache/wild`: variant builds, workspace copies, compiler
+`TMPDIR`, captures, screen outputs, reports, and opt-in stable-layout sidecars. Never create
+`~/d/wild-*` or `~/d/.wild-*` benchmark trees. The runner removes copied workspaces and Cargo
+target trees for normal samples, removes successful-run raw artifacts unless `--keep-artifacts` is
+passed, and preserves failure artifacts only for inspection. After inspecting a failure or an
+explicitly retained capture, delete that exact cache-owned directory before the next large run.
+
+Cache output is an optimization only: any unverified stable-layout-cache change must fall back to a
+normal link, and the benchmark treats that fallback as a failed cache measurement rather than a
+fast sample. The cache directory must be empty and contain no whitespace before an opt-in cache run
+so stale sidecars cannot be mixed into a result.
 
 ### Preparing the "run-with" files
 

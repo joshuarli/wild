@@ -175,10 +175,12 @@ codegen-units = 16
 inherits = "opt"
 debug = true
 
-# The profile that we use for release builds distributed via github.
+# The profile that we use for release builds distributed via github. Fat LTO makes this binary's
+# hot direct-link path faster; distribution build time is intentionally traded for linker runtime.
 [profile.dist]
 inherits = "release"
 strip = true
+lto = "fat"
 
 # In CI, we disable debug info. This gives us faster builds. It also reduces the size of the target
 # directory, allowing us to fit more into cache. The only resulting loss is line numbers in

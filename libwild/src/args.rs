@@ -61,12 +61,22 @@ pub const EXPERIMENTAL_PLATFORMS: &str = "WILD_EXPERIMENTAL_PLATFORMS";
 /// inconsistency.
 pub(crate) const WRITE_VERIFY_ALLOCATIONS_ENV: &str = "WILD_VERIFY_ALLOCATIONS";
 
-/// Unconstrained links on Apple Silicon have enough available CPUs to make the automatic Rayon
-/// pool expensive relative to short links. Eight workers is the measured crossover for the
-/// representative Rust and C++ direct-link replays. Explicit `--threads` and jobserver limits
-/// retain their callers' requested parallelism.
+/// A Cargo final link has hundreds of independent archive inputs, so it can amortize a wider
+/// Rayon pool than a short link. Keep the smaller pool for short Apple-Silicon links, whose
+/// scheduling cost otherwise dominates. Explicit `--threads` and jobserver limits retain their
+/// callers' requested parallelism.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const MACOS_AARCH64_AUTOMATIC_THREAD_LIMIT: NonZeroUsize = NonZeroUsize::new(8).unwrap();
+
+/// The Cargo linker-stress final argv has well over this many inputs. At that scale, using up to
+/// ten workers reduces the normal signed direct-link replay by hiding input-mapping latency. The
+/// buffered output writer is fastest without oversubscribing the host; constrained machines retain
+/// their smaller pools.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const MACOS_AARCH64_LARGE_LINK_MIN_INPUTS: usize = 256;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+const MACOS_AARCH64_LARGE_LINK_THREAD_LIMIT: NonZeroUsize = NonZeroUsize::new(10).unwrap();
 
 #[derive(derive_more::Debug)]
 pub struct CommonArgs {
@@ -428,6 +438,7 @@ impl CommonArgs {
             } else {
                 automatic_thread_count(
                     std::thread::available_parallelism().unwrap_or(NonZeroUsize::new(1).unwrap()),
+                    self.inputs.len(),
                 )
             }
         });
@@ -532,14 +543,21 @@ impl CommonArgs {
     }
 }
 
-fn automatic_thread_count(available_threads: NonZeroUsize) -> NonZeroUsize {
+fn automatic_thread_count(available_threads: NonZeroUsize, input_count: usize) -> NonZeroUsize {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
-        available_threads.min(MACOS_AARCH64_AUTOMATIC_THREAD_LIMIT)
+        if input_count >= MACOS_AARCH64_LARGE_LINK_MIN_INPUTS
+            && available_threads >= MACOS_AARCH64_AUTOMATIC_THREAD_LIMIT
+        {
+            available_threads.min(MACOS_AARCH64_LARGE_LINK_THREAD_LIMIT)
+        } else {
+            available_threads.min(MACOS_AARCH64_AUTOMATIC_THREAD_LIMIT)
+        }
     }
 
     #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
     {
+        let _ = input_count;
         available_threads
     }
 }
@@ -1708,13 +1726,27 @@ mod tests {
 
     #[test]
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    fn caps_unconstrained_macos_arm64_links_at_eight_threads() {
+    fn assigns_ten_threads_to_large_unconstrained_macos_arm64_links() {
         assert_eq!(
-            automatic_thread_count(NonZeroUsize::new(10).unwrap()),
+            automatic_thread_count(NonZeroUsize::new(16).unwrap(), 256),
+            NonZeroUsize::new(10).unwrap()
+        );
+        // `available_parallelism` on the benchmark host reports ten logical CPUs. The large
+        // link's I/O-heavy opening phase benefits from using the complete available pool.
+        assert_eq!(
+            automatic_thread_count(NonZeroUsize::new(10).unwrap(), 256),
+            NonZeroUsize::new(10).unwrap()
+        );
+        assert_eq!(
+            automatic_thread_count(NonZeroUsize::new(8).unwrap(), 256),
             NonZeroUsize::new(8).unwrap()
         );
         assert_eq!(
-            automatic_thread_count(NonZeroUsize::new(2).unwrap()).get(),
+            automatic_thread_count(NonZeroUsize::new(16).unwrap(), 255),
+            NonZeroUsize::new(8).unwrap()
+        );
+        assert_eq!(
+            automatic_thread_count(NonZeroUsize::new(2).unwrap(), 256).get(),
             2
         );
     }
