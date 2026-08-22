@@ -24,6 +24,7 @@ use crate::resolution::SectionSlot;
 use crate::timing_phase;
 use object::Endianness;
 use object::macho::LC_UUID;
+use object::macho::N_PEXT;
 use rayon::prelude::*;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -44,8 +45,8 @@ use std::time::SystemTime;
 
 const MAGIC: &[u8; 16] = b"WILD-MACHO-INC\0\0";
 const STATE_MAGIC: &[u8; 16] = b"WILD-MACHO-STATE";
-const VERSION: u32 = 10;
-const STATE_VERSION: u32 = 4;
+const VERSION: u32 = 11;
+const STATE_VERSION: u32 = 6;
 const HASH_SIZE: usize = 32;
 const MAX_RECORDS: usize = 100_000;
 /// Cache hits may compose a small group of independent direct objects. Bounding both dimensions
@@ -56,10 +57,20 @@ const MAX_CHANGED_DIRECT_OBJECT_BYTES: usize = 16 * 1024 * 1024;
 const DIAGNOSTICS_ENV: &str = "WILD_MACHO_INCREMENTAL_CACHE_DIAGNOSTICS";
 /// Domains the v5 structural digest away from ordinary byte hashes and older cache layouts.
 const STRUCTURE_DIGEST_DOMAIN: &[u8] = b"wild-macho-stable-layout-structure-v5\0";
+/// Rustc can regenerate private LLVM discriminator suffixes and reorder otherwise identical
+/// relocation groups after a one-line incremental edit. This separate digest normalizes only that
+/// compiler-private metadata while keeping every load command, section footprint, non-private
+/// symbol, relocation group, and raw patch source bound to the baseline.
+const RUSTC_PRIVATE_METADATA_DIGEST_DOMAIN: &[u8] =
+    b"wild-macho-stable-layout-rustc-private-metadata-v1\0";
 /// The sidecar is not an authenticated input, but random or torn sidecar corruption must become
 /// a conservative cache miss before any persisted patch mapping is used.
 const MANIFEST_CHECKSUM_DOMAIN: &[u8] = b"wild-macho-stable-layout-manifest-v10\0";
-const STATE_CHECKSUM_DOMAIN: &[u8] = b"wild-macho-stable-layout-state-v4\0";
+const STATE_CHECKSUM_DOMAIN: &[u8] = b"wild-macho-stable-layout-state-v6\0";
+const CACHE_UUID_SEED_DOMAIN: &[u8] = b"wild-macho-stable-layout-cache-uuid-v1\0";
+const CACHE_IMAGE_TOKEN_DOMAIN: &[u8] = b"wild-macho-stable-layout-cache-image-token-v1\0";
+#[cfg(target_os = "macos")]
+const CACHE_IMAGE_TOKEN_XATTR: &str = "com.wild.stable-layout-token";
 
 #[derive(Clone, Debug)]
 struct InputDigest {
@@ -196,6 +207,28 @@ struct ObjectRecord {
     structure_masks: Vec<InputRange>,
     symbol_values: Vec<SymbolValuePatch>,
     protected: Vec<ProtectedRange>,
+    /// A narrowly proven Rustc metadata equivalence relation. It is deliberately independent of
+    /// the ordinary structural digest: generic Mach-O inputs continue to require byte-identical
+    /// relocation and symbol-table metadata.
+    rustc_private: Option<RustcPrivateObject>,
+}
+
+/// Output symbol spellings whose only permitted mutation is Rustc's terminal
+/// `.llvm.<decimal>` discriminator. The output slot is exact and exclusive, so rewriting a
+/// shorter replacement leaves its original NUL-terminated string allocation valid without
+/// repacking the whole link-edit segment.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RustcPrivateSymbolPatch {
+    input_symbol_index: u32,
+    canonical_name: Vec<u8>,
+    expected: Vec<u8>,
+    output_offset: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RustcPrivateObject {
+    metadata_digest: [u8; HASH_SIZE],
+    symbols: Vec<RustcPrivateSymbolPatch>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -272,6 +305,14 @@ struct ObjectRecordView<'a> {
     symbol_value_bytes: &'a [u8],
     protected_bytes: &'a [u8],
     protected_count: usize,
+    rustc_private: Option<RustcPrivateObjectView<'a>>,
+}
+
+#[derive(Clone, Copy)]
+struct RustcPrivateObjectView<'a> {
+    metadata_digest: [u8; HASH_SIZE],
+    symbol_bytes: &'a [u8],
+    symbol_count: usize,
 }
 
 /// A changed direct input paired with its immutable manifest record. Both contracts must hold
@@ -279,6 +320,7 @@ struct ObjectRecordView<'a> {
 struct ChangedObject<'manifest, 'input> {
     object: ObjectRecordView<'manifest>,
     bytes: &'input [u8],
+    output_patches: Vec<OutputPathPatch>,
 }
 
 #[derive(Clone)]
@@ -313,22 +355,15 @@ struct ImageState {
     /// Binds this mutable state to exactly one immutable patch topology. Publishing a new image
     /// and state before its structural manifest can therefore only cause a safe cache miss.
     manifest_checksum: [u8; HASH_SIZE],
-    output_identity: OutputIdentity,
+    /// The cache-owned image carries this xattr generation token. APFS clones and explicit
+    /// benchmark snapshot copies retain it, while an unrelated image at the same cache path does
+    /// not become a patch source merely because it has a plausible size.
+    cache_image_token: [u8; 16],
+    /// A deterministic chain of bounded changed-object bytes. It drives the next `LC_UUID`
+    /// without a full-file BLAKE3 pass; code-directory pages are still refreshed exactly.
+    uuid_seed: [u8; HASH_SIZE],
     output_len: u64,
     inputs: Vec<InputDigest>,
-}
-
-/// Result of reading the previous output as a possible cache baseline.
-///
-/// A [`Matched`](Self::Matched) value owns bytes that passed the complete output-identity check,
-/// so it is safe to patch those bytes directly. Keeping this distinction explicit prevents a
-/// metadata-only check, or an unreadable existing output, from being mistaken for Cargo's allowed
-/// case where the previous output path no longer exists.
-#[derive(Debug, Eq, PartialEq)]
-enum ExistingOutputBaseline {
-    Absent,
-    Matched(Vec<u8>),
-    Mismatch,
 }
 
 struct Candidate {
@@ -337,6 +372,23 @@ struct Candidate {
     structure_masks: Vec<InputRange>,
     symbol_values: Vec<SymbolValuePatch>,
     protected: Vec<ProtectedRange>,
+    rustc_private_symbols: Option<Vec<RustcPrivateSymbolPatch>>,
+}
+
+#[derive(Clone, Debug)]
+struct RustcPrivateMetadata {
+    digest: [u8; HASH_SIZE],
+    symbols: Vec<InputSymbol>,
+}
+
+#[derive(Clone, Debug)]
+struct InputSymbol {
+    index: usize,
+    name: Vec<u8>,
+    n_type: u8,
+    n_sect: u8,
+    n_desc: u16,
+    n_value: u64,
 }
 
 /// The cache normally patches an owned image in memory. On APFS, a cloned temporary lets the
@@ -504,21 +556,18 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
     if !state_matches_manifest {
         return cache_miss("image state does not match the structural manifest");
     }
-    // Cargo normally leaves the previous hash-bearing output in place until the linker replaces
-    // it. When it is present, it is the strongest available proof that this sidecar belongs to
-    // the current output lineage. A cache image can be internally self-consistent yet come from
-    // another output layout (for example, a stale save-temps replay); never patch over such an
-    // output. Cargo may retire the path before invoking the linker, so absence remains a valid
-    // cache candidate and the cache-owned image is verified below.
-    let existing_output = {
-        timing_phase!("Mach-O stable-layout cache: verify current output lineage");
-        read_existing_output_baseline(
-            args.output(),
-            state.output_len,
-            &state.output_identity,
-            &manifest.signature,
-        )
+    // The cache image, rather than Cargo's current `-o` pathname, is the baseline for every
+    // replay. Cargo can remove or replace that pathname before invoking us; treating it as an
+    // input used to force two full-image reads on the hot path. The image is cache-owned and
+    // guarded by its device/inode/ctime identity before and after the APFS clone below.
+    let cache_image = cache_image_path(cache_dir, args);
+    let cache_image_metadata = {
+        timing_phase!("Mach-O stable-layout cache: verify cache image identity");
+        input_file_metadata(&cache_image.to_string_lossy())
     };
+    if cache_image_token(&cache_image) != Some(state.cache_image_token) {
+        return cache_miss("cache-owned baseline image identity differs");
+    }
 
     let current_inputs = {
         timing_phase!("Mach-O stable-layout cache: fingerprint inputs");
@@ -630,10 +679,18 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
             // This immutable snapshot is the exact mapping selected by the initial metadata scan.
             // The metadata recheck below guards against its source pathname being replaced before
             // we publish the composed patched output.
-            let structure_matches = {
+            let (structure_matches, output_patches) = {
                 timing_phase!("Mach-O stable-layout cache: compute object structure digest");
-                object.structure_digest
-                    == masked_digest_from_iter(current_object, object.structure_masks())
+                let ordinary = object.structure_digest
+                    == masked_digest_from_iter(current_object, object.structure_masks());
+                if ordinary {
+                    (true, Vec::new())
+                } else {
+                    match object.rustc_private_output_patches(current_object) {
+                        Some(patches) => (true, patches),
+                        None => (false, Vec::new()),
+                    }
+                }
             };
             if !structure_matches {
                 return cache_miss("changed object structural digest differs");
@@ -648,47 +705,33 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
             changed_objects.push(ChangedObject {
                 object,
                 bytes: current_object,
+                output_patches,
             });
         }
         changed_objects
     };
 
-    // A present previous output has just completed the same full content-identity validation
-    // required of the cache-owned image. Reuse those owned bytes rather than cloning and hashing
-    // an identical cache image a second time. The cache image remains the safe fallback only for
-    // Cargo's documented case where it retired the previous `-o` before invoking the linker.
-    let mut output = match existing_output {
-        ExistingOutputBaseline::Matched(bytes) => MutableOutput::InMemory(bytes),
-        ExistingOutputBaseline::Mismatch => {
-            return cache_miss("current output does not match the cached baseline lineage");
+    let mut output = {
+        timing_phase!("Mach-O stable-layout cache: materialize cache-owned image");
+        #[cfg(target_os = "macos")]
+        let output = fs::read(&cache_image)
+            .ok()
+            .map(MutableOutput::InMemory)
+            .or_else(|| clone_baseline_image(cache_dir, args));
+        #[cfg(not(target_os = "macos"))]
+        let output = fs::read(&cache_image).ok().map(MutableOutput::InMemory);
+        let Some(output) = output else {
+            return cache_miss("owned baseline image is absent");
+        };
+        if output.bytes().len() as u64 != state.output_len
+            || cache_image_metadata.is_none()
+            || input_file_metadata(&cache_image.to_string_lossy()) != cache_image_metadata
+            || cache_image_token(&cache_image) != Some(state.cache_image_token)
+        {
+            output.discard();
+            return cache_miss("cache-owned baseline image changed while cloning");
         }
-        ExistingOutputBaseline::Absent => {
-            timing_phase!("Mach-O stable-layout cache: read and verify baseline image");
-            #[cfg(target_os = "macos")]
-            let output = clone_baseline_image(cache_dir, args).or_else(|| {
-                fs::read(cache_image_path(cache_dir, args))
-                    .ok()
-                    .map(MutableOutput::InMemory)
-            });
-            #[cfg(not(target_os = "macos"))]
-            let output = fs::read(cache_image_path(cache_dir, args))
-                .ok()
-                .map(MutableOutput::InMemory);
-            let Some(output) = output else {
-                return cache_miss("owned baseline image is absent");
-            };
-            if output.bytes().len() as u64 != state.output_len
-                || !output_matches_identity(
-                    output.bytes(),
-                    &manifest.signature,
-                    &state.output_identity,
-                )
-            {
-                output.discard();
-                return cache_miss("owned baseline image identity differs");
-            }
-            output
-        }
+        output
     };
     if !moved_direct_object_paths_are_unobservable(
         output.bytes(),
@@ -714,13 +757,15 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
         };
         patches
     };
-    let output_identity = {
+    let next_uuid_seed = cache_uuid_seed(state.uuid_seed, &changed_objects);
+    {
         timing_phase!("Mach-O stable-layout cache: patch and sign");
         if let [changed] = changed_objects.as_slice() {
             // Retain the existing one-object hot path. The immutable record already proves that
             // its raw and symbol-value ranges do not overlap, so sorting them merely to prove a
             // cross-record invariant would tax the common single-object case.
             if !apply_output_path_patches(output.bytes_mut(), &archive_path_patches)
+                || !apply_output_path_patches(output.bytes_mut(), &changed.output_patches)
                 || !apply_patches_from_iter(
                     output.bytes_mut(),
                     changed.bytes,
@@ -735,21 +780,22 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
                 output.discard();
                 return cache_miss("patch mapping or signature refresh is not valid");
             }
-            let Some(output_identity) = refresh_uuid_and_signature(
+            if !refresh_uuid_and_signature(
                 output.bytes_mut(),
                 &manifest.signature,
                 args,
+                &next_uuid_seed,
                 changed
                     .object
                     .patches()
                     .chain(changed.object.symbol_values().map(SymbolValuePatch::signature_range))
+                    .chain(changed.output_patches.iter().map(OutputPathPatch::signature_range))
                     .chain(archive_path_patches.iter().map(OutputPathPatch::signature_range)),
-            ) else {
+            ) {
                 output.discard();
                 return cache_miss("patch mapping or signature refresh is not valid");
-            };
+            }
             output.invalidate_code_signature_cache();
-            output_identity
         } else {
             let changed_output_ranges = changed_objects
                 .iter()
@@ -758,6 +804,7 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
                         .object
                         .patches()
                         .chain(changed.object.symbol_values().map(SymbolValuePatch::signature_range))
+                        .chain(changed.output_patches.iter().map(OutputPathPatch::signature_range))
                 })
                 .chain(archive_path_patches.iter().map(OutputPathPatch::signature_range))
                 .collect::<Vec<_>>();
@@ -766,6 +813,8 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
                 changed_output_ranges.iter().copied(),
             ) || !output_path_patches_are_applicable(output.bytes(), &archive_path_patches)
                 || !changed_objects.iter().all(|changed| {
+                    output_path_patches_are_applicable(output.bytes(), &changed.output_patches)
+                        &&
                     patch_ranges_are_applicable(
                         output.bytes().len(),
                         changed.bytes,
@@ -784,7 +833,8 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
                 let output_bytes = output.bytes_mut();
                 apply_output_path_patches(output_bytes, &archive_path_patches)
                     && changed_objects.iter().all(|changed| {
-                        apply_patches_from_iter(output_bytes, changed.bytes, changed.object.patches())
+                        apply_output_path_patches(output_bytes, &changed.output_patches)
+                            && apply_patches_from_iter(output_bytes, changed.bytes, changed.object.patches())
                             && apply_symbol_value_patches_from_iter(
                                 output_bytes,
                                 changed.bytes,
@@ -796,19 +846,19 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
                 output.discard();
                 return cache_miss("patch mapping or signature refresh is not valid");
             }
-            let Some(output_identity) = refresh_uuid_and_signature(
-                    output.bytes_mut(),
-                    &manifest.signature,
-                    args,
-                    changed_output_ranges.iter().copied(),
-                ) else {
+            if !refresh_uuid_and_signature(
+                output.bytes_mut(),
+                &manifest.signature,
+                args,
+                &next_uuid_seed,
+                changed_output_ranges.iter().copied(),
+            ) {
                 output.discard();
                 return cache_miss("patch mapping or signature refresh is not valid");
-            };
+            }
             output.invalidate_code_signature_cache();
-            output_identity
         }
-    };
+    }
 
     // Recheck the filesystem identity captured around the initial full input hash immediately
     // before publishing. This is the normal linker's mtime race guard, strengthened on Unix with
@@ -842,7 +892,7 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
         }
     }
 
-    state.output_identity = output_identity;
+    state.uuid_seed = next_uuid_seed;
     state.output_len = output_len;
     // The direct object is the one patched input, but equal-content rlibs can move between
     // rustc's per-link temporary directories. Retain every current physical identity so the
@@ -861,6 +911,12 @@ fn try_apply_inner(args: &MachOArgs) -> bool {
         if image_result.is_err() {
             return cache_miss("atomic baseline-image replacement failed");
         }
+        let image_path = cache_image_path(cache_dir, args);
+        if !set_cache_image_token(&image_path, state.cache_image_token)
+            || cache_image_token(&image_path) != Some(state.cache_image_token)
+        {
+            return cache_miss("published baseline image token is unavailable");
+        }
         if write_image_state_atomic(cache_dir, args, &state).is_err() {
             return cache_miss("image state replacement failed");
         }
@@ -876,6 +932,15 @@ fn changed_object_count_is_supported(count: usize) -> bool {
     (1..=MAX_CHANGED_DIRECT_OBJECTS).contains(&count)
 }
 
+#[cfg(test)]
+#[derive(Debug, Eq, PartialEq)]
+enum ExistingOutputBaseline {
+    Absent,
+    Matched(Vec<u8>),
+    Mismatch,
+}
+
+#[cfg(test)]
 fn read_existing_output_baseline(
     path: &Path,
     output_len: u64,
@@ -976,19 +1041,28 @@ pub(crate) fn stage_after_link(layout: &Layout<'_, MachO>, output: &[u8]) {
     let manifest_checksum: [u8; HASH_SIZE] = manifest_bytes[manifest_bytes.len() - HASH_SIZE..]
         .try_into()
         .expect("manifest encoding ends with a fixed-width checksum");
+    // Stage the image first. `publish_staged` exposes it only after generic linking confirms no
+    // input was replaced during layout/writing.
+    if write_staged_image_atomic(cache_dir, args, output).is_err() {
+        let _ = cache_miss("unable to stage the baseline image or state");
+        return;
+    }
+    let staged_image = staged_cache_image_path(cache_dir, args);
+    let cache_image_token = cache_image_token_for_manifest(&manifest);
+    if !set_cache_image_token(&staged_image, cache_image_token) {
+        let _ = cache_miss("unable to mark the staged baseline image");
+        return;
+    }
     let state = ImageState {
         arguments_digest: manifest.arguments_digest,
         manifest_checksum,
-        output_identity: manifest.output_identity,
+        cache_image_token,
+        uuid_seed: manifest.output_identity.normalized_digest,
         output_len: manifest.output_len,
         inputs: manifest.inputs.clone(),
     };
-    // Stage the image first. `publish_staged` exposes it only after generic linking confirms no
-    // input was replaced during layout/writing.
-    if write_staged_image_atomic(cache_dir, args, output).is_err()
-        || write_staged_image_state_atomic(cache_dir, args, &state).is_err()
-    {
-        let _ = cache_miss("unable to stage the baseline image or state");
+    if write_staged_image_state_atomic(cache_dir, args, &state).is_err() {
+        let _ = cache_miss("unable to stage the baseline image state");
         return;
     }
     if write_staged_manifest_atomic(cache_dir, args, &manifest).is_err() {
@@ -1036,7 +1110,6 @@ pub(crate) fn publish_staged(args: &MachOArgs) {
         || state.arguments_digest != manifest.arguments_digest
         || state.manifest_checksum != manifest_checksum
         || state.inputs != manifest.inputs
-        || state.output_identity != manifest.output_identity
         || state.output_len != manifest.output_len
         || input_digests(args).as_ref() != Some(&manifest.inputs)
     {
@@ -1052,11 +1125,19 @@ pub(crate) fn publish_staged(args: &MachOArgs) {
         let _ = fs::remove_file(staged_state);
         return;
     }
-    if fs::rename(&staged_state, cache_state_path(cache_dir, args)).is_err() {
+    let image_path = cache_image_path(cache_dir, args);
+    if cache_image_token(&image_path) != Some(state.cache_image_token) {
+        let _ = cache_miss("published baseline image token differs");
+        let _ = fs::remove_file(staged);
+        let _ = fs::remove_file(staged_state);
+        return;
+    }
+    if write_image_state_atomic(cache_dir, args, &state).is_err() {
         let _ = cache_miss("unable to publish the staged baseline image state");
         let _ = fs::remove_file(staged);
         return;
     }
+    let _ = fs::remove_file(staged_state);
     if fs::rename(staged, cache_path(cache_dir, args)).is_err() {
         let _ = cache_miss("unable to publish the staged baseline manifest");
     }
@@ -1370,6 +1451,7 @@ fn cache_approved_moved_direct_objects(
 /// object parser while patching a cache-owned executable.
 #[derive(Clone, Copy)]
 struct MachOSymtab {
+    command_offset: usize,
     symbol_offset: usize,
     symbol_count: usize,
     string_offset: usize,
@@ -1377,6 +1459,30 @@ struct MachOSymtab {
 }
 
 impl MachOSymtab {
+    fn input_symbols(self, bytes: &[u8]) -> Option<Vec<InputSymbol>> {
+        let string_end = self.string_offset.checked_add(self.string_size)?;
+        let mut symbols = Vec::with_capacity(self.symbol_count);
+        for index in 0..self.symbol_count {
+            let entry_offset = self.entry_offset(index)?;
+            let string_index = usize::try_from(read_u32(bytes, entry_offset)?).ok()?;
+            if string_index >= self.string_size {
+                return None;
+            }
+            let name_offset = self.string_offset.checked_add(string_index)?;
+            let name = bytes.get(name_offset..string_end)?;
+            let name_end = name.iter().position(|byte| *byte == 0)?;
+            symbols.push(InputSymbol {
+                index,
+                name: name[..name_end].to_vec(),
+                n_type: *bytes.get(entry_offset.checked_add(4)?)?,
+                n_sect: *bytes.get(entry_offset.checked_add(5)?)?,
+                n_desc: read_u16(bytes, entry_offset.checked_add(6)?)?,
+                n_value: read_u64(bytes, entry_offset.checked_add(8)?)?,
+            });
+        }
+        Some(symbols)
+    }
+
     fn has_stabs(self, bytes: &[u8]) -> bool {
         (0..self.symbol_count).any(|index| {
             self.entry_offset(index)
@@ -1425,6 +1531,40 @@ impl MachOSymtab {
         matched
     }
 
+    fn unique_symbol_string_offset(
+        self,
+        bytes: &[u8],
+        expected_name: &[u8],
+        expected_type: u8,
+        expected_desc: u16,
+    ) -> Option<usize> {
+        let mut matched = None;
+        for index in 0..self.symbol_count {
+            let entry_offset = self.entry_offset(index)?;
+            if bytes.get(entry_offset.checked_add(4)?) != Some(&expected_type)
+                || bytes.get(entry_offset.checked_add(5)?) == Some(&0)
+                || read_u16(bytes, entry_offset.checked_add(6)?)? != expected_desc
+            {
+                continue;
+            }
+            let string_index = usize::try_from(read_u32(bytes, entry_offset)?).ok()?;
+            if string_index >= self.string_size {
+                return None;
+            }
+            let name_offset = self.string_offset.checked_add(string_index)?;
+            let string_end = self.string_offset.checked_add(self.string_size)?;
+            let name = bytes.get(name_offset..string_end)?;
+            let name_end = name.iter().position(|byte| *byte == 0)?;
+            if &name[..name_end] != expected_name {
+                continue;
+            }
+            if matched.replace(name_offset).is_some() {
+                return None;
+            }
+        }
+        matched
+    }
+
     fn entry_offset(self, index: usize) -> Option<usize> {
         (index < self.symbol_count)
             .then(|| index.checked_mul(16))
@@ -1452,6 +1592,7 @@ fn macho_symtab(bytes: &[u8]) -> Option<MachOSymtab> {
                 return None;
             }
             symtab = Some(MachOSymtab {
+                command_offset,
                 symbol_offset: usize::try_from(read_u32(bytes, command_offset.checked_add(8)?)?).ok()?,
                 symbol_count: usize::try_from(read_u32(bytes, command_offset.checked_add(12)?)?).ok()?,
                 string_offset: usize::try_from(read_u32(bytes, command_offset.checked_add(16)?)?).ok()?,
@@ -1960,6 +2101,14 @@ fn cacheable_records_from_candidates(
             normalise_input_ranges(&mut candidate.structure_masks)?;
             normalise_symbol_value_patches(&mut candidate.symbol_values)?;
             normalise_protected_ranges(&mut candidate.protected)?;
+            let rustc_private = candidate.rustc_private_symbols.and_then(|symbols| {
+                rustc_private_metadata(&candidate.bytes, &candidate.patches).map(|metadata| {
+                    RustcPrivateObject {
+                        metadata_digest: metadata.digest,
+                        symbols,
+                    }
+                })
+            });
             Some(ObjectRecord {
                 input_index: u32::try_from(input_index).ok()?,
                 structure_digest: masked_digest_for_input_ranges(
@@ -1970,6 +2119,7 @@ fn cacheable_records_from_candidates(
                 structure_masks: candidate.structure_masks,
                 symbol_values: candidate.symbol_values,
                 protected: candidate.protected,
+                rustc_private,
             })
         })
         .collect()
@@ -2061,12 +2211,14 @@ fn object_candidate(
     }
 
     let symbol_values = linker_private_symbol_value_patches(layout, object, output);
+    let rustc_private_symbols = rustc_private_symbol_patches(object, output);
     Some(Candidate {
         bytes: data.to_vec(),
         patches,
         structure_masks: Vec::new(),
         symbol_values,
         protected,
+        rustc_private_symbols,
     })
 }
 
@@ -2179,6 +2331,271 @@ fn linker_private_symbol_value_patches(
     normalise_symbol_value_patches(&mut patches)
         .map(|()| patches)
         .unwrap_or_default()
+}
+
+/// Builds the output-string patch map for one especially narrow Rustc incremental shape.
+///
+/// Rustc uses terminal `.llvm.<decimal>` discriminators for private external implementation
+/// details. A small source edit can regenerate those numbers and reorder relocation records while
+/// preserving every selected atom and final address. We may reuse the old link-edit allocation
+/// only when the old spelling occurs exactly once, in the output nlist string table, and its
+/// replacement will fit the same NUL-terminated slot. Anything caller-visible, ambiguous, or
+/// structurally different remains an ordinary cache miss.
+fn rustc_private_symbol_patches(
+    object: &ObjectLayout<'_, MachO>,
+    output: &[u8],
+) -> Option<Vec<RustcPrivateSymbolPatch>> {
+    let input_symtab = macho_symtab(object.object.data)?;
+    let input_symbols = input_symtab.input_symbols(object.object.data)?;
+    let output_symtab = macho_symtab(output)?;
+    let mut patches = Vec::new();
+    let mut saw_private_llvm_symbol = false;
+
+    for (symbol_index, _) in object.object.enumerate_symbols() {
+        let source = input_symbols.get(symbol_index.0)?;
+        let Some(canonical_name) = rustc_private_symbol_base(&source.name) else {
+            continue;
+        };
+        saw_private_llvm_symbol = true;
+        if !is_rustc_private_symbol(source.n_type) {
+            return None;
+        }
+        // Undefined references have no output nlist record. Their coordinated rename is bound
+        // by the metadata digest; only a section-defined private external needs an output-string
+        // patch.
+        if source.n_type & N_PEXT.0 == 0 {
+            continue;
+        }
+
+        let mut occurrences = memchr::memmem::find_iter(output, &source.name);
+        let Some(occurrence) = occurrences.next() else {
+            continue;
+        };
+        if occurrences.next().is_some() {
+            return None;
+        }
+
+        let output_offset = output_symtab.unique_symbol_string_offset(
+            output,
+            &source.name,
+            source.n_type,
+            source.n_desc,
+        )?;
+        if occurrence != output_offset {
+            return None;
+        }
+        patches.push(RustcPrivateSymbolPatch {
+            input_symbol_index: u32::try_from(source.index).ok()?,
+            canonical_name: canonical_name.to_vec(),
+            expected: source.name.clone(),
+            output_offset: output_offset as u64,
+        });
+    }
+
+    saw_private_llvm_symbol.then(|| {
+        patches.sort_by_key(|patch| patch.input_symbol_index);
+        patches
+    })
+}
+
+/// Returns the stable part of a Rustc-generated private LLVM symbol. Deliberately do not accept a
+/// generic substring replacement: the decimal suffix must be terminal, nonempty, and retain a
+/// nonempty symbol prefix.
+fn rustc_private_symbol_base(name: &[u8]) -> Option<&[u8]> {
+    let marker = b".llvm.";
+    let marker_offset = name.windows(marker.len()).rposition(|window| window == marker)?;
+    let suffix_start = marker_offset.checked_add(marker.len())?;
+    let suffix = name.get(suffix_start..)?;
+    (!suffix.is_empty()
+        && suffix.iter().all(u8::is_ascii_digit)
+        && marker_offset != 0)
+        .then_some(&name[..marker_offset + marker.len()])
+}
+
+/// Rustc's LLVM discriminator is used only on compiler-private definitions and their external
+/// references. Keeping this classification exact is what lets the cache canonicalize a suffix
+/// without accepting a user-visible symbol whose spelling happens to end in `.llvm.<decimal>`.
+fn is_rustc_private_symbol(n_type: u8) -> bool {
+    let symbol_type = n_type & object::macho::N_TYPE;
+    (symbol_type == object::macho::N_SECT.0 && n_type & N_PEXT.0 != 0)
+        || (symbol_type == object::macho::N_UNDF.0
+            && n_type & object::macho::N_EXT.0 != 0
+            && n_type & N_PEXT.0 == 0)
+}
+
+/// Canonicalizes exactly the compiler-private names accepted by
+/// [`rustc_private_symbol_base`]. A tag prevents a literal symbol from colliding with a stripped
+/// private suffix in the metadata digest.
+fn update_canonical_symbol_name(hasher: &mut blake3::Hasher, name: &[u8]) {
+    match rustc_private_symbol_base(name) {
+        Some(base) => {
+            hasher.update(&[1]);
+            hasher.update(&(base.len() as u64).to_le_bytes());
+            hasher.update(base);
+        }
+        None => {
+            hasher.update(&[0]);
+            hasher.update(&(name.len() as u64).to_le_bytes());
+            hasher.update(name);
+        }
+    }
+}
+
+/// Produces a cache-hit equivalence digest for the Rustc-private shape described above.
+///
+/// The normal structural digest still guards every ordinary Mach-O object. This path excludes
+/// only the input nlist/string table and relocation record storage from its byte digest, then
+/// rebinds them with stricter semantic digests: nlists retain type, section, descriptor, value,
+/// order, and every non-private name; relocation groups retain their exact bytes and pairing but
+/// may move as complete independent groups. Rustc's string table must remain the terminal file
+/// region, so a changed string-table length cannot hide appended object data.
+fn rustc_private_metadata(bytes: &[u8], patches: &[PatchRange]) -> Option<RustcPrivateMetadata> {
+    let symtab = macho_symtab(bytes)?;
+    let string_end = symtab.string_offset.checked_add(symtab.string_size)?;
+    if string_end != bytes.len() {
+        return None;
+    }
+    let symbols = symtab.input_symbols(bytes)?;
+    if !symbols
+        .iter()
+        .any(|symbol| rustc_private_symbol_base(&symbol.name).is_some())
+    {
+        return None;
+    }
+    if symbols.iter().any(|symbol| {
+        rustc_private_symbol_base(&symbol.name).is_some()
+            && !is_rustc_private_symbol(symbol.n_type)
+    }) {
+        return None;
+    }
+    let (relocation_digest, relocation_ranges) = rustc_relocation_metadata(bytes)?;
+
+    let mut masks = patches
+        .iter()
+        .map(|patch| InputRange {
+            input_offset: patch.input_offset,
+            len: patch.len,
+        })
+        .collect::<Vec<_>>();
+    masks.push(InputRange {
+        input_offset: symtab.symbol_offset as u64,
+        len: u64::try_from(symtab.symbol_count.checked_mul(16)?).ok()?,
+    });
+    // `strsize` alone is allowed to change because the trailing input string table is omitted
+    // from this digest. `stroff` stays bound by the unmasked command byte and prefix length.
+    masks.push(InputRange {
+        input_offset: u64::try_from(symtab.command_offset.checked_add(20)?).ok()?,
+        len: size_of::<u32>() as u64,
+    });
+    masks.extend(relocation_ranges);
+    normalise_input_ranges(&mut masks)?;
+    let prefix = bytes.get(..symtab.string_offset)?;
+    if masks.iter().any(|mask| {
+        mask.input_offset
+            .checked_add(mask.len)
+            .is_none_or(|end| end > prefix.len() as u64)
+    }) {
+        return None;
+    }
+    let structure_digest = masked_digest_from_iter(prefix, masks.iter().copied());
+
+    let mut symbols_hasher = blake3::Hasher::new();
+    symbols_hasher.update(RUSTC_PRIVATE_METADATA_DIGEST_DOMAIN);
+    symbols_hasher.update(b"symbols\0");
+    symbols_hasher.update(&(symbols.len() as u64).to_le_bytes());
+    for symbol in &symbols {
+        symbols_hasher.update(&[symbol.n_type, symbol.n_sect]);
+        symbols_hasher.update(&symbol.n_desc.to_le_bytes());
+        symbols_hasher.update(&symbol.n_value.to_le_bytes());
+        update_canonical_symbol_name(&mut symbols_hasher, &symbol.name);
+    }
+
+    let mut digest = blake3::Hasher::new();
+    digest.update(RUSTC_PRIVATE_METADATA_DIGEST_DOMAIN);
+    digest.update(&structure_digest);
+    digest.update(symbols_hasher.finalize().as_bytes());
+    digest.update(&relocation_digest);
+    Some(RustcPrivateMetadata {
+        digest: *digest.finalize().as_bytes(),
+        symbols,
+    })
+}
+
+/// Normalizes relocation-table ordering without loosening any relocation contents. Mach-O stores
+/// a few same-address companion records as ordered pairs; they remain one byte-exact group. Only
+/// complete groups at distinct source addresses may reorder, which is independent of relocation
+/// semantics and is the exact variation Rustc exhibits for this cache shape.
+fn rustc_relocation_metadata(bytes: &[u8]) -> Option<([u8; HASH_SIZE], Vec<InputRange>)> {
+    if read_u32(bytes, 0)? != object::macho::MH_MAGIC_64 {
+        return None;
+    }
+    let ncmds = usize::try_from(read_u32(bytes, 16)?).ok()?;
+    let mut command_offset = 32usize;
+    let mut section_index = 0usize;
+    let mut ranges = Vec::new();
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(RUSTC_PRIVATE_METADATA_DIGEST_DOMAIN);
+    hasher.update(b"relocations\0");
+
+    for _ in 0..ncmds {
+        let command = read_u32(bytes, command_offset)?;
+        let command_size = usize::try_from(read_u32(bytes, command_offset.checked_add(4)?)?).ok()?;
+        let command_end = command_offset.checked_add(command_size)?;
+        if command_size < 8 || command_end > bytes.len() {
+            return None;
+        }
+        if command == object::macho::LC_SEGMENT_64.0 {
+            let section_count = usize::try_from(read_u32(bytes, command_offset.checked_add(64)?)?).ok()?;
+            let sections_offset = command_offset.checked_add(72)?;
+            let sections_end = sections_offset.checked_add(section_count.checked_mul(80)?)?;
+            if sections_end > command_end {
+                return None;
+            }
+            for index in 0..section_count {
+                let offset = sections_offset.checked_add(index.checked_mul(80)?)?;
+                let relocation_offset = usize::try_from(read_u32(bytes, offset.checked_add(56)?)?).ok()?;
+                let relocation_count = usize::try_from(read_u32(bytes, offset.checked_add(60)?)?).ok()?;
+                hasher.update(&(section_index as u64).to_le_bytes());
+                section_index = section_index.checked_add(1)?;
+                if relocation_count == 0 {
+                    hasher.update(&0_u64.to_le_bytes());
+                    continue;
+                }
+                let relocation_len = relocation_count.checked_mul(8)?;
+                let relocation_end = relocation_offset.checked_add(relocation_len)?;
+                let table = bytes.get(relocation_offset..relocation_end)?;
+                ranges.push(InputRange {
+                    input_offset: relocation_offset as u64,
+                    len: relocation_len as u64,
+                });
+                let mut groups = Vec::<Vec<u8>>::new();
+                let mut seen_addresses = BTreeSet::new();
+                for record in table.chunks_exact(8) {
+                    let address = i32::from_le_bytes(record[..4].try_into().ok()?);
+                    let starts_group = groups.last().is_none_or(|group| {
+                        i32::from_le_bytes(group[..4].try_into().expect("relocation group starts with a record"))
+                            != address
+                    });
+                    if starts_group {
+                        if !seen_addresses.insert(address) {
+                            return None;
+                        }
+                        groups.push(record.to_vec());
+                    } else {
+                        groups.last_mut()?.extend_from_slice(record);
+                    }
+                }
+                groups.sort_unstable();
+                hasher.update(&(groups.len() as u64).to_le_bytes());
+                for group in groups {
+                    hasher.update(&(group.len() as u64).to_le_bytes());
+                    hasher.update(&group);
+                }
+            }
+        }
+        command_offset = command_end;
+    }
+    Some((*hasher.finalize().as_bytes(), ranges))
 }
 
 fn collect_protected_relocation_ranges(
@@ -2750,6 +3167,7 @@ fn output_identity(output: &[u8], signature: &SignatureInfo) -> Option<OutputIde
     })
 }
 
+#[cfg(test)]
 fn output_matches_identity(
     output: &[u8],
     signature: &SignatureInfo,
@@ -2785,6 +3203,24 @@ fn uuid_from_normalized_digest(digest: &[u8; HASH_SIZE]) -> [u8; 16] {
     uuid
 }
 
+/// Advances the cache-owned UUID chain using only the bounded changed-object snapshots. Unlike
+/// a whole-image digest, this remains proportional to the incremental edit while ensuring that
+/// successive cache publications receive distinct, deterministic UUIDs for distinct inputs.
+fn cache_uuid_seed(
+    previous: [u8; HASH_SIZE],
+    changed_objects: &[ChangedObject<'_, '_>],
+) -> [u8; HASH_SIZE] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(CACHE_UUID_SEED_DOMAIN);
+    hasher.update(&previous);
+    hasher.update(&(changed_objects.len() as u64).to_le_bytes());
+    for changed in changed_objects {
+        hasher.update(&changed.object.input_index.to_le_bytes());
+        hasher.update(blake3::hash(changed.bytes).as_bytes());
+    }
+    *hasher.finalize().as_bytes()
+}
+
 fn signature_identity_ranges(
     output: &[u8],
     signature: &SignatureInfo,
@@ -2818,34 +3254,35 @@ fn refresh_uuid_and_signature(
     output: &mut [u8],
     signature: &SignatureInfo,
     args: &MachOArgs,
+    uuid_seed: &[u8; HASH_SIZE],
     changed_patches: impl Iterator<Item = PatchRange>,
-) -> Option<OutputIdentity> {
+) -> bool {
     let Some(code_limit) = usize::try_from(signature.code_limit).ok() else {
-        return None;
+        return false;
     };
     let Some(hashes_offset) = usize::try_from(signature.hashes_offset).ok() else {
-        return None;
+        return false;
     };
     let Some(uuid_offset) = usize::try_from(signature.uuid_offset).ok() else {
-        return None;
+        return false;
     };
     let Some(identifier_offset) = usize::try_from(signature.identifier_offset).ok() else {
-        return None;
+        return false;
     };
     let Some(identifier_capacity) = usize::try_from(signature.identifier_capacity).ok() else {
-        return None;
+        return false;
     };
     let Some(hashes_len) = usize::try_from(u64::from(signature.hash_count) * u64::from(macho::CS_HASH_SIZE)).ok() else {
-        return None;
+        return false;
     };
     let Some(hashes_end) = hashes_offset.checked_add(hashes_len) else {
-        return None;
+        return false;
     };
     let Some(uuid_end) = uuid_offset.checked_add(16) else {
-        return None;
+        return false;
     };
     let Some(identifier_end) = identifier_offset.checked_add(identifier_capacity) else {
-        return None;
+        return false;
     };
     if code_limit > output.len()
         || hashes_end > output.len()
@@ -2853,7 +3290,7 @@ fn refresh_uuid_and_signature(
         || uuid_end > code_limit
         || identifier_end != hashes_offset
     {
-        return None;
+        return false;
     }
 
     // `code_signature_identifier` is the output basename. A Rustc rebuild may change its
@@ -2861,31 +3298,18 @@ fn refresh_uuid_and_signature(
     // (including its terminator) still fits the original padded allocation.
     let identifier = macho::code_signature_identifier(args);
     let Some(identifier_len) = identifier.len().checked_add(1) else {
-        return None;
+        return false;
     };
     if identifier_len > identifier_capacity {
-        return None;
+        return false;
     }
     output[identifier_offset..identifier_end].fill(0);
     output[identifier_offset..identifier_offset + identifier.len()].copy_from_slice(identifier);
 
-    // The normal writer hashes an LC_UUID command that still contains its initial zero bytes;
-    // clear the previous UUID as well as the code hashes so the replacement is byte-identical
-    // to a normal link of the same changed inputs.
-    // Every cache-owned baseline image is identity-verified before use, so these are the valid
-    // hash slots for all code pages before these object patches. Keep them while zeroing the
-    // slots for the UUID's whole-output hash, then recompute only pages changed by the patch and
-    // the UUID itself. This preserves byte-for-byte normal-link signing without rehashing static
-    // Rust archive pages on every cache hit.
-    let previous_hashes = output[hashes_offset..hashes_end].to_vec();
-    output[hashes_offset..hashes_end].fill(0);
-    output[uuid_offset..uuid_end].fill(0);
-    let normalized_digest = {
-        timing_phase!("Mach-O stable-layout cache: hash patched normalized output");
-        *blake3::hash(output).as_bytes()
-    };
-    output[uuid_offset..uuid_end].copy_from_slice(&uuid_from_normalized_digest(&normalized_digest));
-    output[hashes_offset..hashes_end].copy_from_slice(&previous_hashes);
+    // The cache image has a state-bound filesystem identity, so its unchanged code-signature
+    // pages are already known-good. A UUID need not be a full-image digest: derive a fresh,
+    // deterministic one from the bounded changed-input chain and rehash its one code page.
+    output[uuid_offset..uuid_end].copy_from_slice(&uuid_from_normalized_digest(uuid_seed));
 
     if !refresh_changed_code_signature_hashes(
         output,
@@ -2895,12 +3319,9 @@ fn refresh_uuid_and_signature(
         uuid_offset,
         changed_patches,
     ) {
-        return None;
+        return false;
     }
-    Some(OutputIdentity {
-        normalized_digest,
-        signature_hashes_digest: *blake3::hash(&output[hashes_offset..hashes_end]).as_bytes(),
-    })
+    true
 }
 
 /// Rehashes the CodeDirectory pages changed by a cache patch and the page containing its fresh
@@ -3090,6 +3511,65 @@ fn clone_file(source: &Path, destination: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+fn cache_image_token_for_manifest(manifest: &Manifest) -> [u8; 16] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(CACHE_IMAGE_TOKEN_DOMAIN);
+    hasher.update(&manifest.arguments_digest);
+    hasher.update(&manifest.output_identity.normalized_digest);
+    hasher.update(&manifest.output_len.to_le_bytes());
+    hasher.finalize().as_bytes()[..16]
+        .try_into()
+        .expect("BLAKE3 output contains an image token")
+}
+
+#[cfg(target_os = "macos")]
+fn cache_image_token(path: &Path) -> Option<[u8; 16]> {
+    let path = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let name = CString::new(CACHE_IMAGE_TOKEN_XATTR).ok()?;
+    let mut token = [0_u8; 16];
+    let read = unsafe {
+        libc::getxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            token.as_mut_ptr().cast(),
+            token.len(),
+            0,
+            0,
+        )
+    };
+    (usize::try_from(read).ok() == Some(token.len())).then_some(token)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn cache_image_token(_path: &Path) -> Option<[u8; 16]> {
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn set_cache_image_token(path: &Path, token: [u8; 16]) -> bool {
+    let Ok(path) = CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let Ok(name) = CString::new(CACHE_IMAGE_TOKEN_XATTR) else {
+        return false;
+    };
+    unsafe {
+        libc::setxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            token.as_ptr().cast(),
+            token.len(),
+            0,
+            0,
+        ) == 0
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_cache_image_token(_path: &Path, _token: [u8; 16]) -> bool {
+    false
+}
+
 #[cfg(target_os = "macos")]
 fn clone_temporary_path(target: &Path) -> PathBuf {
     let parent = target.parent().unwrap_or_else(|| Path::new("."));
@@ -3266,6 +3746,20 @@ impl Manifest {
                 put_u64(&mut out, protected.input_offset);
                 put_bytes(&mut out, &protected.bytes);
             }
+            match &object.rustc_private {
+                Some(private) => {
+                    put_u32(&mut out, 1);
+                    out.extend_from_slice(&private.metadata_digest);
+                    put_u32(&mut out, private.symbols.len() as u32);
+                    for symbol in &private.symbols {
+                        put_u32(&mut out, symbol.input_symbol_index);
+                        put_u64(&mut out, symbol.output_offset);
+                        put_bytes(&mut out, &symbol.canonical_name);
+                        put_bytes(&mut out, &symbol.expected);
+                    }
+                }
+                None => put_u32(&mut out, 0),
+            }
         }
         out.extend_from_slice(&manifest_checksum(&out));
         out
@@ -3357,6 +3851,41 @@ impl Manifest {
                     bytes: reader.bytes()?,
                 });
             }
+            let rustc_private = match reader.u32()? {
+                0 => None,
+                1 => {
+                    let metadata_digest = reader.hash()?;
+                    let symbol_count = reader.count()?;
+                    let mut symbols = Vec::with_capacity(symbol_count);
+                    let mut previous_index = None;
+                    for _ in 0..symbol_count {
+                        let input_symbol_index = reader.u32()?;
+                        anyhow::ensure!(
+                            previous_index.is_none_or(|previous| previous < input_symbol_index),
+                            "Rustc private-symbol indices are not strictly ordered"
+                        );
+                        previous_index = Some(input_symbol_index);
+                        let output_offset = reader.u64()?;
+                        let canonical_name = reader.bytes()?;
+                        let expected = reader.bytes()?;
+                        anyhow::ensure!(
+                            !canonical_name.is_empty() && !expected.is_empty(),
+                            "Rustc private-symbol record is empty"
+                        );
+                        symbols.push(RustcPrivateSymbolPatch {
+                            input_symbol_index,
+                            canonical_name,
+                            expected,
+                            output_offset,
+                        });
+                    }
+                    Some(RustcPrivateObject {
+                        metadata_digest,
+                        symbols,
+                    })
+                }
+                _ => anyhow::bail!("invalid Rustc private-metadata flag"),
+            };
             anyhow::ensure!(normalise_ranges(&mut patches).is_some(), "invalid cache patch ranges");
             anyhow::ensure!(normalise_input_ranges(&mut structure_masks).is_some(), "invalid cache structure masks");
             anyhow::ensure!(symbol_value_patches_are_normalized(&symbol_values), "invalid cache symbol value patches");
@@ -3368,6 +3897,7 @@ impl Manifest {
                 structure_masks,
                 symbol_values,
                 protected,
+                rustc_private,
             });
         }
         anyhow::ensure!(reader.offset == body.len(), "trailing cache data");
@@ -3549,6 +4079,11 @@ impl<'a> ObjectRecordView<'a> {
             previous_protected_end = end;
         }
         let protected_bytes = &reader.bytes[protected_start..reader.offset];
+        let rustc_private = match reader.u32()? {
+            0 => None,
+            1 => Some(RustcPrivateObjectView::decode(reader)?),
+            _ => anyhow::bail!("invalid Rustc private-metadata flag"),
+        };
         let object = Self {
             input_index,
             structure_digest,
@@ -3557,6 +4092,7 @@ impl<'a> ObjectRecordView<'a> {
             symbol_value_bytes,
             protected_bytes,
             protected_count,
+            rustc_private,
         };
         anyhow::ensure!(object.patches_are_normalized(), "invalid cache patch ranges");
         anyhow::ensure!(object.structure_masks_are_normalized(), "invalid cache structure masks");
@@ -3590,6 +4126,21 @@ impl<'a> ObjectRecordView<'a> {
         }
     }
 
+    fn rustc_private_output_patches(&self, bytes: &[u8]) -> Option<Vec<OutputPathPatch>> {
+        let private = self.rustc_private?;
+        let patch_ranges = self
+            .patches()
+            .map(|patch| PatchRange {
+                input_offset: patch.input_offset,
+                output_offset: patch.output_offset,
+                len: patch.len,
+            })
+            .collect::<Vec<_>>();
+        let metadata = rustc_private_metadata(bytes, &patch_ranges)?;
+        (metadata.digest == private.metadata_digest)
+            .then(|| private.output_patches(&metadata.symbols))?
+    }
+
     fn patches_are_normalized(&self) -> bool {
         let mut previous_input_end = 0_u64;
         for patch in self.patches() {
@@ -3616,6 +4167,63 @@ impl<'a> ObjectRecordView<'a> {
 
     fn symbol_value_patches_are_normalized(&self) -> bool {
         symbol_value_patches_are_normalized_from_iter(self.symbol_values())
+    }
+}
+
+impl<'a> RustcPrivateObjectView<'a> {
+    fn decode(reader: &mut Reader<'a>) -> anyhow::Result<Self> {
+        let metadata_digest = reader.hash()?;
+        let symbol_count = reader.count()?;
+        let symbol_start = reader.offset;
+        let mut previous_index = None;
+        for _ in 0..symbol_count {
+            let input_symbol_index = reader.u32()?;
+            anyhow::ensure!(
+                previous_index.is_none_or(|previous| previous < input_symbol_index),
+                "Rustc private-symbol indices are not strictly ordered"
+            );
+            previous_index = Some(input_symbol_index);
+            let _ = reader.u64()?;
+            let canonical_name = reader.bytes_ref()?;
+            let expected = reader.bytes_ref()?;
+            anyhow::ensure!(
+                !canonical_name.is_empty() && !expected.is_empty(),
+                "Rustc private-symbol record is empty"
+            );
+        }
+        Ok(Self {
+            metadata_digest,
+            symbol_bytes: &reader.bytes[symbol_start..reader.offset],
+            symbol_count,
+        })
+    }
+
+    fn output_patches(self, symbols: &[InputSymbol]) -> Option<Vec<OutputPathPatch>> {
+        let mut reader = Reader {
+            bytes: self.symbol_bytes,
+            offset: 0,
+        };
+        let mut patches = Vec::with_capacity(self.symbol_count);
+        for _ in 0..self.symbol_count {
+            let input_symbol_index = usize::try_from(reader.u32().ok()?).ok()?;
+            let output_offset = reader.u64().ok()?;
+            let canonical_name = reader.bytes_ref().ok()?;
+            let expected = reader.bytes_ref().ok()?;
+            let current = symbols.get(input_symbol_index)?;
+            if rustc_private_symbol_base(&current.name) != Some(canonical_name)
+                || current.name.len() > expected.len()
+            {
+                return None;
+            }
+            let mut replacement = current.name.clone();
+            replacement.resize(expected.len(), 0);
+            patches.push(OutputPathPatch {
+                output_offset,
+                expected: expected.to_vec(),
+                replacement,
+            });
+        }
+        (reader.offset == reader.bytes.len()).then_some(patches)
     }
 }
 
@@ -3720,8 +4328,8 @@ impl ImageState {
         put_u32(&mut out, STATE_VERSION);
         out.extend_from_slice(&self.arguments_digest);
         out.extend_from_slice(&self.manifest_checksum);
-        out.extend_from_slice(&self.output_identity.normalized_digest);
-        out.extend_from_slice(&self.output_identity.signature_hashes_digest);
+        out.extend_from_slice(&self.cache_image_token);
+        out.extend_from_slice(&self.uuid_seed);
         put_u64(&mut out, self.output_len);
         put_u32(&mut out, self.inputs.len() as u32);
         for input in &self.inputs {
@@ -3747,10 +4355,8 @@ impl ImageState {
         anyhow::ensure!(reader.u32()? == STATE_VERSION, "unsupported image-state version");
         let arguments_digest = reader.hash()?;
         let manifest_checksum = reader.hash()?;
-        let output_identity = OutputIdentity {
-            normalized_digest: reader.hash()?,
-            signature_hashes_digest: reader.hash()?,
-        };
+        let cache_image_token = reader.take(16)?.try_into().expect("fixed-width image token");
+        let uuid_seed = reader.hash()?;
         let output_len = reader.u64()?;
         let input_count = reader.count()?;
         let mut inputs = Vec::with_capacity(input_count);
@@ -3766,7 +4372,8 @@ impl ImageState {
         Ok(Self {
             arguments_digest,
             manifest_checksum,
-            output_identity,
+            cache_image_token,
+            uuid_seed,
             output_len,
             inputs,
         })
@@ -3925,8 +4532,11 @@ mod tests {
     use super::input_metadata_snapshots_match;
     use super::masked_digest;
     use super::masked_digest_for_input_ranges;
+    use super::macho_symtab;
     use super::protected_ranges_match;
     use super::refresh_changed_code_signature_hashes;
+    use super::rustc_private_metadata;
+    use super::rustc_private_symbol_base;
     use super::n_oso_archive_path_patches;
     use super::normalized_output_digest;
     use super::output_identity;
@@ -3993,6 +4603,7 @@ mod tests {
                     input_offset: 4,
                     bytes: vec![9, 10],
                 }],
+                rustc_private: None,
             }],
         };
         let encoded = manifest.encode();
@@ -4055,7 +4666,8 @@ mod tests {
         let state = ImageState {
             arguments_digest: manifest.arguments_digest,
             manifest_checksum: view.checksum,
-            output_identity: manifest.output_identity,
+            cache_image_token: [4; 16],
+            uuid_seed: manifest.output_identity.normalized_digest,
             output_len: manifest.output_len,
             inputs: manifest.inputs.clone(),
         };
@@ -4087,6 +4699,7 @@ mod tests {
                     structure_masks: Vec::new(),
                     symbol_values: Vec::new(),
                     protected: Vec::new(),
+                    rustc_private_symbols: None,
                 }),
             ),
             (7, None),
@@ -4155,6 +4768,59 @@ mod tests {
         assert!(n_oso_archive_path_patches(&output, new_path, "/tmp/rustcTooLong/libexample.rlib").is_none());
     }
 
+    #[test]
+    fn rustc_private_metadata_accepts_only_terminal_llvm_discriminator_churn() {
+        let old = macho_with_symbol_strings(&[(
+            "_private.llvm.16817195673798115762".to_owned(),
+            object::macho::N_SECT.0 | object::macho::N_PEXT.0,
+        )]);
+        let changed = macho_with_symbol_strings(&[(
+            "_private.llvm.8538991645495547684".to_owned(),
+            object::macho::N_SECT.0 | object::macho::N_PEXT.0,
+        )]);
+        let ordinary_change = macho_with_symbol_strings(&[(
+            "_different_private.llvm.8538991645495547684".to_owned(),
+            object::macho::N_SECT.0 | object::macho::N_PEXT.0,
+        )]);
+
+        let old_metadata = rustc_private_metadata(&old, &[]).unwrap();
+        let changed_metadata = rustc_private_metadata(&changed, &[]).unwrap();
+        let ordinary_metadata = rustc_private_metadata(&ordinary_change, &[]).unwrap();
+
+        assert_eq!(old_metadata.digest, changed_metadata.digest);
+        assert_ne!(old_metadata.digest, ordinary_metadata.digest);
+        assert_eq!(
+            rustc_private_symbol_base(b"_private.llvm.123"),
+            Some(&b"_private.llvm."[..])
+        );
+        assert!(rustc_private_symbol_base(b"_private.llvm.not-a-number").is_none());
+        assert!(rustc_private_symbol_base(b"llvm.123").is_none());
+    }
+
+    #[test]
+    fn rustc_private_output_string_is_identified_without_a_linear_section_mapping() {
+        let name = "_private.llvm.16817195673798115762";
+        let mut output = macho_with_symbol_strings(&[(
+            name.to_owned(),
+            object::macho::N_SECT.0 | object::macho::N_PEXT.0,
+        )]);
+        // A string-merged input symbol has no source-to-output offset, and therefore may have a
+        // different final address. The nlist spelling/type/descriptor still identifies one
+        // exact string-table slot.
+        output[64..72].copy_from_slice(&0x1234_5678_u64.to_le_bytes());
+
+        let symtab = macho_symtab(&output).unwrap();
+        assert_eq!(
+            symtab.unique_symbol_string_offset(
+                &output,
+                name.as_bytes(),
+                object::macho::N_SECT.0 | object::macho::N_PEXT.0,
+                0,
+            ),
+            Some(symtab.string_offset + 1)
+        );
+    }
+
     fn macho_with_symbol_strings(symbols: &[(String, u8)]) -> Vec<u8> {
         const MACH_HEADER_64_SIZE: usize = 32;
         const SYMTAB_COMMAND_SIZE: usize = 24;
@@ -4163,6 +4829,7 @@ mod tests {
         let symoff = MACH_HEADER_64_SIZE + SYMTAB_COMMAND_SIZE;
         let stroff = symoff + symbols.len() * NLIST_64_SIZE;
         let mut output = vec![0; stroff + 1];
+        output[..4].copy_from_slice(&object::macho::MH_MAGIC_64.to_le_bytes());
         output[16..20].copy_from_slice(&1_u32.to_le_bytes());
         output[MACH_HEADER_64_SIZE..MACH_HEADER_64_SIZE + 4]
             .copy_from_slice(&object::macho::LC_SYMTAB.0.to_le_bytes());
@@ -4180,6 +4847,8 @@ mod tests {
             let entry = symoff + index * NLIST_64_SIZE;
             output[entry..entry + 4].copy_from_slice(&(string_index as u32).to_le_bytes());
             output[entry + 4] = *n_type;
+            output[entry + 5] = ((*n_type & object::macho::N_TYPE)
+                == object::macho::N_SECT.0) as u8;
             output.extend_from_slice(name.as_bytes());
             output.push(0);
         }

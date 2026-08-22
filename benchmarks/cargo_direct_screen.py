@@ -16,6 +16,7 @@ from cargo_link_benchmark_impl import DIRECT_CAPTURE_COMPATIBLE_SCHEMA_VERSIONS
 from cargo_link_benchmark_impl import DIRECT_CAPTURE_SCHEMA_VERSION
 from cargo_link_benchmark_impl import Linker
 from cargo_link_benchmark_impl import RuntimeCheck
+from cargo_link_benchmark_impl import copy2_preserving_xattrs
 from cargo_link_benchmark_impl import direct_capture_replay_command
 from cargo_link_benchmark_impl import establish_cache_direct_baseline
 from cargo_link_benchmark_impl import remove_benchmark_artifacts
@@ -314,7 +315,7 @@ def main(argv: list[str]) -> int:
                 baseline_output_snapshot = screen_root / candidate.name / "cache-baseline-output"
                 shutil.copy2(baseline_output, baseline_output_snapshot)
                 cache_snapshot = screen_root / candidate.name / "cache-baseline-sidecars"
-                shutil.copytree(cache_root, cache_snapshot)
+                shutil.copytree(cache_root, cache_snapshot, copy_function=copy2_preserving_xattrs)
                 changed_output = Path(changed_replay[changed_replay.index("-o") + 1])
                 cache_contexts[candidate.name] = {
                     "environment": cache_environment,

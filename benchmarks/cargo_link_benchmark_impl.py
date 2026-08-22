@@ -67,6 +67,31 @@ MACOS_TIME_CPU = re.compile(
 RESOURCE_DISK_SAMPLE_INTERVAL_SECONDS = 0.005
 
 
+def copy2_preserving_xattrs(
+    source: str | os.PathLike[str],
+    destination: str | os.PathLike[str],
+    *,
+    follow_symlinks: bool = True,
+) -> str | os.PathLike[str]:
+    """Copies a cache file without dropping its cache-owned extended attributes.
+
+    APFS clone/cache state uses a generation-token xattr to bind a sidecar image to its manifest.
+    The local Python build does not expose `os.listxattr`, so on macOS use `/bin/cp -c -p`:
+    APFS clone-on-write keeps replay preparation quick while `-p` preserves cache xattrs. Other
+    platforms retain Python's ordinary metadata-preserving copy because this Mach-O cache is not
+    enabled there.
+    """
+    if sys.platform == "darwin" and follow_symlinks:
+        subprocess.run(
+            ["/bin/cp", "-c", "-p", os.fspath(source), os.fspath(destination)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        return destination
+    return shutil.copy2(source, destination, follow_symlinks=follow_symlinks)
+
+
 @dataclass(frozen=True)
 class Linker:
     name: str
@@ -1144,7 +1169,7 @@ def restore_cached_direct_baseline(
     if stale_published_output is not None and stale_published_output != baseline_output:
         stale_published_output.unlink(missing_ok=True)
     shutil.rmtree(cache_dir, ignore_errors=True)
-    shutil.copytree(cache_snapshot, cache_dir)
+    shutil.copytree(cache_snapshot, cache_dir, copy_function=copy2_preserving_xattrs)
 
 
 def mutate_incremental_source(path: Path, mutation: SourceMutation) -> tuple[str, str]:
@@ -1948,7 +1973,7 @@ def run_sample(
             baseline_output_snapshot = logs_dir / f"{linker.name}-{sample_index}-cache-baseline-output"
             shutil.copy2(baseline_output, baseline_output_snapshot)
             cache_snapshot = logs_dir / f"{linker.name}-{sample_index}-cache-baseline-sidecars"
-            shutil.copytree(direct_cache_dir, cache_snapshot)
+            shutil.copytree(direct_cache_dir, cache_snapshot, copy_function=copy2_preserving_xattrs)
 
             capture_before, capture_after = mutate_incremental_source(mutation_path, workload.mutation)
             assert capture_before == before_hash and capture_after == mutation_after
