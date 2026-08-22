@@ -22,9 +22,10 @@ For repeatable source-build comparisons, use the standard-library Python runner 
 performance work uses only [`benchmarks/cargo.benchmark.json`](benchmarks/cargo.benchmark.json)
 against `~/d/cargo`; the checked-in `e` profiles are retained qualification fixtures, not routine
 iteration targets.
-It measures a fresh Cargo target, a no-cache cold final-link replay, a Cargo incremental rebuild
-after a controlled source edit, and direct replays of that incremental final-link argv. This
-separates Rust/LTO rebuild time from the linker's cold and incremental targets. It records
+It measures a fresh Cargo target, a Cargo incremental rebuild after a controlled source edit, and
+direct replays of that incremental final-link argv. Profiles with a cold Cargo goal additionally
+capture and replay the cold final link. This separates Rust/LTO rebuild time from the linker's cold
+and incremental targets. It records
 Apple-ld64/Wild linker-selection evidence and validates the resulting ARM64 Mach-O header, strict
 `codesign --verify --strict` evidence, and a checked-in workload runtime smoke check. Runtime
 checks execute with all `DYLD_*` environment overrides removed; a cache-hit record is emitted only
@@ -42,7 +43,7 @@ rebuilds. With
 Cargo wall-time runs remain command-equivalent between linkers. Matching phase records are retained
 under `wild_timing_phases` in the result JSON, and the runner rejects a requested timing capture
 that emits no records. The separate resource batch records peak RSS, CPU, final-output bytes, cache
-bytes, and observed transient-disk bytes for both cold and incremental direct replays. See
+bytes, and observed transient-disk bytes for every configured direct replay. See
 `python3 benchmarks/cargo_link_benchmark.py --help` for the required result path and opt-in goal
 enforcement. Its default Wild path is `target/aarch64-apple-darwin/dist/wild`; do not use the
 unoptimized `ci` profile for a wall-time comparison. Successful runs retain only their JSON report
@@ -145,8 +146,10 @@ cleanup policy; add `--keep-artifacts` before a diagnostic run when those artifa
 ### Fast candidate funnel
 
 The qualification command runs several Cargo builds per linker because it measures Cargo wall time
-and creates fresh `save-temps` inputs for direct replay. That is correct for final evidence but too
-expensive for tuning. Treat it as a signoff gate, not an experiment loop. The normal loop is:
+and creates fresh `save-temps` inputs for direct replay. The normal Cargo profile omits the extra
+cold `save-temps` capture because cold performance is context only; it retains the one cold build
+needed to establish a real incremental rebuild. Treat qualification as a signoff gate, not an
+experiment loop. The normal loop is:
 
 | Stage | Purpose | Parallelism and isolation | Promotion rule |
 | --- | --- | --- | --- |

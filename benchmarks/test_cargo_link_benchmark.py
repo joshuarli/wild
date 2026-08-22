@@ -631,6 +631,48 @@ class CargoLinkBenchmarkTests(unittest.TestCase):
 
         self.assertFalse(BENCHMARK.comparison(runs, workload)["goals_met"])
 
+    def test_comparison_allows_normal_incremental_runs_without_cold_link_replays(self) -> None:
+        runs = [
+            {
+                "sample": 0,
+                "linker": "apple-ld64",
+                "cold": {"elapsed_ns": 100},
+                "incremental": {"elapsed_ns": 100},
+                "incremental_link": {"samples": [{"elapsed_ns": 20}]},
+            },
+            {
+                "sample": 0,
+                "linker": "wild",
+                "cold": {"elapsed_ns": 110},
+                "incremental": {"elapsed_ns": 99},
+                "incremental_link": {"samples": [{"elapsed_ns": 19}]},
+            },
+        ]
+        workload = BENCHMARK.Workload(
+            name="normal-incremental",
+            target="aarch64-apple-darwin",
+            profile="release",
+            cargo_arguments=("--bin", "normal"),
+            artifact="{target}/{profile}/normal",
+            macho_file_type=BENCHMARK.MH_EXECUTE,
+            mutation=BENCHMARK.SourceMutation(path="src/main.rs", append=b"\n// test\n"),
+            cold_max=None,
+            incremental_max=None,
+            deployment_target="11.0",
+            runtime=BENCHMARK.RuntimeCheck(arguments=(), output_mode="exit"),
+            stable_layout_cache_eligible=False,
+            incremental_cargo_max=1.0,
+            incremental_link_max=1.0,
+        )
+
+        result = BENCHMARK.comparison(runs, workload)
+
+        self.assertTrue(result["goals_met"])
+        self.assertIsNone(result["medians_ns"]["apple-ld64"]["cold_link"])
+        self.assertIsNone(result["cold_link_wild_over_apple"])
+        self.assertIsNone(result["paired_wild_over_apple"]["cold_link"])
+        self.assertIsNone(result["cold_link_peak_rss_bytes"])
+
     def test_extracts_shell_quoted_final_linker_child(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             log = Path(temporary) / "cargo.log"

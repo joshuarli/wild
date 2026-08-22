@@ -1527,6 +1527,78 @@ def primary_artifact_path(
     return Path(command[command.index("-o") + 1])
 
 
+def replay_cold_direct_link(
+    *,
+    command: list[str],
+    workspace: Path,
+    environment: dict[str, str],
+    target_dir: Path,
+    logs_dir: Path,
+    workload: Workload,
+    linker: Linker,
+    sample_index: int,
+    link_repetitions: int,
+    resource_link_repetitions: int,
+    wild_timing_json: bool,
+) -> dict[str, Any]:
+    """Captures and replays a cold final link when a profile has a cold-performance goal."""
+    cold_link_capture_target = target_dir / "cold-link-capture"
+    cold_link_capture_log = logs_dir / f"{linker.name}-{sample_index}-cold-link-capture.log"
+    cold_link_capture_environment = dict(environment)
+    cold_link_capture_environment["RUSTFLAGS"] += " -C save-temps"
+    try:
+        run_cargo_build(
+            command,
+            workspace=workspace,
+            environment=cold_link_capture_environment,
+            target_dir=cold_link_capture_target,
+            log_path=cold_link_capture_log,
+        )
+        cold_link_capture_command = final_link_command(
+            cold_link_capture_log,
+            linker,
+            output=primary_artifact_path(
+                cold_link_capture_target, workload, cold_link_capture_log, linker
+            ),
+        )
+        cold_link_command = (
+            with_wild_timing_json(cold_link_capture_command, linker)
+            if wild_timing_json
+            else cold_link_capture_command
+        )
+        cold_link = replay_final_link(
+            command=cold_link_command,
+            environment=cold_link_capture_environment,
+            output_dir=logs_dir / f"{linker.name}-{sample_index}-cold-link",
+            linker=linker,
+            repetitions=link_repetitions,
+            expected_file_type=workload.macho_file_type,
+            runtime=workload.runtime,
+            runtime_cwd=workspace,
+        )
+        cold_link_resources = replay_final_link(
+            command=cold_link_command,
+            environment=cold_link_capture_environment,
+            output_dir=logs_dir / f"{linker.name}-{sample_index}-cold-link-resources",
+            linker=linker,
+            repetitions=resource_link_repetitions,
+            expected_file_type=workload.macho_file_type,
+            runtime=workload.runtime,
+            runtime_cwd=workspace,
+            measure_resources=True,
+        )
+        return {
+            "capture_log": str(cold_link_capture_log),
+            "uses_rustc_save_temps": True,
+            "cache_disabled": True,
+            "samples": cold_link,
+            "resource_samples": cold_link_resources,
+        }
+    finally:
+        # The replay has consumed the `save-temps` inputs; retain only its JSON evidence.
+        shutil.rmtree(cold_link_capture_target, ignore_errors=True)
+
+
 def run_sample(
     *,
     source: Path,
@@ -1652,60 +1724,27 @@ def run_sample(
         shutil.rmtree(target_dir, ignore_errors=True)
         if cache_setup_target is not None:
             shutil.rmtree(cache_setup_target, ignore_errors=True)
-        cold_link_capture_target = target_dir / "cold-link-capture"
-        cold_link_capture_log = logs_dir / f"{linker.name}-{sample_index}-cold-link-capture.log"
-        cold_link_capture_environment = dict(environment)
-        cold_link_capture_environment["RUSTFLAGS"] += " -C save-temps"
-        run_cargo_build(
-            command,
-            workspace=workspace,
-            environment=cold_link_capture_environment,
-            target_dir=cold_link_capture_target,
-            log_path=cold_link_capture_log,
+        # Cold Cargo time remains in every sample because it establishes the changed-source state.
+        # The normal Cargo profile deliberately has no cold goal, so omit its extra full
+        # `save-temps` build and direct cold-link replay. This keeps the signoff focused on the
+        # configured Cargo-incremental and direct-incremental-link contracts.
+        cold_link_capture = (
+            replay_cold_direct_link(
+                command=command,
+                workspace=workspace,
+                environment=environment,
+                target_dir=target_dir,
+                logs_dir=logs_dir,
+                workload=workload,
+                linker=linker,
+                sample_index=sample_index,
+                link_repetitions=link_repetitions,
+                resource_link_repetitions=resource_link_repetitions,
+                wild_timing_json=wild_timing_json,
+            )
+            if workload.cold_max is not None
+            else None
         )
-        cold_link_capture_command = final_link_command(
-            cold_link_capture_log,
-            linker,
-            output=primary_artifact_path(
-                cold_link_capture_target, workload, cold_link_capture_log, linker
-            ),
-        )
-        cold_link_command = (
-            with_wild_timing_json(cold_link_capture_command, linker)
-            if wild_timing_json
-            else cold_link_capture_command
-        )
-        cold_link = replay_final_link(
-            command=cold_link_command,
-            environment=cold_link_capture_environment,
-            output_dir=logs_dir / f"{linker.name}-{sample_index}-cold-link",
-            linker=linker,
-            repetitions=link_repetitions,
-            expected_file_type=workload.macho_file_type,
-            runtime=workload.runtime,
-            runtime_cwd=workspace,
-        )
-        cold_link_resources = replay_final_link(
-            command=cold_link_command,
-            environment=cold_link_capture_environment,
-            output_dir=logs_dir / f"{linker.name}-{sample_index}-cold-link-resources",
-            linker=linker,
-            repetitions=resource_link_repetitions,
-            expected_file_type=workload.macho_file_type,
-            runtime=workload.runtime,
-            runtime_cwd=workspace,
-            measure_resources=True,
-        )
-        cold_link_capture = {
-            "capture_log": str(cold_link_capture_log),
-            "uses_rustc_save_temps": True,
-            "cache_disabled": True,
-            "samples": cold_link,
-            "resource_samples": cold_link_resources,
-        }
-        # Cold direct replays are complete. Their measurements and logs are retained under
-        # `logs_dir`, whereas this Cargo target exists only to supply now-consumed linker inputs.
-        shutil.rmtree(cold_link_capture_target, ignore_errors=True)
         # The incremental direct-link capture below needs the changed source again. The final
         # restore in the `finally` path still guarantees that the disposable workspace is clean.
         mutate_incremental_source(mutation_path, workload.mutation)
@@ -1953,18 +1992,23 @@ def comparison(runs: list[dict[str, Any]], workload: Workload) -> dict[str, Any]
         by_linker[run["linker"]].append(run)
     if not by_linker["apple-ld64"] or not by_linker["wild"]:
         raise ValueError("Both Apple ld64 and Wild samples are required")
+    measure_cold_link = workload.cold_max is not None
     medians = {
         linker: {
             "cold": median_ns([run["cold"]["elapsed_ns"] for run in samples]),
             "incremental_cargo": median_ns(
                 [run["incremental"]["elapsed_ns"] for run in samples]
             ),
-            "cold_link": median_ns(
-                [
-                    sample["elapsed_ns"]
-                    for run in samples
-                    for sample in run["cold_link"]["samples"]
-                ]
+            "cold_link": (
+                median_ns(
+                    [
+                        sample["elapsed_ns"]
+                        for run in samples
+                        for sample in run["cold_link"]["samples"]
+                    ]
+                )
+                if measure_cold_link
+                else None
             ),
             "incremental_link": median_ns(
                 [
@@ -1980,11 +2024,17 @@ def comparison(runs: list[dict[str, Any]], workload: Workload) -> dict[str, Any]
     cargo_incremental_ratio = (
         medians["wild"]["incremental_cargo"] / medians["apple-ld64"]["incremental_cargo"]
     )
-    cold_link_ratio = medians["wild"]["cold_link"] / medians["apple-ld64"]["cold_link"]
+    cold_link_ratio = (
+        medians["wild"]["cold_link"] / medians["apple-ld64"]["cold_link"]
+        if measure_cold_link
+        else None
+    )
     incremental_link_ratio = (
         medians["wild"]["incremental_link"] / medians["apple-ld64"]["incremental_link"]
     )
-    cold_link_resources = direct_link_resource_measurements(by_linker, "cold_link")
+    cold_link_resources = (
+        direct_link_resource_measurements(by_linker, "cold_link") if measure_cold_link else None
+    )
     incremental_link_resources = direct_link_resource_measurements(by_linker, "incremental_link")
     wild_cache_bytes_per_output_byte = {
         kind: (
@@ -2039,19 +2089,29 @@ def comparison(runs: list[dict[str, Any]], workload: Workload) -> dict[str, Any]
         "incremental_link_wild_over_apple": incremental_link_ratio,
         "paired_wild_over_apple": {
             "cold_cargo": paired_wild_over_apple(runs, "cold"),
-            "cold_link": paired_wild_over_apple(runs, "cold_link"),
+            "cold_link": paired_wild_over_apple(runs, "cold_link") if measure_cold_link else None,
             "incremental_cargo": paired_wild_over_apple(runs, "incremental_cargo"),
             "incremental_link": paired_wild_over_apple(runs, "incremental_link"),
         },
-        "cold_link_peak_rss_bytes": cold_link_resources["peak_rss_bytes"],
-        "cold_link_peak_rss_wild_over_apple": cold_link_resources[
-            "peak_rss_wild_over_apple"
-        ],
-        "cold_link_cpu_ns": cold_link_resources["cpu_ns"],
-        "cold_link_disk_usage_bytes": cold_link_resources["disk_usage_bytes"],
-        "cold_link_peak_transient_working_directory_bytes": cold_link_resources[
-            "peak_transient_working_directory_bytes"
-        ],
+        "cold_link_peak_rss_bytes": (
+            cold_link_resources["peak_rss_bytes"] if cold_link_resources is not None else None
+        ),
+        "cold_link_peak_rss_wild_over_apple": (
+            cold_link_resources["peak_rss_wild_over_apple"]
+            if cold_link_resources is not None
+            else None
+        ),
+        "cold_link_cpu_ns": (
+            cold_link_resources["cpu_ns"] if cold_link_resources is not None else None
+        ),
+        "cold_link_disk_usage_bytes": (
+            cold_link_resources["disk_usage_bytes"] if cold_link_resources is not None else None
+        ),
+        "cold_link_peak_transient_working_directory_bytes": (
+            cold_link_resources["peak_transient_working_directory_bytes"]
+            if cold_link_resources is not None
+            else None
+        ),
         "incremental_link_peak_rss_bytes": incremental_link_resources["peak_rss_bytes"],
         "incremental_link_peak_rss_wild_over_apple": incremental_link_resources[
             "peak_rss_wild_over_apple"
