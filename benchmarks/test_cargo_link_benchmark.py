@@ -316,6 +316,34 @@ class CargoLinkBenchmarkTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "digest changed"):
                 BENCHMARK.verify_direct_capture_input_records(records)
 
+    def test_direct_capture_records_libraries_resolved_from_target_search_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "cargo"
+            object_file = root / "main.o"
+            target_library = root / "target" / "libnative_fixture.a"
+            object_file.write_bytes(b"object")
+            target_library.parent.mkdir()
+            target_library.write_bytes(b"native archive")
+            command = [
+                "/usr/bin/ld",
+                "-o",
+                str(output),
+                str(object_file),
+                "-L",
+                str(target_library.parent),
+                "-lnative_fixture",
+                "-lSystem",
+            ]
+
+            records = BENCHMARK.direct_capture_input_records(command)
+
+            self.assertEqual(
+                [record["path"] for record in records],
+                [str(object_file.resolve()), str(target_library.resolve())],
+            )
+            BENCHMARK.verify_direct_capture_input_records(records)
+
     def test_direct_capture_replaces_only_the_linker_executable_for_a_candidate(self) -> None:
         command = ["/usr/bin/ld", "-o", "/tmp/cargo", "/tmp/input.o"]
 

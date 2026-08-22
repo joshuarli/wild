@@ -312,10 +312,12 @@ def sha256_file(path: Path) -> str:
 
 
 def direct_capture_input_records(command: list[str]) -> list[dict[str, Any]]:
-    """Records every distinct existing file argument of a captured direct linker command.
+    """Records every distinct existing file input of a captured direct linker command.
 
     The linker executable and the published output are deliberately excluded: a screen replaces
-    both. Every remaining file argument is an immutable input contract for the reusable capture.
+    both. Literal path arguments and libraries selected from a captured `-L` search path are both
+    immutable input contracts for the reusable capture. The latter matters for native Cargo build
+    scripts, which commonly pass a target-owned archive as `-lfoo` rather than a literal path.
     """
     try:
         output_index = command.index("-o") + 1
@@ -323,14 +325,18 @@ def direct_capture_input_records(command: list[str]) -> list[dict[str, Any]]:
     except (ValueError, IndexError) as error:
         raise ValueError("Direct capture command must contain an output after -o") from error
 
-    records: list[dict[str, Any]] = []
-    recorded_paths: set[Path] = set()
+    file_inputs: list[Path] = []
     for index, argument in enumerate(command):
         if index in {0, output_index}:
             continue
         candidate = Path(argument)
-        if candidate == output or not candidate.is_file():
-            continue
+        if candidate != output and candidate.is_file():
+            file_inputs.append(candidate)
+    file_inputs.extend(direct_capture_library_search_inputs(command))
+
+    records: list[dict[str, Any]] = []
+    recorded_paths: set[Path] = set()
+    for candidate in file_inputs:
         resolved = candidate.resolve()
         if resolved in recorded_paths:
             continue
@@ -346,6 +352,47 @@ def direct_capture_input_records(command: list[str]) -> list[dict[str, Any]]:
     if not records:
         raise ValueError("Direct capture command has no existing file inputs")
     return records
+
+
+def direct_capture_library_search_inputs(command: list[str]) -> list[Path]:
+    """Finds every existing `-l` candidate in the command's explicit `-L` directories.
+
+    Keeping all matching Mach-O library suffixes is deliberately conservative. It avoids making
+    this capture-specific parser another implementation of ld64's library preference rules while
+    still retaining only the handful of files a target-owned native dependency can select.
+    System-library candidates are harmless: they are outside the capture target and pruning never
+    treats them as deletion candidates.
+    """
+    search_paths: list[Path] = []
+    library_names: list[str] = []
+    index = 0
+    while index < len(command):
+        argument = command[index]
+        if argument == "-L" and index + 1 < len(command):
+            search_paths.append(Path(command[index + 1]))
+            index += 2
+            continue
+        if argument.startswith("-L") and len(argument) > 2:
+            search_paths.append(Path(argument[2:]))
+        if argument == "-l" and index + 1 < len(command):
+            library_names.append(command[index + 1])
+            index += 2
+            continue
+        # `-lto_library` takes a path but is an ld64 option, not a `-l` library spelling.
+        if argument.startswith("-l") and len(argument) > 2 and not argument.startswith("-lto_"):
+            library_names.append(argument[2:])
+        index += 1
+
+    inputs: list[Path] = []
+    for name in library_names:
+        if not name:
+            continue
+        for directory in search_paths:
+            for suffix in (".dylib", ".tbd", ".a"):
+                candidate = directory / f"lib{name}{suffix}"
+                if candidate.is_file():
+                    inputs.append(candidate)
+    return inputs
 
 
 def verify_direct_capture_input_records(records: list[dict[str, Any]]) -> None:
